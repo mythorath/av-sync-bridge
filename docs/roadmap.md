@@ -40,8 +40,10 @@ isolated real-capture development, not production deployment.
   metadata gate, tested offline with analytic signals and wrong-rate controls.
 - [x] Offline sender-conversion observability test demonstrating hidden drift
   and timestamp phase steps on tested Windows/Linux runtimes.
-- [ ] Original capture-anchor wire transport and a count/phase-preserving nominal
-  sender converter; current output-PTS-only conversion fails that gate.
+- [x] Timestamp-free nominal sender converter with independently checked sample
+  counts, phase, partition invariance and restart behavior on Windows/Linux.
+- [ ] Original capture-anchor wire transport; sender-side original-anchor
+  diagnostics and nominal RTP progression do not complete that gate.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
@@ -50,8 +52,9 @@ or production startup migration is included yet. See [network validation](networ
 and [physical video validation](video-validation.md) for actual scope and faults.
 The [ASRC design](asrc-design.md) first requires original device-clock anchors to
 survive conversion; nominal RTP progression alone cannot satisfy that gate.
-See [offline DSP evidence](asrc-validation.md) and the measured
-[conversion failure](conversion-timing.md). A tested resampler is not a completed
+See [offline DSP evidence](asrc-validation.md), the measured old
+[conversion failure](conversion-timing.md) and the
+[nominal conversion replacement](nominal-audio-validation.md). A tested resampler is not a completed
 live rate controller or a replacement for that missing timing relationship.
 
 If the shared timestamp relationship does not survive either capture or OBS

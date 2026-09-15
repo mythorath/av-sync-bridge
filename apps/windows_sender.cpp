@@ -23,6 +23,8 @@
 #include <gst/rtp/gstrtcpbuffer.h>
 #include <avsync/network_clock.hpp>
 #include <avsync/capture_window.hpp>
+#include <avsync/audio_anchors.hpp>
+#include <avsync/nominal_audio.hpp>
 
 #include <algorithm>
 #include <array>
@@ -126,7 +128,7 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
             if (!unsigned_value(value, *number)) return std::nullopt;
         } else result.host = value;
     }
-    if (!loopback || seen != 31 || !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 30)
+    if (!loopback || seen != 31 || !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 120)
         return std::nullopt;
     const auto port = [](unsigned p) { return p >= 1 && p <= 65535; };
     if (!port(result.clock_port) || !port(result.rtp_port) || !port(result.rtcp_port) ||
@@ -312,7 +314,11 @@ struct Statistics {
     std::uint64_t first_qpc_100ns{}, last_qpc_100ns{};
     std::int64_t first_capture_ns{}, last_capture_ns{}, domain_bracket_ns{};
     std::uint64_t reject_mapping{}, reject_clock_now{}, reject_future{}, reject_stale{}, reject_nonmonotonic{};
-    std::uint64_t reject_unhealthy{}, reject_after_build{};
+    std::uint64_t reject_unhealthy{}, reject_after_build{}, reject_after_conversion{};
+    std::uint64_t converted_input_frames{}, converted_output_frames{}, converter_latency_input_frames{};
+    std::uint64_t anchor_observations{}, anchor_measurements{}, anchor_out_of_range{};
+    double last_original_rate_ppm{};
+    std::int64_t maximum_conversion_ns{};
     std::optional<std::int64_t> minimum_mapped_minus_now, maximum_mapped_minus_now;
     std::optional<std::int64_t> minimum_qpc_minus_internal, maximum_qpc_minus_internal;
     std::array<Rejection, 8> first_rejections{};
@@ -322,6 +328,7 @@ struct Statistics {
     std::atomic<std::uint64_t> rtp_packets{}, rtcp_packets{}, sender_reports{}, rtp_payload_bytes{};
     std::atomic<std::uint64_t> first_rtp_pts{}, last_rtp_pts{}, last_sr_ntp64{};
     std::atomic<guint32> last_rtp_timestamp{}, last_sr_rtp_timestamp{};
+    std::atomic<std::uint64_t> rtp_frame_steps{}, rtp_nominal_pts_steps{}, rtp_invalid_payload{};
 };
 
 void range_observation(std::optional<std::int64_t> &minimum, std::optional<std::int64_t> &maximum,
@@ -355,66 +362,39 @@ void record_rejection(Statistics &stats, const char *reason, const Packet &packe
     stats.last_rejection = rejected;
 }
 
-void mix_property(GstElement *element, const CaptureFormat &format)
-{
-    GValue matrix = G_VALUE_INIT;
-    g_value_init(&matrix, GST_TYPE_ARRAY);
-    for (const auto &values : format.mix) {
-        GValue row = G_VALUE_INIT;
-        g_value_init(&row, GST_TYPE_ARRAY);
-        for (unsigned i = 0; i < format.channels; ++i) {
-            GValue value = G_VALUE_INIT;
-            g_value_init(&value, G_TYPE_FLOAT);
-            g_value_set_float(&value, values[i]);
-            gst_value_array_append_value(&row, &value);
-            g_value_unset(&value);
-        }
-        gst_value_array_append_value(&matrix, &row);
-        g_value_unset(&row);
-    }
-    g_object_set_property(G_OBJECT(element), "mix-matrix", &matrix);
-    g_value_unset(&matrix);
-}
-
 class SenderPipeline {
 public:
     SenderPipeline(const Arguments &args, const CaptureFormat &format, GstClock *clock, Statistics &stats)
-        : stats_(stats)
+        : stats_(stats), converter_(format.info, format.mix, format.rate / 2),
+          converted_(48'000 * 2), epoch_{static_cast<std::uint64_t>(g_random_int()) + 1, stats.resets + 1}
     {
+        stats_.converter_latency_input_frames = converter_.max_latency_input_frames();
         pipeline_.reset(gst_pipeline_new("avsync-desktop-sender"));
         require(pipeline_ != nullptr, "create_pipeline");
         source_ = make("appsrc", "captured-desktop");
-        auto *mix = make("audioconvert", "explicit-stereo-mix");
-        auto *float_caps = make("capsfilter", "stereo-float");
-        auto *resample = make("audioresample", "fixed-rate-resample");
         auto *quantize = make("audioconvert", "pcm24-convert");
         auto *wire_caps = make("capsfilter", "wire-format");
         pay_ = make("rtpL24pay", "pcm24-payload");
         rtpbin_ = make("rtpbin", "rtp-session");
         auto *rtp_sink = make("udpsink", "rtp-output");
         auto *rtcp_sink = make("udpsink", "rtcp-output");
-        const auto max_bytes = static_cast<guint64>(format.rate) * format.block_align / 10;
+        constexpr guint64 max_bytes = 48'000 * 2 * sizeof(float) / 10;
         g_object_set(source_, "is-live", TRUE, "format", GST_FORMAT_TIME, "do-timestamp", FALSE,
                      "block", FALSE, "max-time", static_cast<guint64>(max_age_ns),
                      "max-bytes", max_bytes, "max-buffers", static_cast<guint64>(32),
                      "leaky-type", GST_APP_LEAKY_TYPE_UPSTREAM, "emit-signals", TRUE,
                      "min-latency", static_cast<gint64>(0), "max-latency", static_cast<gint64>(max_age_ns), nullptr);
-        CapsPtr input_caps(gst_audio_info_to_caps(&format.info));
+        CapsPtr input_caps(gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "F32LE",
+            "layout", G_TYPE_STRING, "interleaved", "channels", G_TYPE_INT, 2,
+            "rate", G_TYPE_INT, 48000, "channel-mask", GST_TYPE_BITMASK,
+            static_cast<guint64>(3), nullptr));
         require(input_caps != nullptr, "create_input_caps");
         gst_app_src_set_caps(GST_APP_SRC(source_), input_caps.get());
         g_signal_connect(source_, "enough-data", G_CALLBACK(enough_data), this);
-        mix_property(mix, format);
-        CapsPtr floating(gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "F32LE",
-            "layout", G_TYPE_STRING, "interleaved", "channels", G_TYPE_INT, 2,
-            "rate", G_TYPE_INT, static_cast<gint>(format.rate), "channel-mask", GST_TYPE_BITMASK,
-            static_cast<guint64>(3), nullptr));
         CapsPtr wire(gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S24BE",
             "layout", G_TYPE_STRING, "interleaved", "channels", G_TYPE_INT, 2,
             "rate", G_TYPE_INT, 48000, "channel-mask", GST_TYPE_BITMASK, static_cast<guint64>(3), nullptr));
-        g_object_set(float_caps, "caps", floating.get(), nullptr);
         g_object_set(wire_caps, "caps", wire.get(), nullptr);
-        g_object_set(resample, "quality", 10, "resample-method", GST_AUDIO_RESAMPLER_METHOD_KAISER,
-                     "sinc-filter-mode", GST_AUDIO_RESAMPLER_FILTER_MODE_AUTO, nullptr);
         // Deterministic 24-bit quantization for the first conversion fixtures.
         g_object_set(quantize, "dithering", 0, "noise-shaping", 0, nullptr);
         guint32 ssrc;
@@ -432,7 +412,7 @@ public:
                      "sync", FALSE, "async", FALSE, "buffer-size", 16384, nullptr);
         g_object_set(rtcp_sink, "host", args.host.c_str(), "port", static_cast<gint>(args.rtcp_port),
                      "sync", FALSE, "async", FALSE, "buffer-size", 16384, nullptr);
-        require(gst_element_link_many(source_, mix, float_caps, resample, quantize, wire_caps, pay_, nullptr),
+        require(gst_element_link_many(source_, quantize, wire_caps, pay_, nullptr),
                 "link_conversion_pipeline");
         GstPtr<GstPad> send_rtp(gst_element_request_pad_simple(rtpbin_, "send_rtp_sink_0"));
         GstPtr<GstPad> pay_src(gst_element_get_static_pad(pay_, "src"));
@@ -447,7 +427,7 @@ public:
         require(rtcp_src && rtcp_in && gst_pad_link(rtcp_src.get(), rtcp_in.get()) == GST_PAD_LINK_OK,
                 "link_rtcp_output");
         gst_pad_add_probe(rtp_src.get(), static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER |
-                          GST_PAD_PROBE_TYPE_BUFFER_LIST), rtp_probe, &stats_, nullptr);
+                          GST_PAD_PROBE_TYPE_BUFFER_LIST), rtp_probe, this, nullptr);
         gst_pad_add_probe(rtcp_src.get(), GST_PAD_PROBE_TYPE_BUFFER, rtcp_probe, &stats_, nullptr);
         GObject *session = nullptr;
         g_signal_emit_by_name(rtpbin_, "get-internal-session", 0, &session);
@@ -485,19 +465,66 @@ public:
             if (failed) throw Failure{"gstreamer_pipeline_error", code};
         }
     }
-    void push(const Capture &capture, const Packet &packet, std::int64_t mapped_ns)
+    bool push(const Capture &capture, const Packet &packet, std::int64_t mapped_ns,
+              std::int64_t shared_now, GstClock *clock, Steady::time_point deadline)
     {
-        BufferPtr buffer(gst_buffer_new_allocate(nullptr, packet.bytes, nullptr));
-        require(buffer != nullptr && gst_buffer_fill(buffer.get(), 0, capture.data(), packet.bytes) == packet.bytes,
-                "allocate_input_buffer");
-        GST_BUFFER_PTS(buffer.get()) = static_cast<GstClockTime>(mapped_ns);
+        if (!anchors_) {
+            avsync::AudioAnchorConfig config;
+            config.rate.nominal_rate = capture.format().rate;
+            config.device_frame_origin = packet.device_position;
+            config.max_anchor_age_ns = max_age_ns;
+            config.max_future_ns = capture_window.maximum_future_ns;
+            anchors_.emplace(epoch_, config);
+            nominal_timeline_.emplace(mapped_ns, 48'000);
+        }
+        // Keep originals in their own metadata ledger. They are NOT serialized
+        // yet, and nominal RTP time must not be used for receiver ASRC control.
+        const auto observation = anchors_->observe({epoch_, anchor_sequence_++, packet.device_position,
+            mapped_ns, capture.format().rate, false}, shared_now);
+        require(!anchors_->faulted(), "original_capture_anchor_invalid");
+        ++stats_.anchor_observations;
+        if (observation.estimate) {
+            ++stats_.anchor_measurements;
+            stats_.last_original_rate_ppm = observation.estimate->source_rate_error_ppm;
+            if (!observation.estimate->within_correction_limit) ++stats_.anchor_out_of_range;
+        }
+        const auto started = Steady::now();
+        const auto converted = converter_.process(
+            {reinterpret_cast<const std::byte*>(capture.data()), packet.bytes}, packet.frames, converted_);
+        stats_.maximum_conversion_ns = std::max(stats_.maximum_conversion_ns,
+            static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Steady::now()-started).count()));
+        require((converted.status == avsync::audio::NominalAudioStatus::progress ||
+                 converted.status == avsync::audio::NominalAudioStatus::no_progress) &&
+                converted.input_frames_used == packet.frames, "nominal_conversion_failed");
+        stats_.converted_input_frames += converted.input_frames_used;
+        stats_.converted_output_frames += converted.output_frames_generated;
+        if (!converted.output_frames_generated) return true;
+        require(converted.output_frames_generated <= converted_.size()/2 &&
+                wire_frames_ <= std::numeric_limits<std::uint64_t>::max()-converted.output_frames_generated,
+                "nominal_conversion_size");
+        const auto end_frame = wire_frames_ + converted.output_frames_generated;
+        const auto pts = nominal_timeline_->at(wire_frames_);
+        const auto end = nominal_timeline_->at(end_frame);
+        require(pts && end, "nominal_timeline_overflow");
+        const auto bytes = converted.output_frames_generated * 2 * sizeof(float);
+        BufferPtr buffer(gst_buffer_new_allocate(nullptr, bytes, nullptr));
+        require(buffer != nullptr && gst_buffer_fill(buffer.get(), 0, converted_.data(), bytes) == bytes,
+                "allocate_converted_buffer");
+        GST_BUFFER_PTS(buffer.get()) = static_cast<GstClockTime>(*pts);
         GST_BUFFER_DTS(buffer.get()) = GST_CLOCK_TIME_NONE;
-        GST_BUFFER_DURATION(buffer.get()) = gst_util_uint64_scale(packet.frames, GST_SECOND, capture.format().rate);
-        GST_BUFFER_OFFSET(buffer.get()) = packet.device_position;
-        GST_BUFFER_OFFSET_END(buffer.get()) = packet.device_position + packet.frames;
+        GST_BUFFER_DURATION(buffer.get()) = static_cast<GstClockTime>(*end-*pts);
+        GST_BUFFER_OFFSET(buffer.get()) = wire_frames_;
+        GST_BUFFER_OFFSET_END(buffer.get()) = end_frame;
+        wire_frames_ = end_frame;
         if (first_) { GST_BUFFER_FLAG_SET(buffer.get(), GST_BUFFER_FLAG_DISCONT); first_ = false; }
+        const auto after_conversion = gst_clock_get_time(clock);
+        if (Steady::now() >= deadline ||
+            after_conversion > static_cast<guint64>(std::numeric_limits<std::int64_t>::max()) ||
+            avsync::capture_window_status(mapped_ns, static_cast<std::int64_t>(after_conversion), capture_window) !=
+                avsync::CaptureWindowStatus::accepted) return false;
         const auto flow = gst_app_src_push_buffer(GST_APP_SRC(source_), buffer.release());
         require(flow == GST_FLOW_OK, "appsrc_push_failed");
+        return true;
     }
 private:
     GstElement *make(const char *factory, const char *name)
@@ -514,14 +541,29 @@ private:
     {
         static_cast<SenderPipeline *>(opaque)->overflow_.store(true);
     }
-    static void count_rtp(GstBuffer *buffer, Statistics &stats)
+    void count_rtp(GstBuffer *buffer)
     {
+        auto &stats = stats_;
         GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
-        if (!gst_rtp_buffer_map(buffer, GST_MAP_READ, &rtp)) return;
+        if (!gst_rtp_buffer_map(buffer, GST_MAP_READ, &rtp)) { ++stats.rtp_invalid_payload; return; }
         const auto count = stats.rtp_packets.fetch_add(1);
         stats.rtp_payload_bytes.fetch_add(gst_rtp_buffer_get_payload_len(&rtp));
         stats.last_rtp_timestamp.store(gst_rtp_buffer_get_timestamp(&rtp));
         const auto pts = GST_BUFFER_PTS(buffer);
+        const auto payload = gst_rtp_buffer_get_payload_len(&rtp);
+        if (!payload || payload % 6) ++stats.rtp_invalid_payload;
+        const auto stamp = gst_rtp_buffer_get_timestamp(&rtp);
+        if (!rtp_timeline_) {
+            if (GST_CLOCK_TIME_IS_VALID(pts) && pts <= static_cast<guint64>(std::numeric_limits<std::int64_t>::max()))
+                rtp_timeline_.emplace(static_cast<std::int64_t>(pts), 48'000);
+            rtp_origin_ = stamp;
+        }
+        if (stamp != static_cast<guint32>(rtp_origin_ + rtp_frames_)) ++stats.rtp_frame_steps;
+        const auto expected = rtp_timeline_ ? rtp_timeline_->at(rtp_frames_) : std::nullopt;
+        if (!expected || !GST_CLOCK_TIME_IS_VALID(pts) ||
+            pts > static_cast<guint64>(std::numeric_limits<std::int64_t>::max()) ||
+            std::abs(static_cast<std::int64_t>(pts)-*expected) > 1) ++stats.rtp_nominal_pts_steps;
+        rtp_frames_ += payload/6;
         if (GST_CLOCK_TIME_IS_VALID(pts)) {
             if (!count) stats.first_rtp_pts.store(pts);
             stats.last_rtp_pts.store(pts);
@@ -530,13 +572,13 @@ private:
     }
     static GstPadProbeReturn rtp_probe(GstPad *, GstPadProbeInfo *info, gpointer opaque)
     {
-        auto &stats = *static_cast<Statistics *>(opaque);
+        auto &self = *static_cast<SenderPipeline *>(opaque);
         if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)
-            count_rtp(GST_PAD_PROBE_INFO_BUFFER(info), stats);
+            self.count_rtp(GST_PAD_PROBE_INFO_BUFFER(info));
         else if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
             auto *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
             for (guint i = 0; i < gst_buffer_list_length(list); ++i)
-                count_rtp(gst_buffer_list_get(list, i), stats);
+                self.count_rtp(gst_buffer_list_get(list, i));
         }
         return GST_PAD_PROBE_OK;
     }
@@ -563,6 +605,13 @@ private:
         return GST_PAD_PROBE_OK;
     }
     Statistics &stats_;
+    avsync::audio::NominalAudioConverter converter_;
+    std::vector<float> converted_;
+    avsync::SessionToken epoch_;
+    std::optional<avsync::AudioAnchorTracker> anchors_;
+    std::optional<avsync::RationalTimeline> nominal_timeline_, rtp_timeline_;
+    std::uint64_t anchor_sequence_{}, wire_frames_{}, rtp_frames_{};
+    guint32 rtp_origin_{};
     GstPtr<GstBus> bus_;
     GstElement *source_{}, *pay_{}, *rtpbin_{};
     std::atomic<bool> overflow_{false};
@@ -586,6 +635,8 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
                    const char *status, const char *error_stage = nullptr, std::uint32_t error_code = 0)
 {
     std::cout << "{\"schema\":1,\"status\":\"" << status << "\",\"desktop_only\":true,\"receiver_verified\":false"
+              << ",\"timestamp_semantics\":\"nominal_media_not_original_capture\",\"original_anchors_transmitted\":false"
+              << ",\"adaptive_correction\":false"
               << ",\"clock_usable\":" << (health.usable ? "true" : "false")
               << ",\"clock_reason\":\"" << health.reason << '"'
               << ",\"clock_observations\":" << health.observations << ",\"domain_bracket_ns\":" << s.domain_bracket_ns;
@@ -598,10 +649,22 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
               << ",\"discontinuities\":" << s.discontinuities << ",\"timestamp_errors\":" << s.timestamp_errors
               << ",\"dropped_packets\":" << s.dropped_packets << ",\"resets\":" << s.resets
               << ",\"queue_overflows\":" << s.queue_overflows << ",\"mapped_packets\":" << s.mapped_packets
+              << ",\"converted_input_frames\":" << s.converted_input_frames
+              << ",\"converted_output_frames\":" << s.converted_output_frames
+              << ",\"converter_latency_input_frames\":" << s.converter_latency_input_frames
+              << ",\"maximum_conversion_ns\":" << s.maximum_conversion_ns
+              << ",\"original_anchor_observations\":" << s.anchor_observations
+              << ",\"original_anchor_measurements\":" << s.anchor_measurements
+              << ",\"original_anchor_out_of_range\":" << s.anchor_out_of_range
+              << ",\"last_original_rate_ppm\":" << s.last_original_rate_ppm
+              << ",\"rtp_frame_steps\":" << s.rtp_frame_steps.load()
+              << ",\"rtp_nominal_pts_steps\":" << s.rtp_nominal_pts_steps.load()
+              << ",\"rtp_invalid_payload\":" << s.rtp_invalid_payload.load()
               << ",\"reject_mapping\":" << s.reject_mapping << ",\"reject_clock_now\":" << s.reject_clock_now
               << ",\"reject_future\":" << s.reject_future << ",\"reject_stale\":" << s.reject_stale
               << ",\"reject_nonmonotonic\":" << s.reject_nonmonotonic
               << ",\"reject_unhealthy\":" << s.reject_unhealthy << ",\"reject_after_build\":" << s.reject_after_build
+              << ",\"reject_after_conversion\":" << s.reject_after_conversion
               << ",\"first_device_position\":" << s.first_device_position << ",\"last_device_position\":" << s.last_device_position
               << ",\"first_qpc_100ns\":" << s.first_qpc_100ns << ",\"last_qpc_100ns\":" << s.last_qpc_100ns
               << ",\"first_capture_ns\":" << s.first_capture_ns << ",\"last_capture_ns\":" << s.last_capture_ns
@@ -768,7 +831,14 @@ int run(const Arguments &args)
                 reset_pipeline();
                 continue;
             }
-            pipeline->push(capture, packet, *mapped);
+            if (!pipeline->push(capture, packet, *mapped, static_cast<std::int64_t>(after_build), clock.get(), deadline)) {
+                ++stats.dropped_packets;
+                ++stats.reject_after_conversion;
+                record_rejection(stats, "after_conversion_deadline_or_age", packet, mapped,
+                    gst_clock_get_time(clock.get()), clock.get(), internal.get());
+                reset_pipeline();
+                continue;
+            }
             last_mapped = mapped;
             if (!stats.mapped_packets) {
                 stats.first_device_position = packet.device_position;
@@ -784,9 +854,11 @@ int run(const Arguments &args)
         pipeline.reset();
         clock_messages(clock_bus.get(), monitor);
         health = monitor.health(clock.get());
-        write_summary(stats, &*observed_format, health,
+        const bool invalid_timing = stats.rtp_frame_steps.load() || stats.rtp_nominal_pts_steps.load() ||
+                                    stats.rtp_invalid_payload.load();
+        write_summary(stats, &*observed_format, health, invalid_timing ? "invalid_nominal_timing" :
                       stats.rtp_packets.load() ? "rtp_output_observed_unverified" : "waiting_no_rtp");
-        return stats.rtp_packets.load() ? 0 : 3;
+        return stats.rtp_packets.load() && !invalid_timing ? 0 : 3;
     } catch (const Failure &failure) {
         write_summary(stats, observed_format ? &*observed_format : nullptr, health, "error", failure.stage, failure.code);
         return 1;
@@ -800,12 +872,13 @@ void help()
 {
     std::cout << "avsync-windows-sender --loopback --host IPV4 --clock-port N --rtp-port N --rtcp-port N --seconds N\n"
                  "Experimental desktop-only WASAPI -> explicit stereo mix -> 48 kHz L24 RTP.\n"
-                 "All options required; seconds is an overall deadline from 1 to 30.\n"
+                 "All options required; seconds is an overall deadline from 1 to 120.\n"
                  "A numeric unicast IPv4 destination and three distinct ports are required.\n"
                  "Help/no arguments opens no audio endpoint and sends no network traffic.\n"
                  "The explicit run captures desktop PCM and sends it unencrypted to that host.\n"
                  "No microphone, recording files, startup changes, endpoint changes or OBS changes.\n"
                  "Shared-monotonic RTCP convention, not UTC. No sender presentation delay.\n"
+                 "Nominal RTP time is NOT original capture time; anchors are not transmitted yet.\n"
                  "Fixed-rate resampling is not long-run device-clock correction.\n";
 }
 } // namespace

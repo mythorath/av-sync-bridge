@@ -31,6 +31,20 @@ if(TARGET avsync_gst_clock)
     add_test(NAME avsync-network-clock-tests COMMAND avsync-network-clock-tests)
 endif()
 
+if(TARGET avsync_nominal_audio)
+    add_executable(avsync-nominal-audio-tests nominal_audio_tests.cpp)
+    target_link_libraries(avsync-nominal-audio-tests PRIVATE avsync_nominal_audio)
+    add_test(NAME avsync-nominal-audio-tests COMMAND avsync-nominal-audio-tests)
+    add_test(NAME avsync-nominal-audio-help COMMAND avsync-nominal-audio-probe --help)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME avsync-nominal-audio-generated-quick COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/run_nominal_audio_suite.py
+            --executable $<TARGET_FILE:avsync-nominal-audio-probe> --quick)
+        set_tests_properties(avsync-nominal-audio-generated-quick PROPERTIES TIMEOUT 120)
+    endif()
+endif()
+
 if(AVSYNC_BUILD_IPC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ipc_tests.cpp")
     add_executable(avsync-ipc-tests ipc_tests.cpp)
     target_link_libraries(avsync-ipc-tests PRIVATE avsync_ipc)

@@ -105,6 +105,12 @@ production audio replacement. See [sender](windows-sender.md),
 This option also builds `avsync-conversion-timing-probe`, an explicitly started
 offline generated-media diagnostic. Its CLI help test opens no device or socket;
 actual runs test the current converter's timestamp behavior, not networking.
+The old timestamped conversion probe is retained as a failure reproduction.
+The new `avsync-nominal-audio-probe` uses the timestamp-free nominal converter;
+`--help` is inert and `--offline` generates bounded PCM in memory only. Run
+`python3 tools/run_nominal_audio_suite.py --executable ./build-network/avsync-nominal-audio-probe`
+for its full generated matrix, or add `--long` for 90-second generated cases.
+This does not open an audio endpoint or listener, play audio, or prove physical A/V sync.
 See [conversion observability](conversion-timing.md).
 
 Ubuntu development packages are `libgstreamer1.0-dev` and

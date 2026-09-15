@@ -23,6 +23,10 @@ PT96 is L24 stereo at 48 kHz. RTP jitter-buffer latency is 100 ms with late
 dropping; this is not the eventual multi-second synchronization buffer. RTCP
 sender reports follow the project's explicit **shared-monotonic, not UTC**
 convention. See [clock contract](network-clock.md) and [sender](windows-sender.md).
+The current sender's references describe its **nominal sample-count media
+timeline**, not original device-clock anchors. The receiver explicitly reports
+`capture_timing_verified=false`. It must not use those references as a surrogate
+for original capture timestamps or as an adaptive-rate command.
 
 Each received SSRC gets a depayloader and a bounded appsink. At most eight
 sessions/report slots are accepted per finite process; further sessions fail

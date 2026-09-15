@@ -166,6 +166,7 @@ public:
         gst_element_get_state(pipeline_, nullptr, nullptr, 5*GST_SECOND);
         std::uint64_t timed = 0, invalid = 0, buffers = 0;
         std::cout << "{\"schema\":1,\"mode\":\"rtp_diagnostic\",\"pcm_saved\":false,\"obs_used\":false,"
+                  << "\"capture_timing_verified\":false,\"reference_semantics\":\"sender_media_time_not_proof_of_capture_time\","
                   << "\"packets_accepted\":" << accepted_.load() << ",\"packets_rejected\":" << rejected_.load()
                   << ",\"invalid_sender_reports\":" << invalid_reports_.load()
                   << ",\"clock_pause_fixture\":" << (clock_paused ? "true" : "false")
