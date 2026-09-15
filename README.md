@@ -4,7 +4,7 @@ An experimental, clock-aware synchronization bridge for independently captured
 video and network audio, designed for OBS Studio.
 
 **Early development — not a working replacement for a production audio bridge.**
-The first milestone is an isolated synthetic timing prototype. Windows capture,
+An isolated synthetic timing prototype is being built. Windows capture,
 network-clock integration, packet recovery, physical video ingest and production
 recovery must each pass explicit validation before a release is recommended.
 
@@ -32,9 +32,24 @@ two seconds stacked on existing audio buffering. The long delay stays outside OB
 
 ## Development
 
-Portable core: C++20 and CMake 3.24 or newer. Linux service and OBS integration are
-optional. Build instructions and test coverage will be added with each working
-component; the roadmap must distinguish implemented work from proposed design.
+Portable core: C++20 and CMake 3.24 or newer. Linux IPC and OBS integration are
+optional. See [build instructions](docs/building.md), [architecture](docs/architecture.md),
+[timing contracts](docs/timing.md), [IPC](docs/ipc.md), and [roadmap](docs/roadmap.md).
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The default build includes the portable core, plus synthetic IPC tools on Linux.
+It does **not** build/install an OBS plugin, capture real media, open network ports,
+change startup tasks, or touch an OBS profile. Tests remain active in Release builds.
+
+Implemented foundation: timestamp arithmetic, rational cadence, bounded queues,
+rate-estimation recommendations, privacy-cutoff logic, local synthetic IPC and an
+optional native OBS adapter. A rate estimate is not implemented ASRC; simulated
+audio is not WASAPI capture; local IPC is not network-clock synchronization.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

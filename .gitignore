@@ -24,3 +24,7 @@
 *.user
 /PLAN.md
 CMakeUserPresets.json
+__pycache__/
+*.py[cod]
+/core
+/core.*
