@@ -14,7 +14,10 @@ ctest --test-dir build -C Release --output-on-failure
 
 For a core-only build on either platform add `-DAVSYNC_BUILD_IPC=OFF`. Linux IPC is
 enabled by default on Linux and disabled on other systems. The Windows build does
-not yet contain an audio sender. No external test framework is downloaded.
+not yet contain an audio sender. It includes the optional metadata-only WASAPI
+probe (`AVSYNC_BUILD_WINDOWS_PROBE=ON` by default on Windows); its help test does
+not open an endpoint. See [explicit probe use](windows-capture.md). No external
+test framework is downloaded.
 
 Optional Linux memory/undefined-behavior checks:
 
@@ -94,9 +97,66 @@ python3 tools/measure_synthetic.py ./synthetic-test.mkv
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The helper returns zero for a valid six-marker match, two for a marker mismatch,
-and one for a decoding/processing error. **A valid match does not assert acceptable
-sync**: inspect the audio-minus-video offsets and apply the release gates
-separately. Missing/extra markers are rejected, not matched to a convenient
+The helper returns zero for a valid marker match and any requested timing gates,
+two for a marker mismatch, three for a timing-gate failure, and one for a
+decoding/processing error. Without timing limits, **a valid match does not assert
+acceptable sync**. Missing/extra markers are rejected, not matched to a convenient
 subset or repeating cycle. Headless Xvfb/CPU rendering is not a 4K60 hardware
 performance benchmark. See [initial validation](validation-2026-09-15.md).
+
+```sh
+python3 tools/measure_synthetic.py ./synthetic-test.mkv \
+  --max-median-ms 16.667 --max-offset-ms 33.333
+```
+
+`--cycles N` explicitly requires all six markers in each of N complete cycles,
+including their inter-cycle spacing (1..6 cycles, maximum 120-second recording).
+It does not search for a cycle shift or discard troublesome events. Region
+boundaries are included to expose split tones. Median limits apply to each
+track's absolute median; maximum limits apply to every marker's absolute offset.
+
+## Repeatable synthetic regression suite
+
+The Linux-only runner creates an isolated display and starts only the project's
+test producer/harness. It never attaches to the OBS GUI. Supply a **new** output
+directory inside an existing trusted parent; recordings and logs are private and
+must not be committed. Replace the module/data paths to match your installation.
+
+```sh
+python3 tools/run_synthetic_suite.py --build-dir ./build-obs \
+  --obs-plugins /usr/lib/x86_64-linux-gnu/obs-plugins \
+  --obs-data /usr/share/obs/obs-plugins \
+  --output-dir "$XDG_RUNTIME_DIR/avsync-regression-new"
+```
+
+The default is three fresh baseline recordings with the explicit timing gates
+above. Every run writes `measurement.json`, `obs.log`, generated `encoded.mkv`,
+and pre-encoder mixer RMS traces (`.mix0.csv` / `.mix1.csv`). Raw traces use
+absolute monotonic sample timestamps; the harness's recording-start log is **not**
+the encoded file's zero point. Callbacks append to bounded preallocated memory;
+CSV files are written only after callbacks have been disconnected. The runner
+also requires a 2 ms absolute raw-mixer check against the producer's known
+presentation schedule, independently of encoded relative A/V alignment. The
+intentionally muted mic uses the separate known-event assertion described below.
+
+Repeat `--case` to select specific scenarios:
+
+| Case | What it exercises |
+| --- | --- |
+| `baseline` | Fresh producer and OBS harness, 40 ms handoff lead |
+| `lead-zero` | Diagnostic control with no handoff lead; failures are retained |
+| `restart` | Stop a first producer, keep OBS sources alive, then start a new epoch before measuring a complete new cycle |
+| `stall` | Pause only the generated producer for 400 ms; no physical device or production service is signaled |
+| `stagger` | Video, desktop and mic source creation staggered while producer starts |
+| `hide` | Hide/show synthetic video between markers without resetting its clock |
+| `mute` | Mute/unmute mic; buffered fixture event 3 must not replay |
+| `rapid-mute` | Immediate mute/unmute in one harness iteration; same expected cutoff |
+
+Mute fixtures intentionally have five mic markers and six desktop/video markers.
+The runner checks the **known** suppressed event rather than inferring a subset,
+and applies both median and maximum timing gates to the remaining events. These
+fixtures do not establish privacy through arbitrary real audio filters.
+
+`--cycles 3` runs a roughly one-minute multi-cycle check (`mute` and `rapid-mute`
+currently require one cycle). This is not a 30-minute load test. The runner
+cleans up only processes it creates and reports cleanup failures as failures.

@@ -20,6 +20,9 @@ struct Config {
 
 enum class ReadResult { ok, empty, busy, disconnected, invalid, buffer_too_small, stale };
 
+// Maximum explicit audio handoff lead. Long intentional delays remain in the ring.
+inline constexpr std::int64_t max_audio_lookahead_ns = 100000000;
+
 struct FrameInfo {
     std::uint64_t generation{}, sequence{};
     std::int64_t capture_ns{}, presentation_ns{};
@@ -85,6 +88,14 @@ public:
     ReadResult read_next_due_audio(unsigned stream, std::int64_t now_ns,
                                   std::span<float> dst, FrameInfo& info,
                                   std::int64_t max_lateness_ns = 100000000) noexcept;
+    // Oldest unconsumed audio with presentation <= now + max_future_ns.
+    // max_future_ns must be in [0, max_audio_lookahead_ns]. Heartbeat expiry and
+    // lateness use actual now_ns, not that future deadline. Timestamps are unchanged.
+    // This is a small explicit handoff allowance, not a new/rebased source clock.
+    ReadResult read_next_audio(unsigned stream, std::int64_t now_ns,
+                               std::int64_t max_future_ns, std::span<float> dst,
+                               FrameInfo& info,
+                               std::int64_t max_lateness_ns = 100000000) noexcept;
     ReadResult poll_status(std::int64_t now_ns, Status& status) noexcept;
 private:
     struct Impl;

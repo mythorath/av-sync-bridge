@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Measure a single complete synthetic marker cycle in an encoded test file.
+"""Measure explicitly counted complete synthetic marker cycles in a test file.
 
 Requires Python 3.10+, ffmpeg and ffprobe; no Python packages. Read-only analysis
 of trusted short test recordings. This is not a hardware calibration tool.
@@ -19,6 +19,8 @@ import sys
 from typing import Sequence
 
 EVENT_SECONDS = (1.0, 2.35, 4.1, 6.7, 10.15, 14.8)
+CYCLE_SECONDS = 20.0
+MAX_CYCLES = 6  # Bounded by the 120-second short-recording decoder limit.
 GRAY_WIDTH, GRAY_HEIGHT = 32, 18
 
 
@@ -68,14 +70,12 @@ def decoded_times(frames: list[dict]) -> list[float]:
     return times
 
 
-def threshold_onsets(times: Sequence[float], levels: Sequence[float], durations: Sequence[float],
-                     threshold: float, *, bridge_gap: float = 0.003,
-                     min_duration: float = 0.010, max_duration: float = 0.200) -> list[float]:
-    """Find threshold regions, bridging tiny codec/envelope holes, not event gaps."""
+def threshold_regions(times: Sequence[float], levels: Sequence[float], durations: Sequence[float],
+                      threshold: float, *, bridge_gap: float = 0.003) -> list[dict]:
+    """Expose every above-threshold region; never merge genuine inter-tone gaps."""
     if not (len(times) == len(levels) == len(durations)):
         raise MeasurementError("Detector arrays have different lengths")
-    if (not math.isfinite(threshold) or threshold <= 0 or bridge_gap < 0 or
-            min_duration <= 0 or max_duration < min_duration):
+    if not math.isfinite(threshold) or threshold <= 0 or not math.isfinite(bridge_gap) or bridge_gap < 0:
         raise MeasurementError("Invalid detector limits")
     regions: list[list[float]] = []
     previous_time = None
@@ -90,10 +90,20 @@ def threshold_onsets(times: Sequence[float], levels: Sequence[float], durations:
             regions[-1][1] = timestamp + duration
         else:
             regions.append([timestamp, timestamp + duration])
+    return [{"start_seconds": start, "end_seconds": end, "duration_ms": (end - start) * 1000}
+            for start, end in regions]
+
+
+def region_onsets(regions: Sequence[dict], *, min_duration: float = 0.010,
+                  max_duration: float = 0.200) -> list[float]:
+    if (not all(math.isfinite(value) for value in (min_duration, max_duration)) or
+            min_duration <= 0 or max_duration < min_duration):
+        raise MeasurementError("Invalid region duration limits")
     onsets = []
-    for start, end in regions:
+    for region in regions:
+        start, end = region["start_seconds"], region["end_seconds"]
         duration = end - start
-        if duration < min_duration:
+        if duration < min_duration - 1e-9:
             # A short isolated click is reported as an ambiguity, not silently
             # discarded to manufacture the expected event count.
             raise MeasurementError("Ambiguous short above-threshold region")
@@ -103,21 +113,35 @@ def threshold_onsets(times: Sequence[float], levels: Sequence[float], durations:
     return onsets
 
 
-def fingerprint(onsets: Sequence[float], tolerance: float = 0.040) -> dict:
+def threshold_onsets(times: Sequence[float], levels: Sequence[float], durations: Sequence[float],
+                     threshold: float, *, bridge_gap: float = 0.003,
+                     min_duration: float = 0.010, max_duration: float = 0.200) -> list[float]:
+    regions = threshold_regions(times, levels, durations, threshold, bridge_gap=bridge_gap)
+    return region_onsets(regions, min_duration=min_duration, max_duration=max_duration)
+
+
+def expected_schedule(cycles: int = 1) -> tuple[float, ...]:
+    if isinstance(cycles, bool) or not isinstance(cycles, int) or not 1 <= cycles <= MAX_CYCLES:
+        raise MeasurementError(f"Cycle count must be an integer from 1 to {MAX_CYCLES}")
+    return tuple(cycle * CYCLE_SECONDS + event for cycle in range(cycles) for event in EVENT_SECONDS)
+
+
+def fingerprint(onsets: Sequence[float], tolerance: float = 0.040, *, cycles: int = 1) -> dict:
+    schedule = expected_schedule(cycles)
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise MeasurementError("Fingerprint tolerance must be positive")
     if any(not math.isfinite(value) for value in onsets):
         raise MeasurementError("Non-finite marker timestamp")
     count = len(onsets)
-    result = {"count": count, "expected_count": len(EVENT_SECONDS),
-              "missing_count": max(0, len(EVENT_SECONDS) - count),
-              "extra_or_duplicate_count": max(0, count - len(EVENT_SECONDS)),
+    result = {"count": count, "expected_count": len(schedule), "expected_cycles": cycles,
+              "missing_count": max(0, len(schedule) - count),
+              "extra_or_duplicate_count": max(0, count - len(schedule)),
               "valid": False, "interval_error_ms": []}
-    if count != len(EVENT_SECONDS):
+    if count != len(schedule):
         result["reason"] = "Marker count mismatch; no subset or cycle matching attempted"
         return result
     gaps = [b - a for a, b in zip(onsets, onsets[1:])]
-    expected = [b - a for a, b in zip(EVENT_SECONDS, EVENT_SECONDS[1:])]
+    expected = [b - a for a, b in zip(schedule, schedule[1:])]
     errors = [gap - reference for gap, reference in zip(gaps, expected)]
     result["interval_error_ms"] = [error * 1000 for error in errors]
     result["valid"] = all(gap > 0 and abs(error) <= tolerance
@@ -128,15 +152,26 @@ def fingerprint(onsets: Sequence[float], tolerance: float = 0.040) -> dict:
 
 
 def compare_onsets(video: Sequence[float], audio_tracks: Sequence[Sequence[float]],
-                   tolerance: float = 0.040) -> dict:
+                   tolerance: float = 0.040, *, cycles: int = 1,
+                   max_median_ms: float | None = None, max_offset_ms: float | None = None) -> dict:
     if len(audio_tracks) != 2:
         raise MeasurementError("Exactly two distinct audio tracks are required")
-    checks = [fingerprint(video, tolerance)] + [fingerprint(track, tolerance) for track in audio_tracks]
+    for limit in (max_median_ms, max_offset_ms):
+        if limit is not None and (not math.isfinite(limit) or limit < 0):
+            raise MeasurementError("Timing limits must be finite and nonnegative")
+    gate_requested = max_median_ms is not None or max_offset_ms is not None
+    checks = [fingerprint(video, tolerance, cycles=cycles)] + [
+        fingerprint(track, tolerance, cycles=cycles) for track in audio_tracks]
     valid = all(check["valid"] for check in checks)
     result = {"valid_marker_match": valid, "video_onsets_seconds": list(video),
               "video_fingerprint": checks[0], "tracks": [],
               "offset_convention": "audio minus video; positive means audio is later",
-              "pairing": "same ordered six-marker fingerprint; no modulo or cycle shift"}
+              "pairing": "complete ordered requested schedule; no subsets, modulo, or cycle shift",
+              "expected_cycles": cycles,
+              "timing_gate": {"requested": gate_requested,
+                              "max_absolute_median_ms": max_median_ms,
+                              "max_absolute_offset_ms": max_offset_ms,
+                              "passed": None}}
     for index, track in enumerate(audio_tracks):
         report = {"audio_track": index, "onsets_seconds": list(track), "fingerprint": checks[index + 1]}
         if valid:
@@ -147,7 +182,23 @@ def compare_onsets(video: Sequence[float], audio_tracks: Sequence[Sequence[float
             report["max_offset_ms"] = max(offsets)
             report["peak_to_peak_jitter_ms"] = max(offsets) - min(offsets)
             report["population_stddev_ms"] = statistics.pstdev(offsets)
+            report["first_to_last_offset_change_ms"] = offsets[-1] - offsets[0]
+            report["cycle_median_offset_ms"] = [statistics.median(offsets[start:start + len(EVENT_SECONDS)])
+                                                for start in range(0, len(offsets), len(EVENT_SECONDS))]
+            if gate_requested:
+                violations = []
+                if max_median_ms is not None and abs(report["median_offset_ms"]) > max_median_ms + 1e-9:
+                    violations.append("absolute median offset exceeds limit")
+                if max_offset_ms is not None and max(map(abs, offsets)) > max_offset_ms + 1e-9:
+                    violations.append("at least one absolute marker offset exceeds limit")
+                report["timing_gate"] = {"passed": not violations, "violations": violations}
         result["tracks"].append(report)
+    if not valid:
+        result["timing_gate"]["reason"] = "Not evaluated: marker match is invalid"
+    elif gate_requested:
+        result["timing_gate"]["passed"] = all(track["timing_gate"]["passed"] for track in result["tracks"])
+    else:
+        result["timing_gate"]["reason"] = "Not requested: offsets are measurements only"
     return result
 
 
@@ -170,12 +221,14 @@ def measure_video(path: str, stream: dict, ffmpeg: str, ffprobe: str) -> tuple[l
         raise MeasurementError("Too few video frames")
     period = statistics.median(gaps)
     durations = gaps + [period]
-    onsets = threshold_onsets(times, levels, durations, (min(levels) + max(levels)) / 2,
-                             bridge_gap=period / 2, min_duration=period / 2, max_duration=0.2)
+    regions = threshold_regions(times, levels, durations, (min(levels) + max(levels)) / 2,
+                                bridge_gap=period / 2)
+    onsets = region_onsets(regions, min_duration=period / 2, max_duration=0.2)
     return onsets, {"stream_index": index, "codec": stream.get("codec_name"),
                     "stream_start_time": stream.get("start_time"), "decoded_first_pts": times[0],
                     "decoded_frames": len(times), "median_frame_interval_ms": period * 1000,
                     "max_frame_interval_ms": max(gaps) * 1000,
+                    "detected_regions": regions,
                     "detector": "full-frame grayscale flash, binary pixel IDs deliberately ignored"}
 
 
@@ -220,8 +273,8 @@ def measure_audio(path: str, stream: dict, ffmpeg: str, ffprobe: str) -> tuple[l
     if peak < 0.005:
         raise MeasurementError("Audio contains no sufficiently strong synthetic tones")
     threshold = max(0.002, peak * 0.12)
-    onsets = threshold_onsets(times, levels, durations, threshold,
-                             bridge_gap=0.003, min_duration=0.010, max_duration=0.080)
+    regions = threshold_regions(times, levels, durations, threshold, bridge_gap=0.003)
+    onsets = region_onsets(regions, min_duration=0.010, max_duration=0.080)
     residuals = [frame_times[n + 1] - (frame_times[n] + counts[n] / rate)
                  for n in range(len(counts) - 1)]
     return onsets, {"stream_index": index, "codec": stream.get("codec_name"), "sample_rate": rate,
@@ -230,6 +283,7 @@ def measure_audio(path: str, stream: dict, ffmpeg: str, ffprobe: str) -> tuple[l
                     "decoded_frames": len(frames), "decoded_samples": len(samples),
                     "rms_window_ms": window / rate * 1000, "rms_threshold": threshold,
                     "peak_rms": peak,
+                    "detected_regions": regions,
                     "max_decoded_frame_continuity_residual_ms": max(map(abs, residuals), default=0) * 1000,
                     "decoder_side_data": [frame["side_data_list"] for frame in frames if "side_data_list" in frame]}
 
@@ -240,9 +294,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--interval-tolerance-ms", type=float, default=40.0)
+    parser.add_argument("--cycles", type=int, default=1,
+                        help="Explicit count of complete 20-second cycles (1..6); never inferred")
+    parser.add_argument("--max-median-ms", type=float,
+                        help="Fail timing gate when either track's absolute median offset exceeds this")
+    parser.add_argument("--max-offset-ms", type=float,
+                        help="Fail timing gate when any absolute marker offset exceeds this")
     parser.add_argument("--max-duration", type=float, default=120.0)
     args = parser.parse_args(argv)
     try:
+        expected_schedule(args.cycles)
         metadata = probe(args.recording, args.ffprobe)
         duration = finite_number(metadata.get("format", {}).get("duration"), "recording duration")
         if not math.isfinite(args.max_duration) or not 0 < duration <= args.max_duration <= 120:
@@ -253,7 +314,9 @@ def main(argv: list[str] | None = None) -> int:
             raise MeasurementError("Require exactly one video stream and two distinct audio streams")
         video_onsets, video_info = measure_video(args.recording, videos[0], args.ffmpeg, args.ffprobe)
         measured = [measure_audio(args.recording, stream, args.ffmpeg, args.ffprobe) for stream in audios]
-        result = compare_onsets(video_onsets, [item[0] for item in measured], args.interval_tolerance_ms / 1000)
+        result = compare_onsets(video_onsets, [item[0] for item in measured], args.interval_tolerance_ms / 1000,
+                                cycles=args.cycles, max_median_ms=args.max_median_ms,
+                                max_offset_ms=args.max_offset_ms)
         result["video_decode"] = video_info
         for report, (_, info) in zip(result["tracks"], measured):
             report["decode"] = info
@@ -264,7 +327,9 @@ def main(argv: list[str] | None = None) -> int:
             "A valid marker match is not a claim of acceptable synchronization or hardware validation.",
             "Count differences are net missing/extra detections, not proof of which physical marker was lost."]
         print(json.dumps(result, indent=2, allow_nan=False))
-        return 0 if result["valid_marker_match"] else 2
+        if not result["valid_marker_match"]:
+            return 2
+        return 3 if result["timing_gate"]["passed"] is False else 0
     except (MeasurementError, KeyError, ValueError) as exc:
         print(json.dumps({"valid_marker_match": False, "error": str(exc)}, indent=2), file=sys.stderr)
         return 1

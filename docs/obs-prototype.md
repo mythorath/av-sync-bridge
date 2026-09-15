@@ -29,11 +29,19 @@ Source type IDs and settings:
 | `avsync_prototype_desktop` | Independent stereo PCM audio input |
 | `avsync_prototype_microphone` | Independent mono PCM audio input |
 
-Each has one setting, `ipc_path`, pointing to the same producer mapping. The
+Each has an `ipc_path` setting pointing to the same producer mapping. The
 default is `$XDG_RUNTIME_DIR/av-sync-bridge.ipc`, matching the producer. If the
 runtime variable is absent or empty, set `ipc_path` explicitly; there is no shared
 `/tmp` fallback. These types do not create sources or rename existing sources by
 themselves. For a test, add instances with clearly synthetic names.
+
+The two audio types also accept the developer setting `handoff_lead_ms`, an
+integer from 0 to 100, default 40. Negative/out-of-range values are rejected;
+invalid updates retain the previous configuration. This setting changes when
+PCM becomes available to OBS, **not its final presentation time**. At 40 ms,
+the first sample can be submitted 40 ms ahead; a 480-sample block adds up to
+another 10 ms of queued tail. A one-sample rounding allowance is explicit.
+The daemon's multi-second delay is not copied into the OBS input queue.
 
 ## Implemented boundary
 
@@ -53,33 +61,58 @@ themselves. For a test, add instances with clearly synthetic names.
   mixer controls and audio filters. Workers do not stop when their source is
   hidden; the OBS scene graph still controls whether audio reaches the output.
   This prototype accepts 480-frame PCM blocks at 48 kHz only.
-- PCM timestamps are the daemon's absolute `CLOCK_MONOTONIC` presentation
-  timestamps, never a per-source arrival-time epoch. Future-dated blocks are
-  rejected, old blocks are dropped, and no multi-second delay is held in OBS.
-- Audio dispatch eligibility stays anchored to the producer's sample grid;
-  repeatedly sleeping a nominal block duration would accumulate scheduler error.
-- After audio has started, a missing block produces timestamped silence. Short
-  gaps are filled with a bounded number of silent blocks, because OBS otherwise
-  smooths a sub-70-ms timestamp gap against the old sample count. A long missing
-  span is skipped rather than replayed rapidly. This discontinuity policy is
-  experimental: the resulting OBS mix/encoder behavior needs testing, including
-  fractional-block phase changes when a producer starts a new epoch.
+- IPC retains the daemon's original absolute `CLOCK_MONOTONIC` presentation
+  timestamps. Audio is submitted on a persistent 48-kHz sample grid anchored to
+  the first such timestamp, never to packet arrival. Normal contiguous packets
+  keep their original dates; a new producer's fractional-block phase is rounded
+  to the nearest sample, bounded by one sample, rather than moved by a block.
+- The worker consumes at most eight blocks per iteration through the configured
+  handoff horizon. Stale data is dropped; a bounded handoff queue protects the
+  OBS mixer deadline. No multi-second future audio is submitted.
+- Sample positions use quotient/remainder arithmetic, not repeated rounded
+  nanosecond increments or successive wakeup times. Missing intervals up to
+  100 ms receive the exact number of silent samples. Already-covered leading
+  samples are trimmed with a matching reduced frame count. A fractional 10-ms
+  epoch change therefore does not create overlapping PCM blocks.
+- After audio starts, missing input produces continuous bounded silence, leaving
+  one block of scheduling margin before filling. Long worker stalls/gaps use an
+  explicit discontinuity instead of replaying a backlog. Recovery of OBS's own
+  buffered state after such hard discontinuities remains a required test.
 - Source destruction stops and joins its worker before freeing source data.
   Mapping reconnection does not require restarting OBS.
 
 ## Microphone privacy prototype
 
-The microphone worker observes OBS source mute state. On a detected mute or
-unmute transition, it records a monotonic capture cutoff. It keeps consuming the
+The microphone subscribes to OBS's source mute signal. On each mute or unmute
+event, the callback records an atomic monotonic capture cutoff and state; it
+does not perform IPC or wait for the audio worker. It keeps consuming the
 ring while muted and submits silence; after unmute, samples captured before the
 cutoff remain silent. The video and desktop clocks continue independently.
 
-This is **not yet a privacy guarantee**. Polling can miss very short toggles;
-filters and OBS may already contain audio; a submitted/encoded packet cannot be
-retracted. No undocumented OBS buffer-reset API is used. A daemon-wide generation
+This is **not yet a privacy guarantee**. The handoff window, filters and OBS may
+already contain audio; a submitted/encoded packet cannot be retracted. No
+undocumented OBS buffer-reset API is used. A daemon-wide generation
 flush/control protocol is not implemented by this adapter. Test rapid toggles,
 filter history, queued packets and reconnect-while-muted before real microphone
 use. The synthetic path is the only supported input for this milestone.
+
+## Low-overhead diagnostics
+
+Each audio worker writes aggregate status every five seconds and at shutdown:
+media blocks, submitted samples, silence-fill samples, trimmed samples, stale
+IPC skips, busy reads, invalid metadata, starvation fills, mapping reconnects,
+producer generations, hard discontinuities, privacy-gated blocks and mute events.
+No audio samples, file paths or capture-device identifiers are logged. Counters
+are local observations: `starvation_fills` does **not** prove an OBS mixer
+underrun. The actual mixer/encoded output must be measured independently.
+
+The specific motivation for short lookahead is an OBS 32.2.2 hypothesis:
+[`discard_audio`](https://github.com/obsproject/obs-studio/blob/32.2.2/libobs/obs-audio.c#L289-L298)
+can advance a partial source buffer's timestamp without consuming its samples.
+An insufficient-buffer event could thereby move retained PCM by an OBS mixer
+interval. The 1024-sample mixer interval is 21.333 ms at 48 kHz. That branch has
+not been demonstrated in a runtime trace; an A/B timing improvement alone must
+not be described as proof that the branch caused the original failures.
 
 ## Required validation and result labels
 
@@ -106,7 +139,10 @@ has loaded all three types and connected them to synthetic IPC. After resolving
 test-harness mux-helper discovery and canvas cleanup, a synthetic recording
 completed with clean source destruction. Encoded event measurement is now
 implemented, but repeated runs exposed timing shifts and one extra detected
-audio onset. The repeatability gate is **not passed**. See the
+audio onset with the earlier due-only handoff. The new bounded-lead/sample-grid
+handoff has subsequently passed the harness timing/onset checks in three fresh
+40-ms baseline runs. Its failure/restart and microphone privacy matrix is still
+under test; baseline success alone is not a production-readiness claim. See the
 [initial validation report](validation-2026-09-15.md) for measurements and limits;
 the failure/restart matrix remains a separate gate.
 

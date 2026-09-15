@@ -36,6 +36,13 @@ constexpr auto ns_per_second = std::int64_t{1'000'000'000};
 constexpr auto retry_period = std::chrono::milliseconds(250);
 constexpr auto stale_video_ns = std::int64_t{250'000'000};
 
+bool reader_online(Reader &reader)
+{
+    avsync::ipc::Status status;
+    return reader.valid() &&
+           reader.poll_status(avsync::ipc::monotonic_ns(), status) == ReadResult::ok && status.online;
+}
+
 // Original shader. Input contract: tightly packed 8-bit NV12, BT.709 limited
 // range, SDR. An HDR/other-matrix frame must not silently use this conversion.
 constexpr const char *nv12_effect = R"effect(
@@ -88,6 +95,7 @@ void source_defaults(obs_data_t *settings)
 {
     const auto path = default_path();
     obs_data_set_default_string(settings, "ipc_path", path.c_str());
+    obs_data_set_default_int(settings, "handoff_lead_ms", 40);
 }
 
 obs_properties_t *source_properties(void *)
@@ -232,7 +240,7 @@ private:
             if (reconnect_needed_.exchange(false)) {
                 try {
                     auto next = std::make_unique<Reader>(path());
-                    if (!next->valid()) {
+                    if (!reader_online(*next)) {
                         reconnect_needed_.store(true);
                     } else {
                         const auto config = next->config();
@@ -277,128 +285,312 @@ public:
     AudioSource(obs_data_t *settings, obs_source_t *source, unsigned stream)
         : WorkerControl(settings), source_(source), stream_(stream)
     {
-        thread_ = std::thread([this] { audio_worker(); });
+        lead_ns_.store(read_lead(settings));
+        muted_.store(obs_source_muted(source_));
+        if (stream_ == 1)
+            signal_handler_connect(obs_source_get_signal_handler(source_), "mute", mute_changed, this);
+        try {
+            thread_ = std::thread([this] {
+                try { audio_worker(); }
+                catch (const std::exception &e) {
+                    blog(LOG_ERROR, "[avsync] Audio worker stopped: %s", e.what());
+                }
+            });
+        } catch (...) {
+            disconnect_mute();
+            throw;
+        }
     }
-    ~AudioSource() { stop(); }
-private:
-    void submit(std::vector<float> &pcm, const Config &config, std::int64_t timestamp)
+    ~AudioSource()
     {
-        if (timestamp < 0 || timestamp > avsync::ipc::monotonic_ns())
-            return;
-        for (auto &sample : pcm)
-            sample = std::isfinite(sample) ? std::clamp(sample, -1.0f, 1.0f) : 0.0f;
+        // OBS signals serialize callback dispatch/disconnect under the signal's
+        // mutex. Disconnect before stopping/freeing the callback's data.
+        disconnect_mute();
+        stop();
+    }
+    void update(obs_data_t *settings)
+    {
+        const auto lead = read_lead(settings); // Reject invalid input before applying anything.
+        lead_ns_.store(lead);
+        WorkerControl::update(settings);
+    }
+private:
+    static constexpr std::uint64_t rate = 48000, block_frames = 480;
+    static constexpr std::int64_t block_ns = 10'000'000;
+    static constexpr std::uint64_t max_fill_frames = 4800; // 100 ms, never a long backlog.
+    static constexpr std::int64_t sample_ceiling_ns = 20834;
+    static constexpr unsigned max_reads_per_iteration = 8;
+    struct Counters {
+        std::uint64_t media_blocks{}, output_samples{}, fill_samples{}, trim_samples{};
+        std::uint64_t late_skipped{}, busy_reads{}, invalid_frames{}, starvation_fills{};
+        std::uint64_t reconnects{}, generations{}, discontinuities{}, privacy_blocks{};
+    } stats_;
+
+    static std::int64_t read_lead(obs_data_t *settings)
+    {
+        const auto value = obs_data_get_int(settings, "handoff_lead_ms");
+        if (value < 0 || value > 100)
+            throw std::invalid_argument("handoff_lead_ms must be an integer from 0 to 100");
+        return value * 1'000'000;
+    }
+    static void mute_changed(void *opaque, calldata_t *params)
+    {
+        auto *self = static_cast<AudioSource *>(opaque);
+        self->capture_cutoff_.store(avsync::ipc::monotonic_ns(), std::memory_order_release);
+        self->muted_.store(calldata_bool(params, "muted"), std::memory_order_release);
+        self->mute_events_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void disconnect_mute()
+    {
+        if (stream_ == 1)
+            signal_handler_disconnect(obs_source_get_signal_handler(source_), "mute", mute_changed, this);
+    }
+    // All grid arithmetic avoids multiplying an unbounded nanosecond delta by
+    // sample rate. Half-sample ties round up; dates before this source's epoch
+    // are rejected rather than folded into an unsigned value.
+    bool sample_index(std::int64_t timestamp, std::uint64_t &index) const
+    {
+        if (epoch_ns_ < 0 || timestamp < epoch_ns_)
+            return false;
+        const auto delta = static_cast<std::uint64_t>(timestamp - epoch_ns_);
+        const auto seconds = delta / ns_per_second;
+        const auto remainder = delta % ns_per_second;
+        if (seconds > std::numeric_limits<std::uint64_t>::max() / rate)
+            return false;
+        const auto whole = seconds * rate;
+        const auto part = (remainder * rate + ns_per_second / 2) / ns_per_second;
+        if (whole > std::numeric_limits<std::uint64_t>::max() - part)
+            return false;
+        index = whole + part;
+        return true;
+    }
+    bool grid_timestamp(std::uint64_t index, std::int64_t &timestamp) const
+    {
+        if (epoch_ns_ < 0)
+            return false;
+        const auto seconds = index / rate;
+        const auto remainder = index % rate;
+        const auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        if (seconds > maximum / ns_per_second)
+            return false;
+        const auto whole = seconds * ns_per_second;
+        const auto part = remainder * ns_per_second / rate;
+        if (whole > maximum - part)
+            return false;
+        const auto delta = whole + part;
+        if (static_cast<std::uint64_t>(epoch_ns_) > maximum - delta)
+            return false;
+        timestamp = epoch_ns_ + static_cast<std::int64_t>(delta);
+        return true;
+    }
+    static std::int64_t bounded_add(std::int64_t base, std::int64_t increment)
+    {
+        const auto maximum = std::numeric_limits<std::int64_t>::max();
+        return base > maximum - increment ? maximum : base + increment;
+    }
+    bool submit(const float *pcm, std::uint32_t frames, std::int64_t lead)
+    {
+        std::int64_t timestamp;
+        if (!frames || !grid_timestamp(cursor_, timestamp) ||
+            cursor_ > std::numeric_limits<std::uint64_t>::max() - frames)
+            return false;
+        const auto now = avsync::ipc::monotonic_ns();
+        // One sample of tolerance covers the explicit nearest-sample conversion.
+        // This is at most a short handoff lead, never the daemon's multi-second delay.
+        if (timestamp > bounded_add(now, lead + sample_ceiling_ns))
+            return false;
         obs_source_audio audio{};
-        audio.data[0] = reinterpret_cast<const std::uint8_t *>(pcm.data());
-        audio.frames = config.audio_frames;
-        audio.samples_per_sec = config.audio_rate;
+        audio.data[0] = reinterpret_cast<const std::uint8_t *>(pcm);
+        audio.frames = frames;
+        audio.samples_per_sec = rate;
         audio.format = AUDIO_FORMAT_FLOAT;
         audio.speakers = stream_ == 0 ? SPEAKERS_STEREO : SPEAKERS_MONO;
         audio.timestamp = static_cast<std::uint64_t>(timestamp);
         obs_source_output_audio(source_, &audio);
+        cursor_ += frames;
+        stats_.output_samples += frames;
+        return true;
     }
-    void fill_short_gap(std::vector<float> &silence, const Config &config,
-                        std::int64_t target, std::int64_t &last_pts, std::int64_t block_ns)
+    void process_frame(std::vector<float> &pcm, const std::vector<float> &silence,
+                       const FrameInfo &frame, std::int64_t lead)
     {
-        if (last_pts <= 0 || target <= last_pts + block_ns)
+        if (frame.presentation_ns < 0 || frame.capture_ns < 0 ||
+            frame.frames != block_frames || frame.bytes != pcm.size() * sizeof(float)) {
+            ++stats_.invalid_frames;
             return;
-        // OBS 32.2 smooths timestamp gaps below 70 ms to its preceding sample
-        // count. Missing those samples would move all subsequent content early.
-        // Fill only a bounded short interval, with silence rather than old sound.
-        if (target - (last_pts + block_ns) >= 70'000'000)
+        }
+        if (epoch_ns_ < 0)
+            epoch_ns_ = frame.presentation_ns;
+        std::uint64_t target;
+        if (!sample_index(frame.presentation_ns, target)) {
+            ++stats_.invalid_frames;
             return;
-        for (unsigned count = 0; count < 7 && last_pts + block_ns < target; ++count) {
-            last_pts += block_ns;
-            submit(silence, config, last_pts);
+        }
+        if (target > cursor_) {
+            const auto gap = target - cursor_;
+            if (gap <= max_fill_frames) {
+                if (!submit(silence.data(), static_cast<std::uint32_t>(gap), lead))
+                    return;
+                stats_.fill_samples += gap;
+            } else {
+                // Never replay seconds of missing audio. This explicit hard-gap
+                // policy still requires OBS-buffer recovery validation.
+                cursor_ = target;
+                ++stats_.discontinuities;
+            }
+        }
+        const auto skip = std::min<std::uint64_t>(cursor_ - target, block_frames);
+        stats_.trim_samples += skip;
+        if (skip == block_frames)
+            return;
+        if (stream_ == 1 && (muted_.load(std::memory_order_acquire) ||
+                            frame.capture_ns < capture_cutoff_.load(std::memory_order_acquire))) {
+            std::fill(pcm.begin(), pcm.end(), 0.0f);
+            ++stats_.privacy_blocks;
+        } else {
+            for (auto &sample : pcm)
+                sample = std::isfinite(sample) ? std::clamp(sample, -1.0f, 1.0f) : 0.0f;
+        }
+        const auto channels = stream_ == 0 ? 2u : 1u;
+        if (submit(pcm.data() + skip * channels, static_cast<std::uint32_t>(block_frames - skip), lead))
+            ++stats_.media_blocks;
+    }
+    void fill_starvation(const std::vector<float> &silence, std::int64_t now, std::int64_t lead)
+    {
+        if (epoch_ns_ < 0)
+            return;
+        std::int64_t timestamp;
+        if (!grid_timestamp(cursor_, timestamp))
+            return;
+        if (timestamp < now && now - timestamp > 100'000'000) {
+            std::uint64_t present;
+            if (!sample_index(now, present))
+                return;
+            cursor_ = present;
+            ++stats_.discontinuities;
+        }
+        // Leave one block of breathing room for a momentarily busy producer,
+        // then supply bounded silence before the OBS input queue becomes empty.
+        const auto low_water = bounded_add(now, std::max<std::int64_t>(0, lead - block_ns));
+        for (unsigned count = 0; count < 8; ++count) {
+            if (!grid_timestamp(cursor_, timestamp) || timestamp > low_water)
+                break;
+            if (!submit(silence.data(), block_frames, lead))
+                break;
+            stats_.fill_samples += block_frames;
+            ++stats_.starvation_fills;
         }
     }
-    void audio_worker() noexcept
+    void report(std::int64_t lead, bool final) const
+    {
+        blog(LOG_INFO,
+             "[avsync] PCM %u %s lead_ms=%lld media_blocks=%llu output_samples=%llu "
+             "fill_samples=%llu trim_samples=%llu late_skipped=%llu busy=%llu invalid=%llu "
+             "starvation_fills=%llu reconnects=%llu generations=%llu discontinuities=%llu "
+             "privacy_blocks=%llu mute_events=%llu",
+             stream_, final ? "final" : "status", static_cast<long long>(lead / 1'000'000),
+             static_cast<unsigned long long>(stats_.media_blocks),
+             static_cast<unsigned long long>(stats_.output_samples),
+             static_cast<unsigned long long>(stats_.fill_samples),
+             static_cast<unsigned long long>(stats_.trim_samples),
+             static_cast<unsigned long long>(stats_.late_skipped),
+             static_cast<unsigned long long>(stats_.busy_reads),
+             static_cast<unsigned long long>(stats_.invalid_frames),
+             static_cast<unsigned long long>(stats_.starvation_fills),
+             static_cast<unsigned long long>(stats_.reconnects),
+             static_cast<unsigned long long>(stats_.generations),
+             static_cast<unsigned long long>(stats_.discontinuities),
+             static_cast<unsigned long long>(stats_.privacy_blocks),
+             static_cast<unsigned long long>(mute_events_.load()));
+    }
+    void audio_worker()
     {
         std::unique_ptr<Reader> reader;
-        std::vector<float> pcm, silence;
-        Config config;
-        std::int64_t block_ns = 10'000'000;
-        std::int64_t next_retry = 0, last_pts = 0, next_submit = 0;
-        std::int64_t mic_capture_cutoff = 0;
-        bool was_muted = obs_source_muted(source_);
+        const auto channels = stream_ == 0 ? 2u : 1u;
+        std::vector<float> pcm(block_frames * channels), silence(max_fill_frames * channels, 0.0f);
+        std::int64_t next_retry = 0, next_status = 0, next_report = 0;
         std::uint64_t generation = 0;
+        std::uint64_t last_skipped = 0;
         while (!stopping_.load()) {
             try {
                 const auto now = avsync::ipc::monotonic_ns();
-                if (stream_ == 1) {
-                    const bool muted = obs_source_muted(source_);
-                    if (muted != was_muted)
-                        mic_capture_cutoff = now;
-                    was_muted = muted;
-                }
+                const auto lead = lead_ns_.load();
                 if (changed_.exchange(false)) {
                     reader.reset();
                     next_retry = 0;
                 }
                 if (!reader && now >= next_retry) {
                     auto candidate = std::make_unique<Reader>(path());
-                    if (candidate->valid()) {
+                    if (reader_online(*candidate)) {
                         const auto incoming = candidate->config();
                         if (incoming.audio_rate != 48000 || incoming.audio_frames != 480)
                             throw std::runtime_error("Prototype OBS PCM requires 480-frame blocks at 48 kHz");
-                        config = incoming;
-                        pcm.assign(avsync::ipc::audio_samples(config, stream_), 0.0f);
-                        silence.assign(pcm.size(), 0.0f);
-                        block_ns = std::int64_t(config.audio_frames) * ns_per_second / config.audio_rate;
+                        if (generation != candidate->generation())
+                            ++stats_.generations;
                         generation = candidate->generation();
+                        last_skipped = 0;
                         reader = std::move(candidate);
-                        blog(LOG_INFO, "[avsync] Synthetic %s PCM IPC connected", stream_ ? "microphone" : "desktop");
+                        ++stats_.reconnects;
+                        blog(LOG_INFO, "[avsync] Synthetic PCM %u connected; handoff lead=%lld ms",
+                             stream_, static_cast<long long>(lead / 1'000'000));
                     }
-                    next_retry = now + 250'000'000;
+                    next_retry = bounded_add(now, 250'000'000);
                 }
-                // At most one block of actual media per sample-grid interval.
-                // Bounded short-gap silence below preserves OBS sample continuity.
-                if (!pcm.empty() && now >= next_submit) {
+                // Drain a small, explicitly bounded handoff window. Final PTS do
+                // not move forward by 'lead'; only delivery to OBS happens earlier.
+                for (unsigned count = 0; reader && count < max_reads_per_iteration; ++count) {
                     FrameInfo frame;
-                    auto result = reader ? reader->read_next_due_audio(stream_, now, pcm, frame, block_ns * 2)
-                                         : ReadResult::disconnected;
+                    const auto result = reader->read_next_audio(stream_, avsync::ipc::monotonic_ns(), lead,
+                                                               pcm, frame, 20'000'000);
+                    if (result == ReadResult::ok) {
+                        if (frame.generation != generation) {
+                            ++stats_.invalid_frames;
+                            reader.reset();
+                            next_retry = bounded_add(now, 250'000'000);
+                            break;
+                        }
+                        process_frame(pcm, silence, frame, lead);
+                        continue;
+                    }
+                    if (result == ReadResult::busy)
+                        ++stats_.busy_reads;
                     if (result == ReadResult::disconnected || result == ReadResult::invalid) {
                         reader.reset();
-                        next_retry = now + 250'000'000;
+                        next_retry = bounded_add(now, 250'000'000);
                     }
-                    if (result == ReadResult::ok && frame.presentation_ns > last_pts &&
-                        frame.presentation_ns <= now && frame.bytes == pcm.size() * sizeof(float) &&
-                        frame.frames == config.audio_frames) {
-                        if (generation != frame.generation) {
-                            generation = frame.generation;
-                            // The daemon supplies a new absolute timeline; never
-                            // replace its timestamps with this arrival time.
-                        }
-                        if (stream_ == 1 && (was_muted || frame.capture_ns < mic_capture_cutoff))
-                            std::fill(pcm.begin(), pcm.end(), 0.0f);
-                        fill_short_gap(silence, config, frame.presentation_ns, last_pts, block_ns);
-                        submit(pcm, config, frame.presentation_ns);
-                        last_pts = frame.presentation_ns;
-                        // Anchor wake-up eligibility to the producer's sample grid,
-                        // not successive actual wakeups (which accumulate jitter).
-                        next_submit = frame.presentation_ns +
-                                      ((now - frame.presentation_ns) / block_ns + 1) * block_ns;
-                    } else if (last_pts > 0 && now - last_pts >= block_ns * 2) {
-                        // Preserve sample-grid phase, but jump over a stale gap rather
-                        // than submitting a backlog. Silence has a real timestamp.
-                        const auto steps = std::max<std::int64_t>(1, (now - last_pts) / block_ns);
-                        const auto target_pts = last_pts + steps * block_ns;
-                        fill_short_gap(silence, config, target_pts, last_pts, block_ns);
-                        last_pts = target_pts;
-                        std::fill(pcm.begin(), pcm.end(), 0.0f);
-                        submit(pcm, config, last_pts);
-                        next_submit = last_pts + block_ns;
+                    break;
+                }
+                fill_starvation(silence, avsync::ipc::monotonic_ns(), lead);
+                if (reader && now >= next_status) {
+                    avsync::ipc::Status status;
+                    if (reader->poll_status(now, status) == ReadResult::ok) {
+                        const auto skipped = status.skipped_audio[stream_];
+                        if (skipped >= last_skipped)
+                            stats_.late_skipped += skipped - last_skipped;
+                        last_skipped = skipped;
                     }
+                    next_status = bounded_add(now, ns_per_second);
+                }
+                if (now >= next_report) {
+                    report(lead, false);
+                    next_report = bounded_add(now, 5 * ns_per_second);
                 }
             } catch (const std::exception &e) {
                 blog(LOG_ERROR, "[avsync] Audio IPC worker: %s", e.what());
                 reader.reset();
-                next_retry = avsync::ipc::monotonic_ns() + 250'000'000;
+                next_retry = bounded_add(avsync::ipc::monotonic_ns(), 250'000'000);
             }
             wait_for(std::chrono::milliseconds(1));
         }
+        report(lead_ns_.load(), true);
     }
     obs_source_t *source_;
     unsigned stream_;
+    std::atomic<std::int64_t> lead_ns_{40'000'000}, capture_cutoff_{0};
+    std::atomic<bool> muted_{false};
+    std::atomic<std::uint64_t> mute_events_{0};
+    std::int64_t epoch_ns_{-1};
+    std::uint64_t cursor_{0};
 };
 
 const char *video_name(void *) { return "AV Sync Prototype - Synthetic Video"; }
@@ -423,7 +615,11 @@ void *mic_create(obs_data_t *settings, obs_source_t *source)
 void video_destroy(void *data) { delete static_cast<VideoSource *>(data); }
 void audio_destroy(void *data) { delete static_cast<AudioSource *>(data); }
 void video_update(void *data, obs_data_t *settings) { static_cast<VideoSource *>(data)->update(settings); }
-void audio_update(void *data, obs_data_t *settings) { static_cast<AudioSource *>(data)->update(settings); }
+void audio_update(void *data, obs_data_t *settings)
+{
+    try { static_cast<AudioSource *>(data)->update(settings); }
+    catch (const std::exception &e) { blog(LOG_ERROR, "[avsync] Rejected audio settings: %s", e.what()); }
+}
 void video_tick(void *data, float) { static_cast<VideoSource *>(data)->tick(); }
 void video_render(void *data, gs_effect_t *) { static_cast<VideoSource *>(data)->render(); }
 std::uint32_t video_width(void *data) { return static_cast<VideoSource *>(data)->width(); }

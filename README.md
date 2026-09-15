@@ -4,11 +4,13 @@ An experimental, clock-aware synchronization bridge for independently captured
 video and network audio, designed for OBS Studio.
 
 **Early development — not a working replacement for a production audio bridge.**
-An isolated synthetic timing prototype is implemented, but its encoded-output
-repeatability gate has **not passed**. See [measured results](docs/validation-2026-09-15.md).
+The isolated synthetic prototype now passes repeated encoded timing checks and
+controlled restart/stall/mute fixtures. See [measured results and limits](docs/handoff-validation.md).
 Windows capture,
 network-clock integration, packet recovery, physical video ingest and production
 recovery must each pass explicit validation before a release is recommended.
+The first Windows component is a [metadata-only WASAPI probe](docs/windows-capture.md),
+not an audio sender; capture is explicit and no PCM is recorded or transmitted.
 
 ## Intended use
 

@@ -71,6 +71,83 @@ void scheduling_and_bounds(TempDir& dir) {
     require(reader.poll_status(t + 3000000000LL, status) == ReadResult::disconnected, "heartbeat expiry");
 }
 
+void bounded_audio_handoff(TempDir& dir) {
+    const auto c = small(); const auto path = dir.file("handoff"); Writer writer(path, c); Reader reader(path);
+    require(writer.valid() && reader.valid(), "handoff fixture");
+    std::vector<float> samples(audio_samples(c, 0), 0.125F), output(samples.size()); FrameInfo info;
+    const auto t = monotonic_ns() + 50000000;
+    require(writer.publish_audio(0, samples, t - 20000000, t - 15000000), "past handoff publish");
+    require(reader.read_next_audio(0, t, 40000000, output, info, 20000000) == ReadResult::ok,
+            "lateness must use real now, not the future deadline");
+    require(output == samples && info.sequence == 1, "past handoff payload");
+    require(writer.publish_audio(0, samples, t, t + 40000001), "future handoff publish");
+    require(reader.read_next_audio(0, t, 40000000, output, info) == ReadResult::empty,
+            "one nanosecond beyond handoff window stays queued");
+    require(reader.read_next_audio(0, t, -1, output, info) == ReadResult::invalid, "negative handoff lead rejected");
+    require(reader.read_next_audio(0, t, max_audio_lookahead_ns + 1, output, info) == ReadResult::invalid,
+            "excess handoff lead rejected");
+    require(reader.read_next_audio(0, -1, 0, output, info) == ReadResult::invalid, "negative real time rejected");
+    require(reader.read_next_audio(0, t, 40000000, output, info, -1) == ReadResult::invalid,
+            "negative handoff stale limit rejected");
+    require(reader.read_next_audio(2, t, 40000000, output, info) == ReadResult::invalid, "invalid handoff stream");
+    require(reader.read_next_audio(0, t, 40000000, std::span<float>(output.data(), 1), info) == ReadResult::buffer_too_small,
+            "short handoff destination rejected");
+    require(reader.read_next_due_audio(0, t + 1, output, info) == ReadResult::empty, "due-only API remains due-only");
+    require(reader.read_next_audio(0, t + 1, 40000000, output, info) == ReadResult::ok && info.sequence == 2 &&
+            info.capture_ns == t && info.presentation_ns == t + 40000001,
+            "inclusive handoff boundary and invalid reads preserve cursor/timestamps");
+    require(reader.read_next_audio(0, t + 1, 40000000, output, info) == ReadResult::empty, "no repeated handoff block");
+    require(writer.publish_audio(0, samples, t + 1, t + 100000001), "maximum lead publish");
+    require(reader.read_next_audio(0, t + 1, max_audio_lookahead_ns, output, info) == ReadResult::ok && info.sequence == 3,
+            "maximum bounded lead accepted");
+    require(writer.publish_audio(0, samples, t + 2, std::numeric_limits<std::int64_t>::max()), "maximum timestamp publish");
+    require(reader.read_next_audio(0, t + 2, max_audio_lookahead_ns, output, info) == ReadResult::empty,
+            "distant future timestamp remains queued without overflow");
+    require(reader.read_next_audio(0, std::numeric_limits<std::int64_t>::max(), max_audio_lookahead_ns, output, info)
+            == ReadResult::disconnected, "extreme current time expires heartbeat without deadline overflow");
+
+    const auto mixed_path = dir.file("handoff-stale"); Writer mixed_writer(mixed_path, c); Reader mixed(mixed_path);
+    require(mixed_writer.publish_audio(0, samples, t, t), "mixed stale publish");
+    require(mixed_writer.publish_audio(0, samples, t + 30000000, t + 30000000), "mixed future publish");
+    require(mixed.read_next_audio(0, t + 20000000, 10000000, output, info, 10000000) == ReadResult::ok && info.sequence == 2,
+            "drop stale block then return oldest eligible future block");
+    Status status;
+    require(mixed.poll_status(t + 20000000, status) == ReadResult::ok && status.skipped_audio[0] == 1, "handoff skip accounting");
+
+    const auto heartbeat_path = dir.file("handoff-heartbeat"); Writer heartbeat_writer(heartbeat_path, c); Reader heartbeat_reader(heartbeat_path);
+    const auto start = monotonic_ns();
+    require(heartbeat_writer.publish_audio(0, samples, start, start + 2030000000LL), "heartbeat handoff publish");
+    require(heartbeat_reader.poll_status(monotonic_ns(), status) == ReadResult::ok, "heartbeat handoff snapshot");
+    require(heartbeat_reader.read_next_audio(0, status.heartbeat_ns + 2000000000LL, 40000000, output, info,
+                                            std::numeric_limits<std::int64_t>::max()) == ReadResult::ok,
+            "future handoff must not prematurely expire real heartbeat");
+    require(heartbeat_reader.read_next_audio(0, status.heartbeat_ns + 2000000001LL, 40000000, output, info)
+            == ReadResult::disconnected, "real heartbeat boundary still enforced");
+}
+
+void handoff_restart_phase(TempDir& dir) {
+    const auto c = small(); const auto path = dir.file("handoff-restart");
+    auto writer = std::make_unique<Writer>(path, c); Reader reader(path);
+    require(writer->valid() && reader.valid(), "handoff restart fixture");
+    std::vector<float> samples(audio_samples(c, 1), 0.0625F), output(samples.size()); FrameInfo info;
+    // Deliberately not aligned with a global 10 ms boundary. Readers must not round/rebase it.
+    auto capture = (monotonic_ns() / 10000000) * 10000000 + 1234567;
+    require(writer->publish_audio(1, samples, capture, capture + 100000000), "first phase publish");
+    require(reader.read_next_audio(1, capture + 60000000, 40000000, output, info) == ReadResult::ok, "first phase read");
+    const auto old_generation = info.generation;
+    writer.reset();
+    writer = std::make_unique<Writer>(path, c); require(writer->valid(), "new handoff generation");
+    capture = (monotonic_ns() / 10000000) * 10000000 + 7654321;
+    require(writer->publish_audio(1, samples, capture, capture + 100000000), "restarted phase publish");
+    require(reader.read_next_audio(1, capture + 60000000, 40000000, output, info) == ReadResult::disconnected,
+            "old generation cannot release replacement media");
+    require(reader.reconnect(), "handoff explicit reconnect");
+    require(reader.read_next_audio(1, capture + 60000000, 40000000, output, info) == ReadResult::ok &&
+            info.generation != old_generation && info.generation == writer->generation() && info.sequence == 1 &&
+            info.capture_ns == capture && info.presentation_ns == capture + 100000000 && output == samples,
+            "new generation resets cursor but preserves fractional capture/presentation phase");
+}
+
 void restart_and_security(TempDir& dir) {
     auto c = small(); auto path = dir.file("restart");
     auto writer = std::make_unique<Writer>(path, c); require(writer->valid(), "first producer");
@@ -137,7 +214,7 @@ void owner_death_and_wrap(TempDir& dir) {
 
 int main() {
     try {
-        TempDir dir; scheduling_and_bounds(dir); restart_and_security(dir);
+        TempDir dir; scheduling_and_bounds(dir); bounded_audio_handoff(dir); handoff_restart_phase(dir); restart_and_security(dir);
 #ifdef AVSYNC_IPC_TEST_HOOKS
         owner_death_and_wrap(dir);
 #else

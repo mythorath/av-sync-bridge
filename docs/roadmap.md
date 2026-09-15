@@ -12,14 +12,19 @@ proven. Record evidence separately in validation reports.
 - [x] Native OBS synthetic adapter with separate video/stereo/mono source types
   (loading and recording tested; complete controls/privacy validation outstanding).
 - [x] Isolated encoded-output measurement with non-uniform marker spacing
-  (measurement exists; repeatability gate is not passed).
-- [ ] Staggered start, scene hiding, producer restart and rapid mute tests.
+  (three synthetic repeats pass; separate absolute raw-mixer checks included).
+- [x] Synthetic staggered start, video hide/show, producer replacement, 400 ms
+  producer pause and rapid mute fixtures (not the full production restart/privacy matrix).
+- [x] Six-cycle, 119-second synthetic check with all 36 markers per audio track.
 
-See [initial validation](validation-2026-09-15.md). Passing unit tests and loading
-the module do not imply that the complete synthetic timing milestone has passed.
+See [handoff validation](handoff-validation.md) and the preserved
+[initial failures](validation-2026-09-15.md). The synthetic foundation is ready for
+isolated real-capture development, not production deployment.
 
 ## Milestone 2 — real capture and clock transport
 
+- [x] Explicit Windows loopback metadata probe: existing mix format, device/QPC
+  timestamp pairs and bounded diagnostics; no PCM storage or network output.
 - [ ] Capture-correlated WASAPI timestamps, preserving speaker configuration.
 - [ ] Shared application clock and explicit epoch; measured uncertainty.
 - [ ] RTP/RTCP PCM and bounded RTX interoperation, including loss/reordering tests.
@@ -32,7 +37,8 @@ delivery, stop and revise that boundary. Do not disguise failure with a new offs
 ## Milestone 3 — production readiness
 
 - [ ] Three unchanged unique-event runs: median offset <= one frame and every
-  marker <= two frames at 60 fps (proposed targets, not current performance).
+  marker <= two frames at 60 fps on the **physical end-to-end** path (the synthetic
+  subset passes; this production gate is still open).
 - [ ] Thirty-minute representative load: no growing drift, unbounded memory,
   popping or unexplained late concealment.
 - [ ] Source, sender, service, OBS and both-machine restart matrix.

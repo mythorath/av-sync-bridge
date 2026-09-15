@@ -1,5 +1,8 @@
 # Initial validation: 2026-09-15
 
+Historical baseline report. The failures below are preserved; the subsequent
+[handoff revision and recovery tests](handoff-validation.md) have newer results.
+
 **Status: usable development foundation, not a production A/V bridge.**
 The portable core and Linux IPC tests pass. The OBS module records generated
 media successfully. Repeated encoded-output tests do **not** yet meet the

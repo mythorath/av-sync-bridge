@@ -336,8 +336,14 @@ ReadResult Reader::read_latest_due_video(std::int64_t now, std::span<std::uint8_
 
 ReadResult Reader::read_next_due_audio(unsigned stream, std::int64_t now, std::span<float> dst,
                                      FrameInfo& info, std::int64_t max_age) noexcept {
+    return read_next_audio(stream, now, 0, dst, info, max_age);
+}
+
+ReadResult Reader::read_next_audio(unsigned stream, std::int64_t now, std::int64_t max_future,
+                                 std::span<float> dst, FrameInfo& info, std::int64_t max_age) noexcept {
     auto& p = *impl_;
-    if (!valid() || stream > 1 || max_age < 0) return ReadResult::invalid;
+    if (!valid() || stream > 1 || now < 0 || max_age < 0 ||
+        max_future < 0 || max_future > max_audio_lookahead_ns) return ReadResult::invalid;
     const auto count = audio_samples(p.config, stream) * sizeof(float);
     if (dst.size_bytes() < count) return ReadResult::buffer_too_small;
     Lock lock(p.map.header(), true);
@@ -354,9 +360,12 @@ ReadResult Reader::read_next_due_audio(unsigned stream, std::int64_t now, std::s
         auto* slot = p.map.slot(p.layout, s, sequence);
         if (!valid_info(slot->info, p.generation, sequence, static_cast<std::uint32_t>(count), p.config.audio_frames))
             return ReadResult::invalid;
-        if (slot->info.presentation_ns > now) break;
+        // Both timestamps are nonnegative. Subtract only the smaller from the
+        // larger, avoiding overflow from constructing a now + future deadline.
+        const auto presentation = slot->info.presentation_ns;
+        if (presentation > now && presentation - now > max_future) break;
         p.cursors[s] = sequence;
-        if (now - slot->info.presentation_ns > max_age) { ++p.skipped[s]; stale = true; continue; }
+        if (presentation <= now && now - presentation > max_age) { ++p.skipped[s]; stale = true; continue; }
         info = slot->info;
         std::memcpy(dst.data(), reinterpret_cast<std::uint8_t*>(slot) + sizeof(Slot), count);
         return ReadResult::ok;

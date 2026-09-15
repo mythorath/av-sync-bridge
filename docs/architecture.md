@@ -47,7 +47,10 @@ create a delay.
 An independently rebased OBS source can undo upstream synchronization. The first
 proof uses a synchronous render-tick source and separate ordinary audio sources,
 all mapped to the same Linux monotonic presentation time. Audio enters OBS near
-its deadline, not carrying a timestamp from seconds before delivery.
+its deadline, not carrying a timestamp from seconds before delivery. The synthetic
+adapter now makes PCM available with a bounded 40 ms first-sample handoff lead
+(up to 50 ms including a block's tail); its final presentation timestamps are
+unchanged. This is mixer availability headroom, not a new path-delay offset.
 
 No render callback waits for networking or IPC. Missing output is explicit.
 One service owns physical capture; development must not compete with another

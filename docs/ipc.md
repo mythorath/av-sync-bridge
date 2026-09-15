@@ -22,10 +22,27 @@ wrong payload sizes. The metadata is validated again before a reader copies a sl
 
 Each reader owns its cursors. Video returns only the newest unconsumed frame due
 at `now`; audio returns the next unconsumed due block while discarding blocks older
-than its age limit. Neither returns future media. Ring overwrite/stale drops are
-counted. Reader buffers must be preallocated from the validated configuration.
+than its age limit. The due-only methods never return future media. Ring
+overwrite/stale drops are counted. Reader buffers must be preallocated from the
+validated configuration.
 The default permitted lateness is 200 ms for video and 100 ms for audio. These are
 prototype safety bounds, not an agreed production synchronization tolerance.
+
+`read_next_audio()` additionally permits an explicit small handoff lead, from zero
+through `max_audio_lookahead_ns` (100 ms). It returns the oldest unconsumed block
+whose original presentation time falls within that window. Heartbeat expiry and
+stale-data age still use the real `now_ns`, not a shifted clock or future deadline.
+The comparison does not add the lead to `now_ns`, avoiding signed deadline overflow.
+Negative arguments and leads above the cap are rejected without consuming media.
+The existing `read_next_due_audio()` is the zero-lead wrapper.
+
+This allowance is for a consumer's short scheduling handoff, not the intentional
+multi-second delay; that delay remains queued in the ring. Capture and presentation
+timestamps are copied unchanged, including their fractional phase within an audio
+block period. Reconnection resets cursors for the new generation but never aligns
+its timestamps to a global sample/block grid or rebases them to connection time.
+The consumer must still handle its own pacing, lead choice, and mute boundary;
+enabling a lead alone is not proof of encoded synchronization or mute safety.
 
 ## Boundedness and scheduling
 
@@ -100,7 +117,10 @@ poll counts are reported separately. The probe does not reconnect itself.
 
 `ipc-tests` covers due-time selection, payload copying, invalid metadata/config,
 private-file requirements, ring overwrite/stale dropping, heartbeat timeout,
-singleton ownership, generation remapping and corrupt/unsupported headers. With
+singleton ownership, generation remapping and corrupt/unsupported headers. The
+bounded audio handoff tests also check the inclusive future limit, invalid lead,
+real-time stale/heartbeat checks, cursor preservation, extreme timestamp values,
+and exact fractional timestamp preservation after a generation change. With
 test hooks enabled it also deterministically kills a robust-mutex owner and tests
 sequence exhaustion at UINT64_MAX. Production device reconnection and OBS loading
 remain separate milestones.
