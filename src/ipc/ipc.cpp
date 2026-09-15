@@ -172,8 +172,12 @@ struct Writer::Impl {
     }
 };
 
-Writer::Writer(std::string path, const Config& c) : impl_(std::make_unique<Impl>()) {
+Writer::Writer(std::string path, const Config& c, AllocationPolicy allocation)
+    : impl_(std::make_unique<Impl>()) {
     auto& p = *impl_; p.config = c;
+    if (allocation != AllocationPolicy::sparse && allocation != AllocationPolicy::reserve_and_prefault) {
+        p.error = "invalid IPC allocation policy"; return;
+    }
     if (!validate_config(c, p.error) || !layout_for(c, p.layout)) return;
     std::string parent, leaf;
     if (!split_path(path, parent, leaf)) { p.error = "IPC path must include a parent directory"; return; }
@@ -198,12 +202,37 @@ Writer::Writer(std::string path, const Config& c) : impl_(std::make_unique<Impl>
     if (!generation) generation = 1;
     const auto temporary = leaf + ".tmp." + std::to_string(getpid()) + "." + std::to_string(generation);
     p.map.fd = openat(dir, temporary.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    auto fail = [&](const char* message) { p.error = message; unlinkat(dir, temporary.c_str(), 0); close(dir); };
+    auto fail = [&](const char* message) {
+        p.error = message;
+        // Never unlink a pre-existing colliding name if O_EXCL did not create it.
+        if (p.map.fd >= 0) unlinkat(dir, temporary.c_str(), 0);
+        close(dir);
+    };
     if (p.map.fd < 0) { fail("cannot create private IPC mapping"); return; }
-    if (ftruncate(p.map.fd, static_cast<off_t>(p.layout.size)) != 0) { fail("cannot size IPC mapping"); return; }
+    if (allocation == AllocationPolicy::reserve_and_prefault) {
+        // The temporary file is new and empty. posix_fallocate also extends it;
+        // reserving here avoids SIGBUS on the first header write to a full tmpfs.
+        // Its return value is an error number, not a failure reported via errno.
+        if (posix_fallocate(p.map.fd, 0, static_cast<off_t>(p.layout.size)) != 0) {
+            fail("cannot reserve full IPC mapping"); return;
+        }
+    } else if (ftruncate(p.map.fd, static_cast<off_t>(p.layout.size)) != 0) {
+        fail("cannot size IPC mapping"); return;
+    }
     p.map.size = p.layout.size;
     p.map.address = mmap(nullptr, p.map.size, PROT_READ | PROT_WRITE, MAP_SHARED, p.map.fd, 0);
     if (p.map.address == MAP_FAILED) { fail("cannot mmap IPC file"); return; }
+    if (allocation == AllocationPolicy::reserve_and_prefault) {
+        const auto page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0 || static_cast<std::uint64_t>(page_size) > max_mapping) {
+            fail("cannot determine IPC prefault page size"); return;
+        }
+        // Only this unpublished, freshly allocated zero-filled mapping is touched.
+        // Do not apply this write-prefault operation to readers or existing media.
+        auto* pages = static_cast<volatile std::uint8_t*>(p.map.address);
+        const auto stride = static_cast<std::size_t>(page_size);
+        for (std::size_t offset = 0; offset < p.map.size; offset += stride) pages[offset] = 0;
+    }
     auto* h = p.map.header();
     std::construct_at(h, Header{});
     pthread_mutexattr_t attr;
@@ -228,15 +257,18 @@ std::uint64_t Writer::generation() const noexcept { return valid() ? impl_->map.
 std::int64_t Writer::epoch_ns() const noexcept { return valid() ? impl_->map.header()->epoch_ns : 0; }
 
 namespace {
-bool publish(Map& map, const Layout& layout, unsigned stream, const void* bytes, std::size_t count,
-             std::uint32_t frames, std::int64_t capture, std::int64_t presentation) noexcept {
-    if (capture < 0 || presentation < capture) return false;
-    auto* h = map.header(); Lock lock(h, false);
-    if (lock.result != 0 || !h->online || h->owner_died) return false;
-    if (h->sequences[stream] == std::numeric_limits<std::uint64_t>::max()) return false;
+WriteResult publish(Map& map, const Layout& layout, unsigned stream, const void* bytes, std::size_t count,
+             std::uint32_t frames, std::int64_t capture, std::int64_t presentation,
+             bool nonblocking = false) noexcept {
+    if (capture < 0 || presentation < capture) return WriteResult::invalid;
+    auto* h = map.header(); Lock lock(h, nonblocking);
+    if (lock.result == EBUSY) return WriteResult::busy;
+    if (!lock.held) return WriteResult::invalid;
+    if (lock.result != 0 || !h->online || h->owner_died) return WriteResult::disconnected;
+    if (h->sequences[stream] == std::numeric_limits<std::uint64_t>::max()) return WriteResult::invalid;
     if (h->sequences[stream]) {
         const auto* prior = map.slot(layout, stream, h->sequences[stream]);
-        if (capture < prior->info.capture_ns || presentation < prior->info.presentation_ns) return false;
+        if (capture < prior->info.capture_ns || presentation < prior->info.presentation_ns) return WriteResult::invalid;
     }
     const auto sequence = h->sequences[stream] + 1;
     auto* slot = map.slot(layout, stream, sequence);
@@ -245,20 +277,34 @@ bool publish(Map& map, const Layout& layout, unsigned stream, const void* bytes,
     slot->info = {h->generation, sequence, capture, presentation, frames, static_cast<std::uint32_t>(count)};
     h->sequences[stream] = sequence;
     h->heartbeat_ns = monotonic_ns();
-    return true;
+    return WriteResult::ok;
 }
 } // namespace
 
 bool Writer::publish_video(std::span<const std::uint8_t> pixels, std::int64_t capture,
                            std::int64_t presentation) noexcept {
     if (!valid() || pixels.size() != video_bytes(impl_->config)) return false;
-    return publish(impl_->map, impl_->layout, 0, pixels.data(), pixels.size(), 1, capture, presentation);
+    return publish(impl_->map, impl_->layout, 0, pixels.data(), pixels.size(), 1, capture, presentation) == WriteResult::ok;
+}
+WriteResult Writer::try_publish_video(std::span<const std::uint8_t> pixels, std::int64_t capture,
+                                     std::int64_t presentation) noexcept {
+    if (!valid() || pixels.size() != video_bytes(impl_->config)) return WriteResult::invalid;
+    return publish(impl_->map, impl_->layout, 0, pixels.data(), pixels.size(), 1, capture, presentation, true);
+}
+WriteResult Writer::try_heartbeat() noexcept {
+    if (!valid()) return WriteResult::invalid;
+    Lock lock(impl_->map.header(), true);
+    if (lock.result == EBUSY) return WriteResult::busy;
+    if (!lock.held) return WriteResult::invalid;
+    if (lock.result != 0 || !lock.h->online || lock.h->owner_died) return WriteResult::disconnected;
+    lock.h->heartbeat_ns = monotonic_ns();
+    return WriteResult::ok;
 }
 bool Writer::publish_audio(unsigned stream, std::span<const float> samples, std::int64_t capture,
                            std::int64_t presentation) noexcept {
     if (!valid() || stream > 1 || samples.size() != audio_samples(impl_->config, stream)) return false;
     return publish(impl_->map, impl_->layout, stream + 1, samples.data(), samples.size_bytes(),
-                   impl_->config.audio_frames, capture, presentation);
+                   impl_->config.audio_frames, capture, presentation) == WriteResult::ok;
 }
 bool Writer::heartbeat() noexcept {
     if (!valid()) return false;

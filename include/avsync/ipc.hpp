@@ -19,6 +19,8 @@ struct Config {
 };
 
 enum class ReadResult { ok, empty, busy, disconnected, invalid, buffer_too_small, stale };
+enum class WriteResult { ok, busy, disconnected, invalid };
+enum class AllocationPolicy { sparse, reserve_and_prefault };
 
 // Maximum explicit audio handoff lead. Long intentional delays remain in the ring.
 inline constexpr std::int64_t max_audio_lookahead_ns = 100000000;
@@ -47,7 +49,15 @@ class Writer {
 public:
     // Parent directory must already exist, be user-owned and not group/world writable.
     // A private .lock sidecar holds a singleton flock. The mapping is atomically replaced.
-    explicit Writer(std::string path, const Config& config);
+    // sparse preserves the original lazy allocation. reserve_and_prefault reserves
+    // the complete new file with posix_fallocate before any mmap access, then
+    // write-touches each page before initialization/publication. Reservation or
+    // setup failure leaves valid()==false, preserves an existing published mapping,
+    // and removes only this attempt's temporary file. No sparse fallback is used.
+    // This is initialization work, not memory locking: pages can later be reclaimed
+    // or swapped, so it does not guarantee zero future faults or real-time latency.
+    explicit Writer(std::string path, const Config& config,
+                    AllocationPolicy allocation = AllocationPolicy::sparse);
     ~Writer();
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
@@ -57,6 +67,10 @@ public:
     std::int64_t epoch_ns() const noexcept;
     bool publish_video(std::span<const std::uint8_t> nv12, std::int64_t capture_ns,
                        std::int64_t presentation_ns) noexcept;
+    // Worker-thread nonblocking variants. A busy reader must not stall capture.
+    WriteResult try_publish_video(std::span<const std::uint8_t> nv12, std::int64_t capture_ns,
+                                  std::int64_t presentation_ns) noexcept;
+    WriteResult try_heartbeat() noexcept;
     // stream 0: interleaved stereo float PCM; stream 1: mono float PCM.
     bool publish_audio(unsigned stream, std::span<const float> samples,
                        std::int64_t capture_ns, std::int64_t presentation_ns) noexcept;

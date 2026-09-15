@@ -4,12 +4,15 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,6 +42,93 @@ struct TempDir {
 };
 Config small() { Config c; c.width = 16; c.height = 16; c.video_capacity = 4; c.audio_capacity = 4; return c; }
 
+void no_temporary_files(const TempDir& dir) {
+    auto* directory = opendir(dir.path.c_str()); require(directory != nullptr, "inspect allocation cleanup");
+    bool clean = true; unsigned entries = 0;
+    errno = 0;
+    while (const auto* entry = readdir(directory)) {
+        if (++entries > 64 || std::strstr(entry->d_name, ".tmp.") != nullptr) { clean = false; break; }
+    }
+    const int read_error = errno; closedir(directory);
+    require(clean && read_error == 0, "allocation attempt must not leave temporary mappings");
+}
+
+// The child alone has a zero-byte file-size limit. No disk/tmpfs is filled,
+// no device is opened, and the parent's limits and signal dispositions persist.
+void reject_reservation_with_child_limit(const std::string& path, const Config& config) {
+    const auto child = fork(); require(child >= 0, "fork reservation failure fixture");
+    if (!child) {
+        rlimit limit{};
+        if (signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(80);
+        alarm(5); // A regression must not leave the parent waiting indefinitely.
+        if (getrlimit(RLIMIT_FSIZE, &limit) != 0 || signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(81);
+        limit.rlim_cur = 0;
+        if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(82);
+        bool rejected = false;
+        try {
+            Writer writer(path, config, AllocationPolicy::reserve_and_prefault);
+            rejected = !writer.valid() && writer.error() == "cannot reserve full IPC mapping";
+        } catch (...) { _exit(83); }
+        _exit(rejected ? 0 : 84); // Writer has already released mappings and flock.
+    }
+    int code{}; pid_t waited;
+    do { waited = waitpid(child, &code, 0); } while (waited < 0 && errno == EINTR);
+    require(waited == child && WIFEXITED(code) && WEXITSTATUS(code) == 0,
+            "reservation failure must be explicit, not SIGBUS/SIGXFSZ or sparse fallback");
+}
+
+void reserved_allocation_and_cleanup(TempDir& dir) {
+    const auto config = small(); const auto success = dir.file("reserved");
+    struct stat previous{};
+    std::uint64_t old_generation{};
+    {
+        Writer writer(success, config, AllocationPolicy::reserve_and_prefault);
+        require(writer.valid(), "reserved and prefaulted writer create");
+        require(stat(success.c_str(), &previous) == 0 && previous.st_size > 0 &&
+                (previous.st_mode & 0777) == 0600, "reserved private mapping");
+        old_generation = writer.generation();
+        Reader reader(success); require(reader.valid(), "reserved mapping remains protocol-compatible");
+        std::vector<std::uint8_t> input(video_bytes(config), 0xA7), output(input.size());
+        std::vector<float> audio(audio_samples(config, 0), 0.25F), pcm(audio.size());
+        const auto t = monotonic_ns(); FrameInfo info;
+        for (std::uint64_t n = 0; n < config.video_capacity + 2U; ++n) {
+            const auto capture = t + static_cast<std::int64_t>(n);
+            require(writer.try_publish_video(input, capture, capture) == WriteResult::ok,
+                    "reserved video publish across ring wrap");
+            require(reader.read_latest_due_video(capture, output, info) == ReadResult::ok &&
+                    input == output && info.sequence == n + 1, "prefault did not corrupt published pixels");
+        }
+        require(writer.publish_audio(0, audio, t, t) &&
+                reader.read_next_due_audio(0, t, pcm, info) == ReadResult::ok && pcm == audio,
+                "reserved allocation preserves audio layout");
+    }
+    no_temporary_files(dir);
+
+    // A failed replacement cannot remove or alter the previously published inode.
+    reject_reservation_with_child_limit(success, config);
+    struct stat after{};
+    require(stat(success.c_str(), &after) == 0 && after.st_ino == previous.st_ino &&
+            after.st_dev == previous.st_dev && after.st_size == previous.st_size,
+            "failed reservation preserves existing published mapping");
+    Reader retained(success);
+    require(retained.valid() && retained.generation() == old_generation,
+            "failed replacement preserves existing header and generation");
+    no_temporary_files(dir);
+
+    const auto failure = dir.file("reserve-failure");
+    reject_reservation_with_child_limit(failure, config);
+    require(lstat(failure.c_str(), &after) != 0 && errno == ENOENT,
+            "failed reservation must not publish a partial mapping");
+    no_temporary_files(dir);
+    // Parent limit was not changed, and the failed child no longer owns the lock.
+    Writer retry(failure, config, AllocationPolicy::reserve_and_prefault);
+    require(retry.valid(), "reservation retry after failure releases singleton lock");
+    const auto invalid = dir.file("invalid-allocation");
+    Writer rejected(invalid, config, static_cast<AllocationPolicy>(99));
+    require(!rejected.valid() && lstat(invalid.c_str(), &after) != 0 && errno == ENOENT,
+            "invalid allocation policy has no published file");
+}
+
 void scheduling_and_bounds(TempDir& dir) {
     const auto path = dir.file("schedule"); auto c = small(); Writer writer(path, c);
     require(writer.valid(), "writer create"); Reader reader(path); require(reader.valid(), "reader create");
@@ -54,6 +144,13 @@ void scheduling_and_bounds(TempDir& dir) {
     require(!writer.publish_video(std::span<const std::uint8_t>(input.data(), 1), t, t), "reject short video");
     require(!writer.publish_video(input, -1, t), "reject negative capture");
     require(!writer.publish_video(input, t + 100, t), "reject reversed timestamp");
+    require(writer.try_publish_video(input, t + 1, t + 100000001) == WriteResult::ok, "nonblocking video publish");
+    require(writer.try_publish_video(input, -1, t) == WriteResult::invalid, "nonblocking invalid timestamp");
+    require(writer.try_publish_video(std::span<const std::uint8_t>(input.data(), 1), t, t) == WriteResult::invalid,
+            "nonblocking invalid size");
+    require(writer.try_heartbeat() == WriteResult::ok, "nonblocking heartbeat");
+    require(reader.read_latest_due_video(t + 100000001, output, info) == ReadResult::ok && info.sequence == 2,
+            "nonblocking preserves timestamps and sequence");
     require(writer.publish_audio(0, samples, t, t + 100000000), "audio publish");
     require(reader.read_next_due_audio(0, t, pcm, info) == ReadResult::empty, "must not release future audio");
     require(reader.read_next_due_audio(0, t + 100000000, pcm, info) == ReadResult::ok && samples == pcm, "audio payload");
@@ -63,7 +160,7 @@ void scheduling_and_bounds(TempDir& dir) {
         require(writer.publish_video(input, t + i * 10000000, t + 100000000 + i * 10000000), "ring video publish");
         require(writer.publish_audio(0, samples, t + i * 10000000, t + 100000000 + i * 10000000), "ring audio publish");
     }
-    require(reader.read_latest_due_video(t + 200000000, output, info) == ReadResult::ok && info.sequence == 11, "newest due after overwrite");
+    require(reader.read_latest_due_video(t + 200000000, output, info) == ReadResult::ok && info.sequence == 12, "newest due after overwrite");
     require(reader.read_next_due_audio(0, t + 500000000, pcm, info, 1000000) == ReadResult::stale, "stale audio dropped");
     require(reader.read_next_due_audio(0, t + 500000000, pcm, info) == ReadResult::empty, "no stale catch-up");
     Status status;
@@ -194,11 +291,18 @@ void owner_death_and_wrap(TempDir& dir) {
     require(read(notification[0], &marker, 1) == 1 && marker == 'R', "child owns mutex"); close(notification[0]);
     Status status;
     const auto busy_result = reader.poll_status(monotonic_ns(), status);
+    std::vector<std::uint8_t> video(video_bytes(c), 12);
+    const auto busy_publish = writer.try_publish_video(video, 1, 2);
+    const auto busy_heartbeat = writer.try_heartbeat();
     require(write(release[1], &marker, 1) == 1, "release fault owner"); close(release[1]);
     int code{}; require(waitpid(child, &code, 0) == child && WIFEXITED(code) && WEXITSTATUS(code) == 99, "owner exits locked");
     require(busy_result == ReadResult::busy, "reader must not wait for mutex");
+    require(busy_publish == WriteResult::busy && busy_heartbeat == WriteResult::busy,
+            "capture worker must not wait for an IPC reader mutex");
     require(reader.poll_status(monotonic_ns(), status) == ReadResult::disconnected && status.owner_died, "robust recovery rejects incomplete epoch");
     require(!writer.heartbeat(), "dead epoch cannot resume");
+    require(writer.try_publish_video(video, 1, 2) == WriteResult::disconnected &&
+            writer.try_heartbeat() == WriteResult::disconnected, "nonblocking rejects abandoned generation");
     const auto wrap_path = dir.file("wrap"); Writer wrap_writer(wrap_path, c); Reader wrap_reader(wrap_path);
     const auto max = std::numeric_limits<std::uint64_t>::max();
     require(testing::set_sequence(wrap_path.c_str(), 1, max - c.audio_capacity), "set near-wrap counter");
@@ -214,7 +318,8 @@ void owner_death_and_wrap(TempDir& dir) {
 
 int main() {
     try {
-        TempDir dir; scheduling_and_bounds(dir); bounded_audio_handoff(dir); handoff_restart_phase(dir); restart_and_security(dir);
+        TempDir dir; reserved_allocation_and_cleanup(dir); scheduling_and_bounds(dir);
+        bounded_audio_handoff(dir); handoff_restart_phase(dir); restart_and_security(dir);
 #ifdef AVSYNC_IPC_TEST_HOOKS
         owner_death_and_wrap(dir);
 #else

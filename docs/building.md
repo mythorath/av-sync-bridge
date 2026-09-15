@@ -19,6 +19,47 @@ probe (`AVSYNC_BUILD_WINDOWS_PROBE=ON` by default on Windows); its help test doe
 not open an endpoint. See [explicit probe use](windows-capture.md). No external
 test framework is downloaded.
 
+Default CTest coverage also includes `avsync-video-timing-tests` and
+`avsync-video-handoff-tests` on Windows and Linux. These are portable C++20 tests:
+checked driver-time conversion and sequence chronology, padded NV12 packing,
+bounded FIFO ownership, and a finite two-thread handoff stress case. Checks stay
+enabled in Release builds. They do not require Linux capture headers or open a
+device. See the [video timing policy](video-timing.md). A passing stress case is
+not a proof of every possible thread interleaving or physical capture quality.
+
+## Optional Linux video capture and buffered handoff
+
+`AVSYNC_BUILD_V4L2=ON` builds the Linux-only `avsync_v4l2` library and
+`avsync-v4l2-probe`. With Linux IPC enabled, it also builds `avsync-video-bridge`.
+The option is **off by default**. It requires Linux UAPI headers including
+`linux/videodev2.h`, but not libv4l, GStreamer, or OBS development libraries.
+The supported input is the adapter's explicitly validated progressive linear
+NV12 layout; this is not automatic capture-format negotiation.
+
+```sh
+cmake -S . -B build-video -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_V4L2=ON
+cmake --build build-video --parallel 2
+ctest --test-dir build-video --output-on-failure --timeout 30
+./build-video/avsync-v4l2-probe --help
+./build-video/avsync-video-bridge --help
+```
+
+These commands compile and run metadata-policy/handoff tests and CLI help only;
+they do not open the capture device or start OBS. If configuring with
+`AVSYNC_BUILD_IPC=OFF`, omit the bridge help command because that target is not
+built. Network diagnostics and V4L2 can be enabled together, but enabling both
+does not by itself connect their streams into synchronized output.
+
+Physical capture must be requested separately, with exclusive device ownership
+and a maintenance/rollback plan. The programs do not install a service or replace
+an OBS source. Read [capture use and limitations](v4l2-capture.md) before opening a
+device. Keep capture files and machine-specific reports outside the public repo.
+
+CI enables V4L2 in the Ubuntu Release, Linux ASan/UBSan, and Linux network builds.
+The Windows job leaves V4L2 off and exercises the portable timing/handoff tests.
+V4L2 CTest entries invoke only `--help`; no CI job claims hardware, rendering,
+capture restart, or A/V-sync validation. ASan/UBSan are not ThreadSanitizer.
+
 ## Optional network diagnostics
 
 `AVSYNC_BUILD_NETWORK=ON` adds the desktop-only Windows sender or the Linux
@@ -58,7 +99,8 @@ receiver and runs pure clock tests but does not open network listeners.
 Optional Linux memory/undefined-behavior checks:
 
 ```sh
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DAVSYNC_ENABLE_SANITIZERS=ON
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DAVSYNC_ENABLE_SANITIZERS=ON -DAVSYNC_BUILD_V4L2=ON
 cmake --build build-asan --parallel 2
 ctest --test-dir build-asan --output-on-failure
 ```

@@ -32,13 +32,18 @@ isolated real-capture development, not production deployment.
 - [ ] Independently measured WASAPI content-time calibration and microphone capture.
 - [ ] Shared-clock uncertainty and generation behavior under representative load.
 - [ ] RTP/RTCP PCM and bounded RTX interoperation, including loss/reordering tests.
-- [ ] Physical V4L2 capture, sequence/time validation and stable calibration.
+- [x] Explicit physical NV12 V4L2 capture, checked sequence/time metadata and
+  bounded video-only IPC handoff with in-memory delivery verification.
+- [ ] Capture startup readiness, loss-free loaded delivery, color interpretation
+  and stable physical content-time calibration.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 
-The two completed transport subsets above do not complete the broader capture
-or clock-uncertainty gates. No microphone, physical video, adaptive drift control,
-RTX, OBS network handoff, or production startup migration is included yet. See
-[network validation](network-validation.md) for actual scope and known gaps.
+Completed subsets above do not complete the broader capture or clock-uncertainty
+gates. No microphone, adaptive drift control, RTX, combined real A/V OBS handoff,
+or production startup migration is included yet. See [network validation](network-validation.md)
+and [physical video validation](video-validation.md) for actual scope and faults.
+The [ASRC design](asrc-design.md) first requires original device-clock anchors to
+survive conversion; nominal RTP progression alone cannot satisfy that gate.
 
 If the shared timestamp relationship does not survive either capture or OBS
 delivery, stop and revise that boundary. Do not disguise failure with a new offset.

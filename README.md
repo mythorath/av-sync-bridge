@@ -10,9 +10,12 @@ An optional [desktop-only Windows sender](docs/windows-sender.md) now feeds a
 [Linux diagnostic receiver](docs/network-receiver.md) using a shared monotonic
 clock and RTP/RTCP PCM. Short real-network starts and a controlled clock outage
 have been tested; see [transport results and limits](docs/network-validation.md).
-This path is not yet connected to the OBS playout bridge. Packet recovery,
-adaptive audio-rate correction, physical video ingest and production recovery
-still require explicit validation. A separate [metadata-only WASAPI probe](docs/windows-capture.md)
+An optional [physical video capture and memory buffer](docs/video-buffer.md) now
+preserves NV12 frames and their driver timestamps in a bounded two-second ring;
+see [physical video results and remaining faults](docs/video-validation.md).
+These experiments are not yet connected into one real A/V OBS playout path.
+Packet recovery, adaptive audio-rate correction, physical content calibration
+and production recovery still require explicit validation. A separate [metadata-only WASAPI probe](docs/windows-capture.md)
 remains available without transmitting PCM.
 
 ## Intended use
@@ -57,7 +60,9 @@ Implemented foundation: timestamp arithmetic, rational cadence, bounded queues,
 rate-estimation recommendations, privacy-cutoff logic, local synthetic IPC and an
 optional native OBS adapter. A rate estimate is not implemented ASRC; simulated
 audio is not hardware validation. The optional network experiment remains
-separate from the synthetic IPC/OBS playout path.
+separate from the physical-video and synthetic IPC/OBS paths. The
+[ASRC design](docs/asrc-design.md) identifies an original capture-clock metadata
+gate that must pass before adaptive rate correction is enabled.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

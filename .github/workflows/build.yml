@@ -14,16 +14,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            v4l2: "ON"
+          - os: windows-latest
+            v4l2: "OFF"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           persist-credentials: false
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_OBS_PLUGIN=OFF
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_OBS_PLUGIN=OFF -DAVSYNC_BUILD_V4L2=${{ matrix.v4l2 }}
       - name: Build
         run: cmake --build build --config Release --parallel 2
-      - name: Test
+      - name: Portable policy, handoff and help tests (no device capture)
         run: ctest --test-dir build -C Release --output-on-failure --timeout 30
       - name: Measurement helper tests
         run: python -m unittest discover -s tests -p "test_*.py"
@@ -34,7 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           persist-credentials: false
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAVSYNC_ENABLE_SANITIZERS=ON
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAVSYNC_ENABLE_SANITIZERS=ON -DAVSYNC_BUILD_V4L2=ON
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --timeout 30
   network-linux:
@@ -46,7 +51,7 @@ jobs:
           persist-credentials: false
       - name: Install optional development libraries
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_NETWORK=ON
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_NETWORK=ON -DAVSYNC_BUILD_V4L2=ON
       - run: cmake --build build --parallel 2
-      - name: Pure clock and help tests (no capture or network listeners)
+      - name: Pure timing, handoff and help tests (no capture or network listeners)
         run: ctest --test-dir build --output-on-failure --timeout 30
