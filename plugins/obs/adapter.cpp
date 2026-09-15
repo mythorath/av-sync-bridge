@@ -79,7 +79,7 @@ technique Draw {
 std::string default_path()
 {
     if (const char *runtime = std::getenv("XDG_RUNTIME_DIR"); runtime && *runtime)
-        return std::string(runtime) + "/avsync-bridge/media.ipc";
+        return std::string(runtime) + "/av-sync-bridge.ipc";
     // The service refuses unsafe directories. Do not fall back to a shared /tmp file.
     return {};
 }

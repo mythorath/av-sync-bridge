@@ -86,6 +86,17 @@ duration; then stops and removes its temporary sources. It uses libOBS, not the
 normal OBS GUI or saved profiles. It refuses to overwrite an existing output.
 Expect a file containing **generated** flashes and tones, not your desktop.
 
-Use the measurement helper when available to inspect decoded presentation times
-and uniquely spaced events. A successful recording alone does not establish sync.
-Headless Xvfb/CPU rendering is not a 4K60 hardware performance benchmark.
+Inspect decoded presentation times and uniquely spaced events with Python 3,
+FFmpeg and ffprobe installed:
+
+```sh
+python3 tools/measure_synthetic.py ./synthetic-test.mkv
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+The helper returns zero for a valid six-marker match, two for a marker mismatch,
+and one for a decoding/processing error. **A valid match does not assert acceptable
+sync**: inspect the audio-minus-video offsets and apply the release gates
+separately. Missing/extra markers are rejected, not matched to a convenient
+subset or repeating cycle. Headless Xvfb/CPU rendering is not a 4K60 hardware
+performance benchmark. See [initial validation](validation-2026-09-15.md).

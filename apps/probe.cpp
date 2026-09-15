@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (verify && (!received[0] || !received[1] || !received[2])) failed = true;
-    std::cout << "IPC " << (failed ? "FAIL" : "PASS") << " counts=" << received[0] << ',' << received[1] << ',' << received[2]
+    std::cout << "IPC " << (failed ? "FAIL" : verify ? "METADATA PASS" : "OBSERVED") << " counts=" << received[0] << ',' << received[1] << ',' << received[2]
               << " busy=" << busy << " stale=" << stale << " disconnected_polls=" << disconnected
               << "; metadata-only, not end-to-end validation\n";
     return failed ? 1 : 0;

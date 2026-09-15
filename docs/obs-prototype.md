@@ -30,8 +30,9 @@ Source type IDs and settings:
 | `avsync_prototype_microphone` | Independent mono PCM audio input |
 
 Each has one setting, `ipc_path`, pointing to the same producer mapping. The
-default is `$XDG_RUNTIME_DIR/avsync-bridge/media.ipc`; there is no shared `/tmp`
-fallback. These types do not create sources or rename existing sources by
+default is `$XDG_RUNTIME_DIR/av-sync-bridge.ipc`, matching the producer. If the
+runtime variable is absent or empty, set `ipc_path` explicitly; there is no shared
+`/tmp` fallback. These types do not create sources or rename existing sources by
 themselves. For a test, add instances with clearly synthetic names.
 
 ## Implemented boundary
@@ -103,9 +104,11 @@ does not prove USB capture timestamps, network timestamps or restart recovery.
 The Linux module has compiled against OBS 32.2.2 and an isolated libOBS process
 has loaded all three types and connected them to synthetic IPC. After resolving
 test-harness mux-helper discovery and canvas cleanup, a synthetic recording
-completed with 1,081 output video frames and clean source destruction. This
-establishes loading/recording integration, not a passing encoded-timing result;
-event analysis and the failure/restart matrix remain separate gates.
+completed with clean source destruction. Encoded event measurement is now
+implemented, but repeated runs exposed timing shifts and one extra detected
+audio onset. The repeatability gate is **not passed**. See the
+[initial validation report](validation-2026-09-15.md) for measurements and limits;
+the failure/restart matrix remains a separate gate.
 
 OBS 32.2 canvas ownership matters in standalone harnesses: removing output
 channels and releasing a public scene handle may leave a canvas-owned reference.

@@ -9,9 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
-#include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -22,18 +20,18 @@ bool number(const char* text, std::uint32_t& value) {
     return e == std::errc{} && p == s.data() + s.size();
 }
 std::string default_path() {
-    if (const auto* runtime = std::getenv("XDG_RUNTIME_DIR")) return std::string(runtime) + "/av-sync-synthetic.ipc";
-    auto parent = std::string("/tmp/av-sync-synthetic-") + std::to_string(geteuid());
-    mkdir(parent.c_str(), 0700);
-    return parent + "/media.ipc";
+    if (const auto* runtime = std::getenv("XDG_RUNTIME_DIR"); runtime && *runtime)
+        return std::string(runtime) + "/av-sync-bridge.ipc";
+    return {};
 }
 void help() {
-    std::cout << "avsync-synthetic --path FILE [--duration SECONDS] [--delay-ms MS]\n"
+    std::cout << "avsync-synthetic [--path FILE] [--duration SECONDS] [--delay-ms MS]\n"
                  " [--width EVEN] [--height EVEN] [--fps 1..120]\n"
                  "Synthetic only: NV12 video + stereo/mono float PCM; no devices or network.\n"
                  "Defaults: 640x360, 60 fps, 48000 Hz, 480 samples/block, 2000 ms delay,\n"
                  "10 seconds capture followed by delay drain. --duration 0 runs until stopped.\n"
-                 "Parent directory must be private and user-owned.\n";
+                 "Default path: $XDG_RUNTIME_DIR/av-sync-bridge.ipc. Without that environment\n"
+                 "variable, --path is required. Parent directory must be private and user-owned.\n";
 }
 }
 
@@ -60,6 +58,10 @@ int main(int argc, char** argv) {
     std::string error;
     if (!avsync::ipc::validate_config(config, error)) { std::cerr << error << '\n'; return 2; }
     if (path.empty()) path = default_path();
+    if (path.empty()) {
+        std::cerr << "XDG_RUNTIME_DIR is unset or empty; specify --path in an existing private, user-owned directory\n";
+        return 2;
+    }
     avsync::ipc::Writer writer(path, config);
     if (!writer.valid()) { std::cerr << writer.error() << '\n'; return 1; }
     std::signal(SIGINT, stop_handler); std::signal(SIGTERM, stop_handler);

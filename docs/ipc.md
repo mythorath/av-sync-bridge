@@ -68,6 +68,10 @@ always corrupt or remove their own files. Test builds can enable private
 `avsync-synthetic --help` describes options. The default is 640x360 NV12 at 60 fps,
 two audio streams, 2000 ms delay, 10 seconds capture and a final delay-drain period.
 `--duration 0` continues until interrupted. There are no network sockets.
+The default mapping path is `$XDG_RUNTIME_DIR/av-sync-bridge.ipc`, matching the
+OBS prototype. No extra directory is created. When `XDG_RUNTIME_DIR` is unset or
+empty, pass `--path` in a pre-existing private, user-owned directory. The probe
+always requires its explicit `--path`.
 
 Flashes occur near 1.00, 2.35, 4.10, 6.70, 10.15 and 14.80 seconds of each 20-second
 cycle (rounded to video frames). Events carry binary identifiers in the top-left
@@ -89,6 +93,10 @@ checks receipt of all three streams, exact configured metadata delay, nonfuture
 delivery and monotonically increasing sequences. It does not analyze tone/flash
 content, test cross-machine clocks, or measure the encoded OBS result. Its reported
 delivery lateness is local reader scheduling lateness, not measured A/V offset.
+Without `--verify`, the final `OBSERVED` label only summarizes observations; it
+does not require any media to arrive. With `--verify`, `METADATA PASS` means the
+finite checks above passed, not uninterrupted delivery: stale and disconnected
+poll counts are reported separately. The probe does not reconnect itself.
 
 `ipc-tests` covers due-time selection, payload copying, invalid metadata/config,
 private-file requirements, ring overwrite/stale dropping, heartbeat timeout,

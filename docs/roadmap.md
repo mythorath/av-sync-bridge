@@ -6,12 +6,17 @@ proven. Record evidence separately in validation reports.
 
 ## Milestone 1 — synthetic timing foundation
 
-- [ ] Portable timestamp arithmetic, rational cadence and bounded queue policies.
-- [ ] Deterministic tests for rate estimates, discontinuity and privacy cutoff.
-- [ ] Linux bounded IPC with a finite synthetic video/stereo/mic producer.
-- [ ] Native OBS adapter with independent video and audio controls.
-- [ ] Isolated encoded-output measurement with non-uniform marker spacing.
+- [x] Portable timestamp arithmetic, rational cadence and bounded queue policies.
+- [x] Deterministic tests for rate estimates, discontinuity and privacy cutoff.
+- [x] Linux bounded IPC with a finite synthetic video/stereo/mic producer.
+- [x] Native OBS synthetic adapter with separate video/stereo/mono source types
+  (loading and recording tested; complete controls/privacy validation outstanding).
+- [x] Isolated encoded-output measurement with non-uniform marker spacing
+  (measurement exists; repeatability gate is not passed).
 - [ ] Staggered start, scene hiding, producer restart and rapid mute tests.
+
+See [initial validation](validation-2026-09-15.md). Passing unit tests and loading
+the module do not imply that the complete synthetic timing milestone has passed.
 
 ## Milestone 2 — real capture and clock transport
 
