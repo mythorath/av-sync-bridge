@@ -1,9 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # Receiver ASRC: proposed next milestone
 
-Status: **design and primary-source review only, 2026-09-15**. No ASRC has been
-implemented, installed, or connected to live media by this work. No measured
-drift, sound-quality improvement, or hardware/OBS synchronization is claimed.
+Status: **complete-system design with offline-tested components, 2026-09-15**.
+The [bounded DSP backend](asrc-backend.md), [original-anchor metadata policy](audio-anchors.md)
+and [generated-signal fixture](asrc-validation.md) are now implemented separately.
+There is still no live adaptive controller, original-anchor wire transport or
+hardware/OBS synchronization claim. The [current conversion diagnostic](conversion-timing.md)
+now measures the gate-zero failure predicted below; live activation stays off.
 The contracts in [network-clock.md](network-clock.md),
 [audio-conversion.md](audio-conversion.md), and [timing.md](timing.md) remain
 authoritative. This first milestone concerns desktop audio, not the microphone.

@@ -60,6 +60,37 @@ The Windows job leaves V4L2 off and exercises the portable timing/handoff tests.
 V4L2 CTest entries invoke only `--help`; no CI job claims hardware, rendering,
 capture restart, or A/V-sync validation. ASan/UBSan are not ThreadSanitizer.
 
+## Optional offline audio-rate correction components
+
+`AVSYNC_BUILD_ASRC=ON` adds `avsync_asrc`, its tests, and the generated-only
+`avsync-asrc-fixture`. Requires pkg-config and libsamplerate >=0.2.2 development
+files (Ubuntu: `libsamplerate0-dev`). It is off by default and does not connect
+to the network receiver, OBS, an audio endpoint or a playback sink. No package is
+downloaded by CMake. Inspect package-manager changes before installing on a live
+machine; the validated installation added matching headers without upgrading the
+already installed runtime.
+
+```sh
+cmake -S . -B build-asrc -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAVSYNC_BUILD_ASRC=ON
+cmake --build build-asrc --parallel 2
+ctest --test-dir build-asrc --output-on-failure --timeout 30
+python3 tools/run_asrc_suite.py --executable build-asrc/avsync-asrc-fixture --long
+```
+
+If Python 3 is discoverable at configuration, CTest also runs five short
+generated cases, including wrong-rate silence/DC controls. Without Python, the
+C++ unit tests still build/run; the generated suite must be run separately.
+`--long` runs the 78-case matrix plus one 600-second **simulated**, not real-time,
+marker case. The default suite omits that long case; `--quick` selects five.
+Reports are aggregate JSON on stdout; no PCM is recorded or played. The helper
+uses a per-child timeout, validates positive timing/quality results independently,
+and requires deliberately wrong-rate controls to fail their duration gate.
+
+CI builds the optional Linux component both with and without ASan/UBSan and runs
+the quick suite. Windows tests the dependency-free anchor policy; no Windows ASRC
+binary or performance certification is implied. See [backend contract](asrc-backend.md)
+and [offline results and limitations](asrc-validation.md).
+
 ## Optional network diagnostics
 
 `AVSYNC_BUILD_NETWORK=ON` adds the desktop-only Windows sender or the Linux
@@ -70,6 +101,11 @@ plugins must include appsrc/appsink, audioconvert, audioresample, rtpbin, UDP,
 and L24 payload/depayload elements. These are bounded experiments, not yet a
 production audio replacement. See [sender](windows-sender.md),
 [clock contract](network-clock.md) and [receiver](network-receiver.md).
+
+This option also builds `avsync-conversion-timing-probe`, an explicitly started
+offline generated-media diagnostic. Its CLI help test opens no device or socket;
+actual runs test the current converter's timestamp behavior, not networking.
+See [conversion observability](conversion-timing.md).
 
 Ubuntu development packages are `libgstreamer1.0-dev` and
 `libgstreamer-plugins-base1.0-dev`. Review package-manager changes before installing

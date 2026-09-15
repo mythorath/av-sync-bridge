@@ -55,3 +55,20 @@ jobs:
       - run: cmake --build build --parallel 2
       - name: Pure timing, handoff and help tests (no capture or network listeners)
         run: ctest --test-dir build --output-on-failure --timeout 30
+  asrc-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizers: ["OFF", "ON"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+      - name: Install optional resampler development files
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsamplerate0-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAVSYNC_BUILD_ASRC=ON -DAVSYNC_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
+      - run: cmake --build build --parallel 2
+      - name: Synthetic ASRC and negative controls (no devices, playback or network)
+        run: ctest --test-dir build --output-on-failure --timeout 30

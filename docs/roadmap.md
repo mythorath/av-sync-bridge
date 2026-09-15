@@ -36,6 +36,12 @@ isolated real-capture development, not production deployment.
   bounded video-only IPC handoff with in-memory delivery verification.
 - [ ] Capture startup readiness, loss-free loaded delivery, color interpretation
   and stable physical content-time calibration.
+- [x] Optional bounded stereo resampling backend and original capture-anchor
+  metadata gate, tested offline with analytic signals and wrong-rate controls.
+- [x] Offline sender-conversion observability test demonstrating hidden drift
+  and timestamp phase steps on tested Windows/Linux runtimes.
+- [ ] Original capture-anchor wire transport and a count/phase-preserving nominal
+  sender converter; current output-PTS-only conversion fails that gate.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
@@ -44,6 +50,9 @@ or production startup migration is included yet. See [network validation](networ
 and [physical video validation](video-validation.md) for actual scope and faults.
 The [ASRC design](asrc-design.md) first requires original device-clock anchors to
 survive conversion; nominal RTP progression alone cannot satisfy that gate.
+See [offline DSP evidence](asrc-validation.md) and the measured
+[conversion failure](conversion-timing.md). A tested resampler is not a completed
+live rate controller or a replacement for that missing timing relationship.
 
 If the shared timestamp relationship does not survive either capture or OBS
 delivery, stop and revise that boundary. Do not disguise failure with a new offset.

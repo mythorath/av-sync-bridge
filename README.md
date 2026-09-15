@@ -61,8 +61,11 @@ rate-estimation recommendations, privacy-cutoff logic, local synthetic IPC and a
 optional native OBS adapter. A rate estimate is not implemented ASRC; simulated
 audio is not hardware validation. The optional network experiment remains
 separate from the physical-video and synthetic IPC/OBS paths. The
-[ASRC design](docs/asrc-design.md) identifies an original capture-clock metadata
-gate that must pass before adaptive rate correction is enabled.
+[optional resampler and original capture-anchor components](docs/asrc-validation.md)
+now pass offline checks, including a 600-second generated-marker case and wrong-rate
+controls. The [current sender conversion](docs/conversion-timing.md) demonstrably
+hides drift and steps its timestamps under simulated clock mismatch. Preserving
+the original capture-clock relationship remains a gate before live correction.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

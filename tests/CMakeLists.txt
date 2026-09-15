@@ -15,6 +15,16 @@ add_executable(avsync-capture-window-tests capture_window_tests.cpp)
 target_link_libraries(avsync-capture-window-tests PRIVATE avsync_core)
 add_test(NAME avsync-capture-window-tests COMMAND avsync-capture-window-tests)
 
+add_executable(avsync-audio-anchor-tests audio_anchor_tests.cpp)
+target_link_libraries(avsync-audio-anchor-tests PRIVATE avsync_core)
+add_test(NAME avsync-audio-anchor-tests COMMAND avsync-audio-anchor-tests)
+
+if(TARGET avsync_asrc)
+    add_executable(avsync-asrc-tests asrc_tests.cpp)
+    target_link_libraries(avsync-asrc-tests PRIVATE avsync_asrc PkgConfig::SAMPLERATE)
+    add_test(NAME avsync-asrc-tests COMMAND avsync-asrc-tests)
+endif()
+
 if(TARGET avsync_gst_clock)
     add_executable(avsync-network-clock-tests network_clock_tests.cpp)
     target_link_libraries(avsync-network-clock-tests PRIVATE avsync_gst_clock)
