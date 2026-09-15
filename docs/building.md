@@ -13,11 +13,47 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 For a core-only build on either platform add `-DAVSYNC_BUILD_IPC=OFF`. Linux IPC is
-enabled by default on Linux and disabled on other systems. The Windows build does
-not yet contain an audio sender. It includes the optional metadata-only WASAPI
+enabled by default on Linux and disabled on other systems. The default Windows
+build includes the optional metadata-only WASAPI
 probe (`AVSYNC_BUILD_WINDOWS_PROBE=ON` by default on Windows); its help test does
 not open an endpoint. See [explicit probe use](windows-capture.md). No external
 test framework is downloaded.
+
+## Optional network diagnostics
+
+`AVSYNC_BUILD_NETWORK=ON` adds the desktop-only Windows sender or the Linux
+diagnostic receiver, plus shared-clock tests. It is **off by default** and does
+not install a service or change OBS. Requires GStreamer >=1.24 development
+libraries for core, net, app, audio and RTP, plus GIO and pkg-config. Runtime
+plugins must include appsrc/appsink, audioconvert, audioresample, rtpbin, UDP,
+and L24 payload/depayload elements. These are bounded experiments, not yet a
+production audio replacement. See [sender](windows-sender.md),
+[clock contract](network-clock.md) and [receiver](network-receiver.md).
+
+Ubuntu development packages are `libgstreamer1.0-dev` and
+`libgstreamer-plugins-base1.0-dev`. Review package-manager changes before installing
+on a live machine. Then:
+
+```sh
+cmake -S . -B build-network -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_NETWORK=ON
+cmake --build build-network --parallel 2
+ctest --test-dir build-network --output-on-failure
+```
+
+On Windows use a matching x64 MSVC GStreamer **development** distribution. A
+runtime-only install lacks headers/import libraries. The tested 1.28.6 Inno
+installer supports `/portable=1 /CURRENTUSER /TYPE=devel /DIR="NEW_SDK_DIRECTORY"`;
+portable mode avoids registry/environment/Visual Studio changes. Obtain installers
+and checksums from the [official download directory](https://gstreamer.freedesktop.org/data/pkg/windows/).
+Do not replace a functioning production runtime just to build this experiment.
+
+In the build shell only, prepend that SDK's `bin` to PATH and set PKG_CONFIG_PATH
+to its `lib/pkgconfig`. Configure with Visual Studio 2022 x64 and the network
+option above. Use `--config Release` for building and `-C Release` for CTest.
+Run diagnostics from a shell with the same process-local SDK PATH; avoid mixing
+DLLs/plugins from different installations. The normal CI Windows job tests the
+dependency-free core/probe, not the optional SDK sender. Linux CI compiles the
+receiver and runs pure clock tests but does not open network listeners.
 
 Optional Linux memory/undefined-behavior checks:
 

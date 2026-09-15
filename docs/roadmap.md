@@ -25,11 +25,20 @@ isolated real-capture development, not production deployment.
 
 - [x] Explicit Windows loopback metadata probe: existing mix format, device/QPC
   timestamp pairs and bounded diagnostics; no PCM storage or network output.
-- [ ] Capture-correlated WASAPI timestamps, preserving speaker configuration.
-- [ ] Shared application clock and explicit epoch; measured uncertainty.
+- [x] Optional bounded desktop-only WASAPI sender, explicit stereo conversion,
+  shared-monotonic clock mapping, and RTP/RTCP diagnostic receiver.
+- [x] Actual eight-channel conversion fixtures on Windows/Linux; short real-network
+  starts, one sender-clock outage/reacquisition and sender SR correspondence checks.
+- [ ] Independently measured WASAPI content-time calibration and microphone capture.
+- [ ] Shared-clock uncertainty and generation behavior under representative load.
 - [ ] RTP/RTCP PCM and bounded RTX interoperation, including loss/reordering tests.
 - [ ] Physical V4L2 capture, sequence/time validation and stable calibration.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
+
+The two completed transport subsets above do not complete the broader capture
+or clock-uncertainty gates. No microphone, physical video, adaptive drift control,
+RTX, OBS network handoff, or production startup migration is included yet. See
+[network validation](network-validation.md) for actual scope and known gaps.
 
 If the shared timestamp relationship does not survive either capture or OBS
 delivery, stop and revise that boundary. Do not disguise failure with a new offset.

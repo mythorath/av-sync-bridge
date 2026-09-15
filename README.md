@@ -6,11 +6,14 @@ video and network audio, designed for OBS Studio.
 **Early development — not a working replacement for a production audio bridge.**
 The isolated synthetic prototype now passes repeated encoded timing checks and
 controlled restart/stall/mute fixtures. See [measured results and limits](docs/handoff-validation.md).
-Windows capture,
-network-clock integration, packet recovery, physical video ingest and production
-recovery must each pass explicit validation before a release is recommended.
-The first Windows component is a [metadata-only WASAPI probe](docs/windows-capture.md),
-not an audio sender; capture is explicit and no PCM is recorded or transmitted.
+An optional [desktop-only Windows sender](docs/windows-sender.md) now feeds a
+[Linux diagnostic receiver](docs/network-receiver.md) using a shared monotonic
+clock and RTP/RTCP PCM. Short real-network starts and a controlled clock outage
+have been tested; see [transport results and limits](docs/network-validation.md).
+This path is not yet connected to the OBS playout bridge. Packet recovery,
+adaptive audio-rate correction, physical video ingest and production recovery
+still require explicit validation. A separate [metadata-only WASAPI probe](docs/windows-capture.md)
+remains available without transmitting PCM.
 
 ## Intended use
 
@@ -53,7 +56,8 @@ change startup tasks, or touch an OBS profile. Tests remain active in Release bu
 Implemented foundation: timestamp arithmetic, rational cadence, bounded queues,
 rate-estimation recommendations, privacy-cutoff logic, local synthetic IPC and an
 optional native OBS adapter. A rate estimate is not implemented ASRC; simulated
-audio is not WASAPI capture; local IPC is not network-clock synchronization.
+audio is not hardware validation. The optional network experiment remains
+separate from the synthetic IPC/OBS playout path.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

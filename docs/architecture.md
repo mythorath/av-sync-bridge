@@ -18,10 +18,12 @@ nanoseconds are validated before arithmetic. Each connection carries a shared
 session plus per-stream generation; a reconnect may invalidate one stream without
 restarting unrelated streams.
 
-The planned network clock is Linux's monotonic media clock exposed through
-GStreamer NetTimeProvider/NetClientClock. RTP/RTCP PCM with deadline-bounded RTX is
-the first transport candidate. These are **not implemented by the synthetic
-milestone**. OS NTP alone cannot reconstruct discarded capture metadata.
+The network clock is Linux's monotonic media clock exposed through
+GStreamer NetTimeProvider/NetClientClock. A bounded desktop-only RTP/RTCP PCM
+diagnostic now implements that boundary separately from synthetic IPC/OBS;
+see [network validation](network-validation.md). Deadline-bounded RTX and the
+complete playout integration are not implemented. OS NTP alone cannot reconstruct
+discarded capture metadata.
 
 Given calibrated content time T, present at T + configured playout delay. The
 initial design target is two seconds, including network jitter/recovery allowance,

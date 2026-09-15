@@ -13,6 +13,8 @@
 *.mkv
 *.mp4
 *.wav
+*.raw
+*.pcm
 *.tar
 *.tar.gz
 *.zip

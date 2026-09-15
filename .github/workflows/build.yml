@@ -37,3 +37,16 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAVSYNC_ENABLE_SANITIZERS=ON
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --timeout 30
+  network-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+      - name: Install optional development libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAVSYNC_BUILD_NETWORK=ON
+      - run: cmake --build build --parallel 2
+      - name: Pure clock and help tests (no capture or network listeners)
+        run: ctest --test-dir build --output-on-failure --timeout 30
