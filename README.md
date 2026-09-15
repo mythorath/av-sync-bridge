@@ -66,9 +66,12 @@ now pass offline checks, including a 600-second generated-marker case and wrong-
 controls. The [old sender conversion](docs/conversion-timing.md) hid drift and
 stepped its timestamps under simulated clock mismatch. A new
 [timestamp-free nominal converter](docs/nominal-audio-validation.md) keeps sample
-progression separate from original capture-clock diagnostics. Original-anchor
-wire transport remains a gate before live correction; a continuous nominal
-timeline alone cannot satisfy it.
+progression separate from original capture-clock diagnostics. A bounded
+[original-anchor transport diagnostic](docs/audio-anchor-transport-validation.md)
+now preserves those records independently of nominal RTP time, with strict
+sample-position and generation checks. Live adaptive correction and combined
+physical A/V delivery remain separate gates; continuous nominal timestamps alone
+cannot satisfy them.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

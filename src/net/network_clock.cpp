@@ -115,6 +115,43 @@ std::optional<Nanoseconds> map_qpc_100ns(GstClock* client, std::uint64_t qpc_100
     return apply_calibration(*calibration, *local);
 }
 
+CaptureClockMapper::CaptureClockMapper(std::uint64_t maximum_revision)
+    : maximum_revision_(maximum_revision)
+{
+    if (maximum_revision == 0)
+        throw std::invalid_argument("capture clock revision budget must be nonzero");
+}
+
+std::optional<MappedCapture> CaptureClockMapper::map(
+    GstClock* client, std::uint64_t qpc_100ns) noexcept
+{
+    // One calibration query supplies both the transform and returned
+    // provenance. Later clock recalibration cannot mutate this local value.
+    const auto snapshot = client_calibration(client);
+    if (!snapshot) return std::nullopt;
+    return map(*snapshot, qpc_100ns);
+}
+
+std::optional<MappedCapture> CaptureClockMapper::map(
+    const Calibration& calibration, std::uint64_t qpc_100ns) noexcept
+{
+    const Calibration snapshot = calibration;
+    const auto local = qpc_100ns_to_ns(qpc_100ns);
+    if (!local) return std::nullopt;
+    const auto capture = apply_calibration(snapshot, *local);
+    if (!capture) return std::nullopt;
+
+    const bool changed = !previous_ || *previous_ != snapshot;
+    if (changed && revision_ == maximum_revision_) return std::nullopt;
+    // Complete every validation before advancing revision/provenance. With
+    // the exhaustion check, increment cannot wrap even at the default budget.
+    const auto next_revision = revision_ + (changed ? 1U : 0U);
+    const MappedCapture result{*local, *capture, snapshot, next_revision};
+    previous_ = snapshot;
+    revision_ = next_revision;
+    return result;
+}
+
 DomainCheck verify_local_monotonic_domain(GstClock* local_clock, Nanoseconds tolerance_ns) noexcept
 {
     DomainCheck best;

@@ -58,8 +58,8 @@ requirements; no library implementation needs copying into this repository.
 
 ## Gate zero: prove that drift remains observable
 
-A backend cannot reconstruct timing information discarded upstream. The current
-fixed sender resampler generates its output PTS from an initial time plus its
+A backend cannot reconstruct timing information discarded upstream. The original
+timestamped sender resampler generated its output PTS from an initial time plus its
 nominal output sample count. Comparing RTP sample progression to that same
 SR-derived nominal time can therefore report exactly 48 kHz while original
 device-position/QPC progression differs. This is a **design inference from the
@@ -82,17 +82,17 @@ relationship to the transmitted PCM sample sequence. Proposed minimum anchor:
 Retain original anchors unchanged. A fixed nominal conversion preserves the
 fractional source-rate error only if it does not insert/drop frames or reset its
 phase; demonstrate that condition rather than assume it. Packet sequence alone
-is not a sample index when packet sizes vary. A later small, versioned metadata
-channel or RTP/RTCP extension can carry anchors; this document does not choose
-an unimplemented wire format or mislabel monotonic timestamps as UTC.
+is not a sample index when packet sizes vary. The experimental
+[original-anchor wire contract](audio-anchor-wire-draft.md) now carries these
+records separately; it does not mislabel monotonic timestamps as UTC.
 
-The smallest next step is an **offline ASRC harness with independently generated
-anchors**, followed by a sender-conversion observability fixture. Live activation
-must remain disabled until those anchors survive conversion/transport and the
-sender's nominal-PTS discontinuity behavior is addressed explicitly. Possible
-later implementation is a raw converter with an explicit sample ledger, or
-separate nominal converter timestamps and original timing metadata; neither is
-implemented or approved as a silent timestamp rewrite here.
+The **offline ASRC harness with independently generated anchors**, conversion
+observability fixture, and timestamp-free nominal converter are now implemented
+and tested separately. The bounded [original-anchor transport diagnostic](audio-anchor-transport-validation.md)
+also preserves original metadata and its exact nominal sample association.
+Live correction remains disabled: the next boundary is owned validated PCM
+through one bounded correction worker and presentation schedule, with independent
+content-time/load/restart measurements. No silent timestamp rewrite is approved.
 
 ## Receiver placement and one correction owner
 

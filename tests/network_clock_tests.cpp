@@ -153,12 +153,105 @@ void test_health()
     }
 }
 
+void test_capture_mapper()
+{
+    const Calibration first{10'000'000'000, 50'000'000'000, 1, 1};
+    Calibration changed = first;
+    CaptureClockMapper mapper;
+    // Rejected input cannot consume revision 1 or retain invalid provenance.
+    CHECK(!mapper.map(nullptr, 0));
+    CHECK(!mapper.map(Calibration{0, 0, 1, 0}, 0));
+    CHECK(!mapper.map(first, std::numeric_limits<std::uint64_t>::max()));
+    const auto a = mapper.map(first, 90'000'000);
+    CHECK(a);
+    CHECK(a->local_ns == 9'000'000'000);
+    CHECK(a->capture_ns == 49'000'000'000);
+    CHECK(a->calibration == first);
+    CHECK(a->revision == 1);
+    // Historical time need not increase in the mapper: the anchor tracker
+    // owns chronology. There is no monotonic-now clamping or arrival fallback.
+    const auto older = mapper.map(first, 80'000'000);
+    CHECK(older && older->capture_ns == 48'000'000'000 && older->revision == 1);
+    CHECK(mapper.map(first, 90'000'000) == a);
+    CHECK(!mapper.map(nullptr, 90'000'000));
+
+    changed.external_reference += 125;
+    const auto b = mapper.map(changed, 90'000'000);
+    CHECK(b && b->capture_ns == a->capture_ns + 125 && b->revision == 2);
+    CHECK(b->calibration == changed);
+    CHECK(apply_calibration(b->calibration, b->local_ns) == b->capture_ns);
+    // A caller's later calibration edit cannot alter an already returned
+    // record or accidentally supply a separately queried diagnostic snapshot.
+    changed.external_reference += 456;
+    CHECK(a->calibration == first && a->revision == 1 && a->capture_ns == 49'000'000'000);
+    CHECK(b->calibration.external_reference == first.external_reference + 125);
+    CHECK(b->capture_ns == apply_calibration(b->calibration, b->local_ns));
+    const auto c = mapper.map(changed, 90'000'000);
+    CHECK(c && c->revision == 3 && c->capture_ns == b->capture_ns + 456);
+    CHECK(mapper.map(first, 90'000'000)->revision == 4); // Reversion is a new revision.
+
+    // Every coefficient participates in identity, even when an equivalent
+    // transform maps this particular QPC value to the same result.
+    const Calibration identity{0, 0, 1, 1};
+    CaptureClockMapper coefficients;
+    CHECK(coefficients.map(identity, 100)->revision == 1);
+    for (const Calibration value : {Calibration{100, 100, 1, 1},
+                                    Calibration{100, 100, 2, 2},
+                                    Calibration{100, 100, 3, 2},
+                                    Calibration{100, 100, 3, 4}}) {
+        const auto record = coefficients.map(value, 100);
+        CHECK(record);
+        CHECK(record->calibration == value);
+        CHECK(record->capture_ns == apply_calibration(value, 10'000));
+        CHECK(coefficients.map(value, 100) == record);
+    }
+    CHECK(coefficients.map(Calibration{100, 100, 3, 4}, 100)->revision == 5);
+
+    // Failures after a successful result must preserve both coefficient
+    // identity and revision: next successful change advances by exactly one.
+    CaptureClockMapper transactional;
+    CHECK(transactional.map(identity, 0)->revision == 1);
+    const auto qpc_limit = static_cast<std::uint64_t>(maximum) / 100;
+    const auto boundary = transactional.map(identity, qpc_limit);
+    CHECK(boundary && boundary->capture_ns == static_cast<Nanoseconds>(qpc_limit * 100));
+    CHECK(boundary->revision == 1);
+    CHECK(!transactional.map(Calibration{0, 1, 1, 1}, qpc_limit + 1));
+    CHECK(!transactional.map(Calibration{0, maximum, 1, 1}, 1));
+    CHECK(!transactional.map(Calibration{1, 0, 1, 1}, 0));
+    CHECK(!transactional.map(Calibration{0, 0, std::numeric_limits<std::uint64_t>::max(), 1}, 1));
+    CHECK(!transactional.map(Calibration{-1, 0, 1, 1}, 0));
+    CHECK(!transactional.map(Calibration{0, -1, 1, 1}, 0));
+    CHECK(!transactional.map(Calibration{0, 0, 0, 1}, 0));
+    CHECK(!transactional.map(Calibration{0, 0, 1, 0}, 0));
+    CHECK(transactional.map(identity, 0)->revision == 1);
+    CHECK(transactional.map(Calibration{0, 1, 1, 1}, 0)->revision == 2);
+
+    // Inject a finite revision budget to exercise the same pre-increment
+    // exhaustion branch as UINT64_MAX without needing 2^64 mappings.
+    CaptureClockMapper limited(2);
+    CHECK(limited.map(identity, 0)->revision == 1);
+    CHECK(limited.map(first, 90'000'000)->revision == 2);
+    CHECK(!limited.map(changed, 90'000'000));
+    CHECK(!limited.map(identity, 0));
+    const auto at_limit = limited.map(first, 90'000'000);
+    CHECK(at_limit && at_limit->revision == 2 && at_limit->calibration == first);
+    CHECK(at_limit->capture_ns == a->capture_ns);
+    CHECK(!limited.map(changed, std::numeric_limits<std::uint64_t>::max()));
+    CHECK(limited.map(first, 90'000'000) == at_limit);
+    bool threw = false;
+    try { CaptureClockMapper invalid(0); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}
+
 void test_local_clock_domain()
 {
     CHECK(!verify_local_monotonic_domain(nullptr).valid);
     auto* local = GST_CLOCK(g_object_new(GST_TYPE_SYSTEM_CLOCK, "clock-type", GST_CLOCK_TYPE_MONOTONIC, nullptr));
     CHECK(local);
     CHECK(!client_calibration(local));
+    CaptureClockMapper mapper;
+    CHECK(!mapper.map(local, 0)); // Wrong clock type is rejected without network I/O.
+    CHECK(mapper.map(Calibration{0, 0, 1, 1}, 0)->revision == 1);
     CHECK(!verify_local_monotonic_domain(local, -1).valid);
 #if defined(_WIN32) || defined(__linux__)
     const auto domain = verify_local_monotonic_domain(local);
@@ -180,6 +273,7 @@ int main(int argc, char** argv)
     gst_init(&argc, &argv);
     try {
         test_mapping();
+        test_capture_mapper();
         test_health();
         test_local_clock_domain();
         std::cout << "Network clock tests passed: " << checks << " checks; no network or capture.\n";

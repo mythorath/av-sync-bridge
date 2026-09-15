@@ -1,10 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # Original audio anchor transport: wire draft
 
-Status: **design proposal only; unimplemented; not a committed or stable wire
-contract**. The sender currently keeps original anchors locally. Neither the
-extension below nor receiver ASRC is enabled by this document. Field choices,
-admission and recovery must pass fixtures before becoming a versioned protocol.
+Status: **implemented experimental desktop-audio diagnostic; not a stable wire
+contract or production sync bridge**. The bounded codec, RTP adapter, ordered
+validator and generation-admission helper are implemented. The receiver can
+inspect original anchors alongside their RTP PCM with `--expect-anchors`.
+It does not apply ASRC, schedule presentation, record/play audio, or send this
+path to OBS. Generated fixtures establish software properties, not physical
+capture accuracy or end-to-end A/V synchronization.
 
 ## Two independent positions
 
@@ -31,12 +34,14 @@ phase and fixed/irregular partition agreement, including downsampling. That is
 a completed offline prerequisite, **not** proof of network metadata association,
 physical capture timing, sustained clock correction or end-to-end OBS sync.
 
-## Proposed fixed 96-byte record
+## Experimental fixed 96-byte record
 
-Use one RFC 8285 **two-byte-header** element, with appbits zero. Bind a project
-URI and extension ID through explicit out-of-band configuration; ID 1 is a
-prototype choice, not a global assignment. All multibyte values are network
-byte order; serialize fields explicitly, never copy a native C++ struct.
+The narrow diagnostic profile uses one RFC 8285 **two-byte-header** element,
+with appbits zero and extension ID 1. Both endpoints explicitly agree to this
+profile; ID 1 is a prototype choice, not a global assignment or negotiated URI.
+All multibyte values are network byte order, serialized explicitly rather than
+copying a native C++ struct. The adapter rejects unknown or duplicate elements,
+CSRCs, RTP padding and nonzero extension padding.
 
 | Byte offset | Type | Field |
 |---:|---|---|
@@ -46,7 +51,7 @@ byte order; serialize fields explicitly, never copy a native C++ struct.
 | 4 | u32 | Nominal original source sample rate |
 | 8 | u64 | Nonzero sender session ID |
 | 16 | u64 | Nonzero conversion generation |
-| 24 | u64 | Agreed provider-clock epoch |
+| 24 | u64 | Nonzero provider-clock epoch explicitly copied from this receiver run |
 | 32 | u64 | Original device-frame origin for this generation |
 | 40 | u32 | RTP timestamp corresponding to wire frame zero |
 | 44 | u32 | Reserved, exactly 0 |
@@ -55,12 +60,15 @@ byte order; serialize fields explicitly, never copy a native C++ struct.
 | 64 | u64 | Original anchor device-frame position |
 | 72 | i64 | Original mapped capture time, nonnegative nanoseconds |
 | 80 | u64 | Original WASAPI QPC time in 100 ns units |
-| 88 | u64 | Revision of the exact calibration used for this mapping |
+| 88 | u64 | Nonzero revision of the exact calibration used for this mapping |
 
 The packet header supplies SSRC; admitted `(session, generation)` binds to one
 SSRC and one immutable source rate, origin, clock epoch and RTP-zero timestamp.
 All fields of an identified anchor, including QPC time and calibration revision,
 remain immutable when repeated. Only the per-packet wire start changes.
+The codec accepts source rates from 8 to 384 kHz, nonnegative mapped capture
+times and raw QPC values whose conversion to signed nanoseconds is representable.
+The nominal converter independently applies its narrower phase-table bounds.
 The profile remains ordinary stereo L24/48 kHz RTP if a nonparticipating reader
 ignores the extension; the sync application must not enable correction without
 validated metadata. [RFC 8285](https://www.rfc-editor.org/rfc/rfc8285.html).
@@ -75,16 +83,34 @@ packet is 1,196 bytes. Check final size after insertion; do not grow an already
 UDP/IP headers. GStreamer's two-byte extension insertion can fail and must be
 checked. [RTP buffer API](https://gstreamer.freedesktop.org/documentation/rtplib/gstrtpbuffer.html).
 
-## Sender ledger and receiver validation
+## Explicit agreement for a finite diagnostic
+
+The receiver generates a fresh nonzero clock-epoch token and prints it in
+`AVSYNC_NETWORK_READY ... clock_epoch=...`. Copy that exact token to the sender's
+required `--clock-epoch` argument for this bounded run. A restarted receiver
+requires its new token and a new run; do not reuse a saved value. This is a
+manual, out-of-band agreement, **not an automatic control handshake,
+authentication, or proof of clock accuracy**.
+
+`CaptureClockMapper` obtains one calibration snapshot and returns the original
+QPC conversion, mapped capture time, exact applied coefficients and revision as
+one value-owned result. Selected anchors retain that result unchanged. Normal
+calibration changes advance its revision, not the transport generation; invalid
+mapping or health loss still fences the generation. See the
+[shared-clock contract](network-clock.md).
+
+## Implemented sender ledger and receiver validation
 
 - Select actual original capture anchors at least 20 ms apart on the nominal
   device-frame grid, beginning with the conversion origin. Assign consecutive
   IDs to selected anchors, not to every capture buffer. Never manufacture a
   capture time at a convenient interval.
-- Retain selected records in a bounded FIFO until packetization passes their
-  nominal positions. A proposed initial cap is 32 records and 200 ms residence;
-  overflow/expiry invalidates the generation, never overwrites required records.
-  Reconcile these caps with converter, appsrc and network budgets before use.
+- Retain selected records in a **32-record FIFO** until packetization passes
+  their nominal positions; overflow is a fault rather than an overwrite.
+  At packet decoration, the selected anchor's original capture time must be
+  at most **200 ms old** and at most 100 ms in the future. This is a capture-age
+  check on the selected record, **not a strict 200 ms FIFO-residence deadline**
+  or an independent timer expiring every queued record.
 - For each packet, repeat the newest selected anchor whose **exact rational**
   position is no later than its first wire frame. Keep that anchor until its
   successor applies. This avoids a racing "latest capture" pointer attaching
@@ -97,10 +123,11 @@ checked. [RTP buffer API](https://gstreamer.freedesktop.org/documentation/rtplib
   output, split buffers and aggregation all require the same checks.
 - Validate peer and packet bounds at ingress. After jitter-buffer ordering,
   parse RTP, the extension and L24 payload together, **before depayloading**.
-  Keep validated PCM and its packet identity in one bounded owned object; do
-  not assume arbitrary metadata survives a depayloader or pair independent
-  metadata/audio FIFOs by arrival order. The jitter buffer reorders and removes
-  duplicates; its output PTS is not an original capture anchor.
+  The diagnostic inspects the extension and PCM in the same owned RTP buffer,
+  before releasing it; it does not forward PCM to an ASRC worker or maintain
+  independently paired metadata/audio FIFOs. Future media delivery must retain
+  that atomic ownership. The jitter buffer reorders and removes duplicates;
+  its output PTS is not an original capture anchor.
   [Jitter-buffer contract](https://gstreamer.freedesktop.org/documentation/rtpmanager/rtpjitterbuffer.html).
 - Reject absent/duplicate target elements, unknown versions/flags, wrong size,
   nonzero reserved fields, zero or non-frame-aligned PCM, arithmetic overflow,
@@ -108,39 +135,64 @@ checked. [RTP buffer API](https://gstreamer.freedesktop.org/documentation/rtplib
   `rtp_timestamp == (rtp_zero + packet_wire_start) mod 2^32`; contiguous accepted
   packet extents must advance by their actual payload frames. Do not use a
   periodic timestamp or SSRC alone to identify a restarted stream.
+- First admission requires wire frame zero, selected-anchor sequence zero and
+  the original device position equal to the declared device origin. Every
+  selected anchor's exact rational position must be no later than the first
+  wire frame of its carrier packet. Receiver capture age is bounded to **250 ms
+  old / 100 ms future**. Consecutive new anchors require strictly increasing
+  original QPC/device positions and capture times, with nondecreasing
+  calibration revision.
 - Identical repeated anchors are deduplicated before `AudioAnchorTracker`;
   repetitions do not advance its sequence or refresh original capture age.
   A repeated ID with changed contents is a fault. Missing, backward, stale or
   conflicting selected anchors fail closed under the current tracker contract.
   Do not renumber received records, turn missing media into declared silence,
   or fall back to nominal SR timestamps to keep correction apparently active.
-- A media gap, expired anchor, clock fault or admitted new generation discards
-  old PCM, anchors, ASRC history and sample-grid state before re-priming. Old or
-  unadmitted SSRCs cannot switch the active generation back. The required
-  sender/receiver restart coordination remains to be designed; the first
-  finite diagnostic can stop explicitly rather than pretend recovery exists.
+- New rate measurements are emitted only for newly completed original-clock
+  windows. Repeated anchors do not inflate measurement counts. Out-of-range
+  values remain diagnostic evidence; the separately queried correction estimate
+  is withheld when stale, faulted or outside the correction limit.
+- Each ordered branch has an O(1) validator which latches same-generation
+  faults; later valid-looking packets do not heal a gap. Global admission binds
+  the first sender session and SSRC, then permits only higher generations of
+  that same session on new, never-reused SSRCs starting at wire frame zero.
+  It remembers at most **eight admitted SSRCs**, rejecting retired generations,
+  foreign sessions and further transitions after the cap. Rejected admission
+  does not replace the active generation. This is bounded finite-run policy,
+  not general restart recovery or authenticated sender identity.
 
-## Prerequisites still missing
+## Generated transport fixtures
 
-1. **Provider-clock epoch agreement.** The current network-time provider does
-   not distribute the proposed epoch token. An explicit startup/control handshake
-   must bind the expected provider instance and sender session. A guessed token,
-   SSRC, process arrival time or wall-clock timestamp is not such a handshake.
-2. **Atomic calibration provenance.** Mapping currently returns a timestamp;
-   a separately read calibration snapshot can race it. Add one operation that
-   snapshots the exact coefficients/revision and applies that snapshot to the
-   original QPC value. Normal calibration revisions are provenance, not automatic
-   generation changes. Health loss or a disallowed mapping discontinuity must
-   fence a generation; the policy and uncertainty remain independently tested.
-3. **Admission, bounded ownership and faults.** Define active/retired epoch
-   admission, frame/anchor queues, expiry, control-channel recovery and all
-   ownership across capture, packetizer, jitter buffer and ASRC worker. A
-   configured jitter latency alone is not proof of a total process-memory bound.
-4. **Independent transport fixtures.** Exercise capture/packet boundary mismatch,
-   delayed conversion, buffer lists, 44.1 kHz rational positions, 32-bit RTP wrap,
-   duplicate/reordered/lost packets, all repetitions lost, stale anchors, wrong
-   SSRC/clock epochs and restart races. Require sample-content markers as well
-   as metadata/count checks, with deliberately wrong associations rejected.
+The dependency-free `avsync-audio-wire-tests` covers the independent 96-byte
+golden representation, malformed fields, overflow, rational associations,
+original-clock measurements, immutable repeats, age limits and admission rules.
+`avsync-rtp-audio-anchor-tests` exercises the actual GStreamer L24 payloader and
+adapter with sample-index-coded PCM, split/aggregated input, buffer lists,
+44.1 kHz associations, RTP timestamp wrap and deliberately invalid packets.
+Ordered-validator negative cases include missing/reordered media, lost anchor
+transitions, stale anchors and incorrect epochs. These are generated software
+fixtures; they do not establish real network-loss recovery, capture-driver
+accuracy, live correction quality or physical A/V timing.
+
+## Remaining production gates
+
+1. **Managed control and recovery.** Replace manual finite-run token transfer
+   with explicit provider/sender-instance agreement and safe process-restart
+   coordination. Define retirement, reacquisition and operator-visible failures
+   across real link loss; do not silently admit a new sender session by arrival.
+2. **Physical timing and mapping uncertainty.** Exact applied-coefficient
+   provenance is implemented, but it is not a hardware-atomic capture/clock
+   observation or clock-error bound. Measure clock residuals, driver content
+   timing and calibration behavior under load and across restarts.
+3. **Owned PCM through correction and presentation.** Connect validated packet
+   identity to bounded ASRC input/output and one presentation timeline. On a
+   fault, discard prior-generation PCM, anchors and filter history before
+   re-priming. Jitter latency and a 32-record ledger alone do not prove total
+   process-memory or end-to-end deadline bounds.
+4. **Live and end-to-end proof.** Extend generated tests to real transport loss,
+   all repetitions lost, control restart races, long runs and physically measured
+   nonuniform audio/video events. The generated converter, metadata and PCM
+   fixtures do not substitute for that evidence.
 
 These checks provide protocol consistency, **not authentication or encryption**.
 The current private-link UDP/RTP transport and source-IP filtering cannot prove

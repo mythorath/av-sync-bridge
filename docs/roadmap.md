@@ -42,8 +42,10 @@ isolated real-capture development, not production deployment.
   and timestamp phase steps on tested Windows/Linux runtimes.
 - [x] Timestamp-free nominal sender converter with independently checked sample
   counts, phase, partition invariance and restart behavior on Windows/Linux.
-- [ ] Original capture-anchor wire transport; sender-side original-anchor
-  diagnostics and nominal RTP progression do not complete that gate.
+- [x] Bounded desktop original capture-anchor wire diagnostic, exact calibration
+  provenance, ordered PCM association and finite generation admission.
+- [ ] Automatic provider/sender restart handshake, loaded loss/reordering/recovery
+  and sustained original-anchor uncertainty characterization.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
@@ -55,7 +57,8 @@ survive conversion; nominal RTP progression alone cannot satisfy that gate.
 See [offline DSP evidence](asrc-validation.md), the measured old
 [conversion failure](conversion-timing.md) and the
 [nominal conversion replacement](nominal-audio-validation.md). A tested resampler is not a completed
-live rate controller or a replacement for that missing timing relationship.
+live rate controller. The [original-anchor transport milestone](audio-anchor-transport-validation.md)
+preserves the timing relationship diagnostically; it does not yet drive ASRC or OBS.
 
 If the shared timestamp relationship does not survive either capture or OBS
 delivery, stop and revise that boundary. Do not disguise failure with a new offset.

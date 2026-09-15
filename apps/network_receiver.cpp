@@ -7,6 +7,7 @@
 #include <gst/rtp/gstrtcpbuffer.h>
 #include <gio/gio.h>
 #include "avsync/network_clock.hpp"
+#include "avsync/rtp_audio_anchor.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -38,14 +40,15 @@ struct Options {
     std::string bind, peer;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
-    bool expect_media{};
+    bool expect_media{}, expect_anchors{};
 };
 void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
-                 " [--seconds 1..180] [--expect-media]\n"
+                 " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
                  " [--clock-pause-after SECONDS --clock-pause-seconds 1..10] (test fixture only)\n"
                  "Explicit private-link diagnostic listener and shared monotonic clock provider.\n"
                  "PT96/L24/48kHz/stereo; accepts only the supplied peer's media packets.\n"
+                 "For anchor tests, copy the fresh clock_epoch from READY to the sender.\n"
                  "No PCM recording/playback, OBS access, firewall changes or startup service.\n";
 }
 struct InetDeleter { void operator()(GInetAddress* value) const { if(value) g_object_unref(value); } };
@@ -61,8 +64,27 @@ struct ReportSlot {
     bool occupied{};
     guint32 ssrc{};
     std::atomic<GstClockTime> last_received{GST_CLOCK_TIME_NONE};
+    // Strict-profile RTP observed after the peer filter but before rtpbin.
+    // First/last refer to ingress arrival order, not minimum/maximum positions.
+    std::atomic<std::uint64_t> ingress_rtp_packets{}, ingress_rtp_frames{};
+    std::atomic<std::uint64_t> ingress_first_wire_start{}, ingress_last_wire_start{};
 };
+class Receiver;
 struct Branch {
+    Receiver* owner{};
+    std::optional<avsync::wire::AudioReceiverValidator> validator;
+    std::uint64_t original_packets{}, original_repeats{}, original_measurements{}, original_out_of_range{};
+    std::uint64_t original_usable_measurements{};
+    bool last_original_estimate_within_limit{};
+    std::uint64_t original_invalid{}, original_retired{}, original_frames{};
+    std::uint64_t original_callbacks{};
+    std::optional<std::uint64_t> first_callback_wire_start, first_callback_anchor_sequence;
+    std::optional<unsigned> first_original_failure_status;
+    std::optional<std::uint64_t> first_failure_wire_start, first_failure_anchor_sequence;
+    std::optional<std::int64_t> first_failure_capture_age_ns;
+    unsigned last_original_status{};
+    double last_original_ppm{};
+    std::optional<avsync::wire::AudioRecord> first_original, last_original;
     ReportSlot* report{};
     std::uint64_t buffers{}, frames{}, untimed{}, untimed_after_lock{}, timed{}, invalid_reference{}, stale_reference{}, nonmonotonic{}, gaps{};
     GstClockTime previous{GST_CLOCK_TIME_NONE};
@@ -72,6 +94,21 @@ struct Branch {
     double peak{}, sum_squares{};
     std::uint64_t samples{};
 };
+template<class T> void json_optional(const std::optional<T>& value) {
+    if (value) std::cout << *value;
+    else std::cout << "null";
+}
+void remember_original_failure(Branch& branch, avsync::wire::AudioWireStatus status,
+        const std::optional<avsync::wire::AudioRecord>& record, GstClockTime now) noexcept {
+    if (branch.first_original_failure_status) return;
+    branch.first_original_failure_status = static_cast<unsigned>(status);
+    if (!record) return;
+    branch.first_failure_wire_start = record->packet_wire_start;
+    branch.first_failure_anchor_sequence = record->anchor_sequence;
+    if (now <= static_cast<guint64>(std::numeric_limits<std::int64_t>::max()))
+        branch.first_failure_capture_age_ns = avsync::checked_sub(
+            static_cast<std::int64_t>(now), record->capture_ns);
+}
 class Receiver {
 public:
     explicit Receiver(const Options& options) : options_(options), peer_(address(options.peer)) {
@@ -82,6 +119,8 @@ public:
                 (options.clock_pause_after && options.clock_pause_seconds &&
                  options.clock_pause_after + options.clock_pause_seconds < options.seconds),
                 "Clock pause needs both options and must finish before the diagnostic deadline");
+        do { clock_epoch_ = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!clock_epoch_);
+        admission_.emplace(clock_epoch_);
     }
     ~Receiver() {
         if (pipeline_) {
@@ -108,6 +147,7 @@ public:
         g_object_set(rtpbin_, "latency", 100u, "drop-on-latency", TRUE,
                      "add-reference-timestamp-meta", TRUE, "ntp-sync", FALSE, nullptr);
         g_signal_connect(rtpbin_, "pad-added", G_CALLBACK(pad_added), this);
+        g_signal_connect(rtpbin_, "new-jitterbuffer", G_CALLBACK(new_jitterbuffer), this);
         auto* rtp = add("udpsrc", "rtp-input");
         auto* rtcp = add("udpsrc", "rtcp-input");
         for (auto* source : {rtp, rtcp})
@@ -133,7 +173,8 @@ public:
         auto* bus = gst_element_get_bus(pipeline_);
         const auto start = Steady::now();
         const auto deadline = start + std::chrono::seconds(options_.seconds);
-        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic metadata_only=true\n" << std::flush;
+        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic metadata_only=true clock_epoch="
+                  << clock_epoch_ << "\n" << std::flush;
         bool error = false;
         bool clock_paused = false, clock_resumed = false;
         while (Steady::now() < deadline && !fatal_.load()) {
@@ -150,7 +191,8 @@ public:
                 }
             }
             auto* message = gst_bus_timed_pop_filtered(bus, 100*GST_MSECOND,
-                static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING | GST_MESSAGE_EOS));
+                static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
+                    GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT));
             if (!message) continue;
             if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
                 // Error text may contain peer paths/addresses. Keep public diagnostics generic.
@@ -158,24 +200,56 @@ public:
                 error = true;
             }
             if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING) ++warnings_;
+            if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ELEMENT) observe_drop_message(message);
             gst_message_unref(message);
             if (error) break;
         }
         gst_object_unref(bus);
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         gst_element_get_state(pipeline_, nullptr, nullptr, 5*GST_SECOND);
-        std::uint64_t timed = 0, invalid = 0, buffers = 0;
+        std::optional<avsync::SessionToken> active_epoch;
+        std::optional<std::uint32_t> active_ssrc;
+        {
+            std::lock_guard lock(admission_mutex_);
+            active_epoch = admission_->active_epoch();
+            active_ssrc = admission_->active_ssrc();
+        }
+        std::uint64_t timed = 0, invalid = 0, buffers = 0, original_invalid = 0;
+        std::uint64_t active_branches = 0, active_windows = 0, active_usable_windows = 0;
+        bool active_last_estimate_within_limit = false;
         std::cout << "{\"schema\":1,\"mode\":\"rtp_diagnostic\",\"pcm_saved\":false,\"obs_used\":false,"
                   << "\"capture_timing_verified\":false,\"reference_semantics\":\"sender_media_time_not_proof_of_capture_time\","
+                  << "\"original_anchor_mode\":" << (options_.expect_anchors ? "true" : "false")
+                  << ",\"jitter_faststart_min_packets\":" << (options_.expect_anchors ? 2 : 0)
+                  << ",\"adaptive_correction\":false,\"clock_epoch\":" << clock_epoch_ << ','
                   << "\"packets_accepted\":" << accepted_.load() << ",\"packets_rejected\":" << rejected_.load()
                   << ",\"invalid_sender_reports\":" << invalid_reports_.load()
+                  << ",\"invalid_ingress_anchor_packets\":" << invalid_ingress_anchors_.load()
                   << ",\"clock_pause_fixture\":" << (clock_paused ? "true" : "false")
                   << ",\"clock_resumed\":" << (clock_resumed ? "true" : "false")
-                  << ",\"warnings\":" << warnings_ << ",\"sessions\":[";
+                  << ",\"warnings\":" << warnings_
+                  << ",\"jitter_drop_messages\":" << jitter_drop_messages_
+                  << ",\"jitter_num_too_late\":" << jitter_num_too_late_
+                  << ",\"jitter_num_drop_on_latency\":" << jitter_num_drop_on_latency_
+                  << ",\"invalid_jitter_drop_messages\":" << invalid_jitter_drop_messages_
+                  << ",\"first_jitter_drop_seqnum\":";
+        json_optional(first_jitter_drop_seqnum_);
+        std::cout << ",\"first_jitter_drop_reason\":";
+        json_optional(first_jitter_drop_reason_);
+        std::cout << ",\"jitter_drop_reason_codes\":{\"unknown\":0,\"too_late\":1,\"drop_on_latency\":2}"
+                  << ",\"sessions\":[";
         for (std::size_t n = 0; n < branches_.size(); ++n) {
             const auto& b = *branches_[n];
             timed += b.timed; buffers += b.buffers;
             invalid += b.invalid_reference + b.stale_reference + b.nonmonotonic + b.untimed_after_lock;
+            original_invalid += b.original_invalid;
+            if (active_epoch && active_ssrc && b.last_original && b.report &&
+                b.last_original->epoch == *active_epoch && b.report->ssrc == *active_ssrc) {
+                ++active_branches;
+                active_windows = b.original_measurements;
+                active_usable_windows = b.original_usable_measurements;
+                active_last_estimate_within_limit = b.last_original_estimate_within_limit;
+            }
             if (n) std::cout << ',';
             std::cout << "{\"index\":" << n << ",\"buffers\":" << b.buffers << ",\"frames\":" << b.frames
                       << ",\"priming_untimed\":" << b.untimed << ",\"timed\":" << b.timed
@@ -188,12 +262,114 @@ public:
                       << ",\"rms\":" << (b.samples ? std::sqrt(b.sum_squares/b.samples) : 0)
                       << ",\"min_reference_age_ms\":" << (b.timed ? b.min_age/1e6 : 0)
                       << ",\"max_reference_age_ms\":" << (b.timed ? b.max_age/1e6 : 0) << '}';
+            // Keep original-clock diagnostics separate from nominal RTCP references.
         }
-        std::cout << "],\"status\":\"" << (error || fatal_ ? "error" : !buffers ? "waiting_media" :
-                    !timed ? "priming_reference" : invalid ? "invalid_timing" : "timestamps_observed") << "\"}\n";
-        return error || fatal_ ? 1 : options_.expect_media && (!timed || invalid) ? 3 : 0;
+        std::cout << "],\"original_anchor_ingress\":[";
+        {
+            std::lock_guard lock(report_mutex_);
+            bool comma = false;
+            for (const auto& slot : reports_) {
+                if (!slot.occupied) continue;
+                if (comma) std::cout << ',';
+                comma = true;
+                const auto packets = slot.ingress_rtp_packets.load();
+                std::cout << "{\"ssrc\":" << slot.ssrc << ",\"rtp_packets\":" << packets
+                    << ",\"rtp_frames\":" << slot.ingress_rtp_frames.load()
+                    << ",\"first_wire_start\":";
+                if (packets) std::cout << slot.ingress_first_wire_start.load(); else std::cout << "null";
+                std::cout << ",\"last_wire_start\":";
+                if (packets) std::cout << slot.ingress_last_wire_start.load(); else std::cout << "null";
+                std::cout << '}';
+            }
+        }
+        std::cout << "],\"original_anchor_sessions\":[";
+        for (std::size_t n = 0; n < branches_.size(); ++n) {
+            const auto& b = *branches_[n];
+            if (n) std::cout << ',';
+            std::cout << "{\"ssrc\":" << (b.report ? b.report->ssrc : 0)
+                << ",\"callbacks\":" << b.original_callbacks
+                << ",\"first_callback_wire_start\":";
+            json_optional(b.first_callback_wire_start);
+            std::cout << ",\"first_callback_anchor_sequence\":";
+            json_optional(b.first_callback_anchor_sequence);
+            std::cout << ",\"first_failure_status\":";
+            json_optional(b.first_original_failure_status);
+            std::cout << ",\"first_failure_wire_start\":";
+            json_optional(b.first_failure_wire_start);
+            std::cout << ",\"first_failure_anchor_sequence\":";
+            json_optional(b.first_failure_anchor_sequence);
+            std::cout << ",\"first_failure_capture_age_ns\":";
+            json_optional(b.first_failure_capture_age_ns);
+            std::cout << ",\"packets\":" << b.original_packets << ",\"repeated_anchors\":" << b.original_repeats
+                << ",\"measurements\":" << b.original_measurements << ",\"out_of_range\":" << b.original_out_of_range
+                << ",\"usable_measurements\":" << b.original_usable_measurements
+                << ",\"last_estimate_within_limit\":" << (!b.original_measurements ? "null" :
+                    b.last_original_estimate_within_limit ? "true" : "false")
+                << ",\"invalid\":" << b.original_invalid << ",\"retired_or_foreign\":" << b.original_retired
+                << ",\"frames\":" << b.original_frames << ",\"last_status\":" << b.last_original_status
+                << ",\"last_rate_ppm\":" << b.last_original_ppm;
+            if (b.last_original) std::cout << ",\"generation\":" << b.last_original->epoch.generation
+                << ",\"first_device_position\":" << b.first_original->device_position
+                << ",\"last_device_position\":" << b.last_original->device_position
+                << ",\"first_capture_ns\":" << b.first_original->capture_ns
+                << ",\"last_capture_ns\":" << b.last_original->capture_ns
+                << ",\"last_qpc_100ns\":" << b.last_original->qpc_100ns
+                << ",\"last_anchor_sequence\":" << b.last_original->anchor_sequence
+                << ",\"last_calibration_revision\":" << b.last_original->calibration_revision;
+            std::cout << '}';
+        }
+        // Historical observation only: the finite receiver can intentionally
+        // outlive its sender. Never sum acquisition windows across generations,
+        // count repeated anchors as new windows, or hide a later bad estimate.
+        const bool historical_qualified = active_branches == 1 && !original_invalid &&
+            active_usable_windows >= 3 && active_last_estimate_within_limit;
+        const bool bad_anchors = options_.expect_anchors && !historical_qualified;
+        std::cout << "],\"active_generation_measurements\":" << active_windows
+            << ",\"active_generation_usable_measurements\":" << active_usable_windows
+            << ",\"active_generation_last_estimate_within_limit\":" << (!active_windows ? "null" :
+                active_last_estimate_within_limit ? "true" : "false")
+            << ",\"historical_original_anchor_qualification\":" << (historical_qualified ? "true" : "false")
+            << ",\"qualification_semantics\":\"historical_active_generation_windows_not_present_lock\""
+            << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" : bad_anchors ? "original_anchors_unqualified" :
+            !buffers ? "waiting_media" : !timed ? "priming_reference" : invalid ? "invalid_timing" :
+            options_.expect_anchors ? "original_anchors_observed" : "timestamps_observed") << "\"}\n";
+        return error || fatal_ ? 1 : bad_anchors || (options_.expect_media && (!timed || invalid)) ? 3 : 0;
     }
 private:
+    static void new_jitterbuffer(GstElement*, GstElement* jitterbuffer,
+            guint session, guint, gpointer opaque) {
+        if (session != 0) return;
+        const auto* self = static_cast<Receiver*>(opaque);
+        // Waiting the full latency at startup can fill the media-span bound
+        // before its release timer fires, dropping frame zero on bursty input.
+        // Start after two consecutive packets; retain the 100ms loss/reorder
+        // budget and drop-on-latency cap. This is not presentation scheduling.
+        if (self->options_.expect_anchors)
+            g_object_set(jitterbuffer, "faststart-min-packets", 2u, nullptr);
+        g_object_set(jitterbuffer, "post-drop-messages", TRUE,
+            "drop-messages-interval", 0u, nullptr);
+    }
+    void observe_drop_message(GstMessage* message) noexcept {
+        const auto* fields = gst_message_get_structure(message);
+        if (!fields || !gst_structure_has_name(fields, "drop-msg")) return;
+        guint sequence{}, too_late{}, on_latency{};
+        if (!gst_structure_get_uint(fields, "seqnum", &sequence) || sequence > 65535 ||
+            !gst_structure_get_uint(fields, "num-too-late", &too_late) ||
+            !gst_structure_get_uint(fields, "num-drop-on-latency", &on_latency)) {
+            ++invalid_jitter_drop_messages_;
+            return;
+        }
+        ++jitter_drop_messages_;
+        jitter_num_too_late_ += too_late;
+        jitter_num_drop_on_latency_ += on_latency;
+        if (first_jitter_drop_seqnum_) return;
+        first_jitter_drop_seqnum_ = sequence;
+        const auto* reason = gst_structure_get_string(fields, "reason");
+        // Only publish stable numeric codes, never arbitrary bus text.
+        first_jitter_drop_reason_ = !reason ? 0u :
+            std::string_view(reason) == "too-late" ? 1u :
+            std::string_view(reason) == "drop-on-latency" ? 2u : 0u;
+    }
     GstElement* add(const char* factory, const char* name) {
         auto* element = gst_element_factory_make(factory, name);
         require(element != nullptr, "Required GStreamer element is unavailable");
@@ -216,6 +392,8 @@ private:
         auto* sink = gst_element_request_pad_simple(rtpbin_, requested);
         require(src && sink, "Cannot obtain RTP input pads");
         gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, filter_peer, this, nullptr);
+        if (options_.expect_anchors && std::string_view(requested) == "recv_rtp_sink_0")
+            gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, observe_rtp, this, nullptr);
         if (std::string_view(requested) == "recv_rtcp_sink_0")
             gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, observe_rtcp, this, nullptr);
         const auto linked = gst_pad_link(src, sink);
@@ -230,6 +408,25 @@ private:
         }
         fatal_.store(true);
         return nullptr;
+    }
+    static GstPadProbeReturn observe_rtp(GstPad*, GstPadProbeInfo* info, gpointer opaque) {
+        auto* self = static_cast<Receiver*>(opaque);
+        std::uint32_t ssrc{}, timestamp{}, frames{};
+        const auto record = avsync::net::read_audio_anchor(
+            GST_PAD_PROBE_INFO_BUFFER(info), ssrc, timestamp, frames);
+        if (!record) {
+            ++self->invalid_ingress_anchors_;
+            return GST_PAD_PROBE_OK; // Observability only; ordered validation still decides.
+        }
+        try {
+            if (auto* slot = self->report_slot(ssrc)) {
+                if (slot->ingress_rtp_packets.fetch_add(1) == 0)
+                    slot->ingress_first_wire_start.store(record->packet_wire_start);
+                slot->ingress_last_wire_start.store(record->packet_wire_start);
+                slot->ingress_rtp_frames.fetch_add(frames);
+            }
+        } catch (...) { self->fatal_.store(true); }
+        return GST_PAD_PROBE_OK;
     }
     static GstPadProbeReturn observe_rtcp(GstPad*, GstPadProbeInfo* info, gpointer opaque) {
         auto* self = static_cast<Receiver*>(opaque);
@@ -264,6 +461,8 @@ private:
             require(self->branches_.size() < 8, "Session limit reached");
             auto branch = std::make_unique<Branch>();
             auto* state = branch.get();
+            state->owner = self;
+            if (self->options_.expect_anchors) state->validator.emplace(self->clock_epoch_);
             const auto suffix = name.substr(std::string_view("recv_rtp_src_0_").size());
             const auto separator = suffix.find('_');
             guint32 ssrc{};
@@ -272,23 +471,25 @@ private:
             require(parsed.ec == std::errc{} && parsed.ptr == suffix.data()+separator, "Invalid session identifier");
             state->report = self->report_slot(ssrc);
             require(state->report != nullptr, "Report session limit reached");
-            auto* depay = self->add("rtpL24depay", nullptr);
+            auto* depay = self->options_.expect_anchors ? nullptr : self->add("rtpL24depay", nullptr);
             auto* sink = self->add("appsink", nullptr);
             g_object_set(sink, "sync", FALSE, "async", FALSE, "emit-signals", TRUE,
                          "max-buffers", 32u, "drop", TRUE, "enable-last-sample", FALSE, nullptr);
-            auto* raw_caps = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S24BE",
-                "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 2, "layout", G_TYPE_STRING, "interleaved", nullptr);
-            gst_app_sink_set_caps(GST_APP_SINK(sink), raw_caps);
-            gst_caps_unref(raw_caps);
+            if (depay) {
+                auto* raw_caps = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S24BE",
+                    "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 2, "layout", G_TYPE_STRING, "interleaved", nullptr);
+                gst_app_sink_set_caps(GST_APP_SINK(sink), raw_caps);
+                gst_caps_unref(raw_caps);
+            }
             // Retain callback state even if a later linking/state operation fails.
             self->branches_.push_back(std::move(branch));
             g_signal_connect(sink, "new-sample", G_CALLBACK(new_sample), state);
-            require(gst_element_link(depay, sink), "Cannot link audio depayloader");
-            auto* depay_sink = gst_element_get_static_pad(depay, "sink");
+            if (depay) require(gst_element_link(depay, sink), "Cannot link audio depayloader");
+            auto* depay_sink = gst_element_get_static_pad(depay ? depay : sink, "sink");
             const auto linked = gst_pad_link(pad, depay_sink);
             gst_object_unref(depay_sink);
             require(linked == GST_PAD_LINK_OK, "Cannot connect received session");
-            require(gst_element_sync_state_with_parent(sink) && gst_element_sync_state_with_parent(depay),
+            require(gst_element_sync_state_with_parent(sink) && (!depay || gst_element_sync_state_with_parent(depay)),
                     "Cannot activate received session");
         } catch (...) { self->fatal_.store(true); }
     }
@@ -297,8 +498,57 @@ private:
         auto* sample = gst_app_sink_pull_sample(sink);
         if (!sample) return GST_FLOW_EOS;
         auto* buffer = gst_sample_get_buffer(sample);
+        GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
         GstMapInfo map{};
-        if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) { gst_sample_unref(sample); return GST_FLOW_ERROR; }
+        if (b.validator) {
+            std::uint32_t ssrc{}, timestamp{}, payload_frames{};
+            const auto record = avsync::net::read_audio_anchor(buffer, ssrc, timestamp, payload_frames);
+            const auto now = gst_util_get_timestamp();
+            if (b.original_callbacks++ == 0 && record) {
+                b.first_callback_wire_start = record->packet_wire_start;
+                b.first_callback_anchor_sequence = record->anchor_sequence;
+            }
+            if (!record || now > static_cast<guint64>(std::numeric_limits<std::int64_t>::max())) {
+                const auto rejected = b.validator->reject_missing();
+                b.last_original_status = static_cast<unsigned>(rejected.status);
+                remember_original_failure(b, rejected.status, record, now);
+                ++b.original_invalid;
+                gst_sample_unref(sample); return GST_FLOW_OK;
+            }
+            const auto validation = b.validator->observe(*record, ssrc, timestamp, payload_frames,
+                static_cast<std::int64_t>(now));
+            b.last_original_status = static_cast<unsigned>(validation.status);
+            if (!validation.accepted) {
+                remember_original_failure(b, validation.status, record, now);
+                ++b.original_invalid; gst_sample_unref(sample); return GST_FLOW_OK;
+            }
+            bool admitted{};
+            try {
+                std::lock_guard lock(b.owner->admission_mutex_);
+                admitted = b.owner->admission_->admit(*record, ssrc);
+            } catch (...) {
+                b.owner->fatal_.store(true);
+                gst_sample_unref(sample); return GST_FLOW_ERROR;
+            }
+            if (!admitted) { ++b.original_retired; gst_sample_unref(sample); return GST_FLOW_OK; }
+            ++b.original_packets;
+            b.original_frames += payload_frames;
+            if (validation.repeated) ++b.original_repeats;
+            if (validation.estimate) {
+                ++b.original_measurements;
+                b.last_original_ppm = validation.estimate->source_rate_error_ppm;
+                b.last_original_estimate_within_limit = validation.estimate->within_correction_limit;
+                if (b.last_original_estimate_within_limit) ++b.original_usable_measurements;
+                else ++b.original_out_of_range;
+            }
+            if (!b.first_original) b.first_original = record;
+            b.last_original = record;
+            if (!gst_rtp_buffer_map(buffer, GST_MAP_READ, &rtp)) { gst_sample_unref(sample); return GST_FLOW_ERROR; }
+            map.data = static_cast<guint8*>(gst_rtp_buffer_get_payload(&rtp));
+            map.size = gst_rtp_buffer_get_payload_len(&rtp);
+        } else if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+            gst_sample_unref(sample); return GST_FLOW_ERROR;
+        }
         ++b.buffers;
         const auto frames = map.size / 6;
         b.frames += frames;
@@ -331,7 +581,9 @@ private:
             }
             b.previous = stamp; b.previous_frames = frames;
         } else ++b.invalid_reference;
-        gst_buffer_unmap(buffer,&map); gst_sample_unref(sample);
+        if (b.validator) gst_rtp_buffer_unmap(&rtp);
+        else gst_buffer_unmap(buffer,&map);
+        gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
     Options options_;
@@ -341,12 +593,20 @@ private:
     GstNetTimeProvider* provider_{};
     std::mutex branch_mutex_;
     std::mutex report_mutex_;
+    std::mutex admission_mutex_;
+    std::optional<avsync::wire::AudioStreamAdmission> admission_;
+    std::uint64_t clock_epoch_{};
     std::array<ReportSlot, 8> reports_;
     std::vector<std::unique_ptr<Branch>> branches_;
     std::atomic<bool> fatal_{false};
     std::atomic<std::uint64_t> accepted_{0}, rejected_{0};
     std::atomic<std::uint64_t> invalid_reports_{0};
+    std::atomic<std::uint64_t> invalid_ingress_anchors_{0};
     std::uint64_t warnings_{};
+    // Main bus-loop owner; constant storage for this finite diagnostic run.
+    std::uint64_t jitter_drop_messages_{}, jitter_num_too_late_{}, jitter_num_drop_on_latency_{};
+    std::uint64_t invalid_jitter_drop_messages_{};
+    std::optional<unsigned> first_jitter_drop_seqnum_, first_jitter_drop_reason_;
 };
 }
 int main(int argc,char** argv) {
@@ -356,6 +616,7 @@ int main(int argc,char** argv) {
         for (int i=1;i<argc;++i) {
             const std::string_view arg(argv[i]);
             if(arg=="--expect-media") { options.expect_media=true; continue; }
+            if(arg=="--expect-anchors") { options.expect_anchors=true; continue; }
             require(i+1<argc,"Missing option value");
             const auto* value=argv[++i];
             if(arg=="--bind") options.bind=value;

@@ -6,7 +6,7 @@ device, saves PCM, changes OBS, or feeds the IPC playout bridge. This is a
 transport/timestamp experiment, not an audible or physical A/V validation.
 
 ```text
-avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port CLOCK_PORT --rtp-port RTP_PORT --rtcp-port RTCP_PORT --seconds 30 --expect-media
+avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port CLOCK_PORT --rtp-port RTP_PORT --rtcp-port RTCP_PORT --seconds 30 --expect-media --expect-anchors
 ```
 
 Use a specific local unicast IPv4 address on an explicitly trusted private link,
@@ -23,15 +23,44 @@ PT96 is L24 stereo at 48 kHz. RTP jitter-buffer latency is 100 ms with late
 dropping; this is not the eventual multi-second synchronization buffer. RTCP
 sender reports follow the project's explicit **shared-monotonic, not UTC**
 convention. See [clock contract](network-clock.md) and [sender](windows-sender.md).
+
+Original-anchor mode sets each jitter buffer's `faststart-min-packets=2` while
+retaining the 100 ms latency and drop-on-latency limit. This prevents its normal
+startup wait from filling the queue and discarding frame zero on the tested
+bursty input. It does not remove the capacity limit or promise recovery when
+the consumer stalls. The receiver inspects media immediately; presentation
+buffering remains a separate future stage. See
+[GStreamer's startup and capacity properties](https://gstreamer.freedesktop.org/documentation/rtpmanager/rtpjitterbuffer.html).
 The current sender's references describe its **nominal sample-count media
 timeline**, not original device-clock anchors. The receiver explicitly reports
 `capture_timing_verified=false`. It must not use those references as a surrogate
 for original capture timestamps or as an adaptive-rate command.
 
-Each received SSRC gets a depayloader and a bounded appsink. At most eight
+With `--expect-anchors`, a separate versioned RTP extension carries original
+WASAPI device positions and mapped QPC times. Copy the fresh decimal `clock_epoch`
+from the receiver's READY line into the sender's required `--clock-epoch` option.
+Restarting the receiver requires a new token and a new sender invocation. This
+manual finite-run agreement does not implement authentication or unattended
+recovery. A provider pause within the same diagnostic retains its epoch.
+
+Each received SSRC gets a bounded appsink. In original-anchor mode, the app
+validates the extension and PCM inside the same owned, ordered RTP buffer,
+before any depayloader can lose their association. Without `--expect-anchors`,
+the previous nominal-reference-only depayloader path remains available. At most eight
 sessions/report slots are accepted per finite process; further sessions fail
 visibly. Stop the diagnostic before restarting a production component, rather
 than making this session budget an unattended service.
+
+Original-anchor validation requires contiguous wire-frame extents, the expected
+clock epoch, an immutable format/origin, unchanged repeated records, and strictly
+consecutive selected-anchor identities. Original capture age is limited to
+250 ms old / 100 ms future. Repetitions do not refresh age or create estimator
+windows. The active sender session may advance only to a higher generation with
+a fresh, never-used SSRC and a valid frame-zero anchor. Retired generations and
+foreign sessions cannot replace it. Faulted generations do not fall back to
+arrival time or nominal RTCP references. See the
+[experimental wire contract](audio-anchor-wire-draft.md) and
+[validation results and limits](audio-anchor-transport-validation.md).
 
 Packets without reference timestamp metadata remain counted as untimed priming.
 No arrival-time or ordinary buffer-PTS fallback is used. Valid references must
@@ -48,6 +77,13 @@ PCM is inspected in memory only and immediately released. Report freshness uses
 the local monotonic receive time, not the time claimed by the incoming report.
 Peak/RMS is not a listening or quality test, and silence is valid media.
 
+Original mode also reports bounded per-SSRC ingress counts and first/last wire
+positions, first ordered callback position, and the first validation failure
+with checked capture age. Jitterbuffer drop messages are counted separately by
+late/capacity reason. These identify a startup loss without erasing its first
+cause behind the validator's subsequent latched-error reports. They contain no
+PCM, hostnames or addresses, but raw timing diagnostics should still stay private.
+
 Exit 0 means help or completed diagnostics. Exit 1 means configuration/pipeline
 failure. With `--expect-media`, exit 3 means no timed media, stale/invalid
 references, missing reference metadata after lock, or nonmonotonic timestamps.
@@ -56,6 +92,16 @@ continuity gaps, startup untimed packets or silence: `timestamps_observed` is
 deliberately weaker than `continuity_passed` or `audio_quality_passed`. Keep full
 reports when comparing tests. Durations are 1..180 seconds; external driver/OS
 shutdown stalls are not a hard-real-time watchdog guarantee.
+
+`--expect-anchors` additionally returns exit 3 for invalid original records or
+failure to observe at least three in-range estimator windows within the final
+active generation, with its latest estimate still in range. Earlier generations
+and repeated anchors cannot satisfy this gate. Reports expose all out-of-range
+windows, rather than concealing them. Qualification is explicitly **historical**:
+the receiver normally outlives its finite sender, and it does not claim present
+lock, physical capture accuracy, or active correction. Neither mode submits
+audio to the resampler or OBS. Missing/lost media currently faults the generation;
+RTX and seamless re-priming are separate work.
 
 Runtime dependencies include rtpbin, udpsrc, rtpL24depay and appsink. Build with
 `AVSYNC_BUILD_NETWORK=ON`; see [building](building.md). Help/default CTest does

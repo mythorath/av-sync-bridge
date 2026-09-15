@@ -4,6 +4,7 @@
 #include "avsync/timing.hpp"
 #include <gst/gst.h>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace avsync::net {
@@ -13,6 +14,7 @@ struct Calibration {
     Nanoseconds external_reference = 0;
     std::uint64_t rate_numerator = 1;
     std::uint64_t rate_denominator = 1;
+    friend bool operator==(const Calibration&, const Calibration&) = default;
 };
 
 // Maps a historical local monotonic timestamp, not a current arrival timestamp.
@@ -26,6 +28,47 @@ struct Calibration {
 // The caller owns the clock; no sockets, providers, or clocks are created here.
 [[nodiscard]] std::optional<Calibration> client_calibration(GstClock* client) noexcept;
 [[nodiscard]] std::optional<Nanoseconds> map_qpc_100ns(GstClock* client, std::uint64_t qpc_100ns) noexcept;
+
+struct MappedCapture {
+    Nanoseconds local_ns = 0;
+    Nanoseconds capture_ns = 0;
+    Calibration calibration;
+    std::uint64_t revision = 0;
+    friend bool operator==(const MappedCapture&, const MappedCapture&) = default;
+};
+
+// Single-owner capture mapping with immutable, value-owned provenance. The
+// clock overload obtains client_calibration exactly once, then maps the
+// historical QPC value with that same snapshot. It does not query calibration
+// again for the diagnostic result, clamp to now, or remap earlier anchors.
+// This is consistent provenance for the applied coefficients, not a hardware
+// atomic capture/clock observation, an uncertainty bound, or a health gate.
+// Keep one mapper across sender conversion generations; no implicit reset.
+class CaptureClockMapper {
+public:
+    // The optional finite revision budget permits deterministic exhaustion
+    // tests. Default production budget is the full uint64_t range; zero is
+    // invalid. A budget is not an initial revision: first success is always 1.
+    explicit CaptureClockMapper(std::uint64_t maximum_revision =
+        std::numeric_limits<std::uint64_t>::max());
+    CaptureClockMapper(const CaptureClockMapper&) = delete;
+    CaptureClockMapper& operator=(const CaptureClockMapper&) = delete;
+    CaptureClockMapper(CaptureClockMapper&&) = delete;
+    CaptureClockMapper& operator=(CaptureClockMapper&&) = delete;
+
+    [[nodiscard]] std::optional<MappedCapture> map(
+        GstClock* client, std::uint64_t qpc_100ns) noexcept;
+    // Injected snapshot for deterministic tests and callers that already own
+    // the exact calibration. Any coefficient change advances the revision,
+    // including equivalent transforms expressed using different references.
+    [[nodiscard]] std::optional<MappedCapture> map(
+        const Calibration& calibration, std::uint64_t qpc_100ns) noexcept;
+
+private:
+    std::uint64_t maximum_revision_;
+    std::uint64_t revision_ = 0;
+    std::optional<Calibration> previous_;
+};
 
 struct DomainCheck {
     bool valid = false;

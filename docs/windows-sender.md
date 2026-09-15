@@ -6,10 +6,15 @@ This is a bounded capture/transport milestone, not a replacement for an existing
 
 ```text
 avsync-windows-sender --help
-avsync-windows-sender --loopback --host IPV4 --clock-port CLOCK_PORT --rtp-port RTP_PORT --rtcp-port RTCP_PORT --seconds 15
+avsync-windows-sender --loopback --host IPV4 --clock-port CLOCK_PORT --rtp-port RTP_PORT --rtcp-port RTCP_PORT --clock-epoch RECEIVER_EPOCH --seconds 15
 ```
 
 Replace the uppercase placeholders with the explicitly selected destination and three distinct ports. All run options are mandatory. `--seconds` is an overall observation deadline of 1–120 seconds, including clock acquisition and any pipeline rebuilds; retries do not extend it. Help, no arguments, and invalid arguments open no endpoint and send no network traffic. Only numeric unicast IPv4 destinations are accepted in this version.
+
+Start the diagnostic receiver first with `--expect-anchors` and copy its fresh
+decimal `clock_epoch` from the READY line into `--clock-epoch`. A receiver restart
+requires a new value. This explicit finite-run agreement is not authentication
+or an automatic startup/recovery handshake.
 
 A deliberate run **captures desktop PCM and sends it unencrypted to the chosen host**. It is suitable only for an explicitly trusted, isolated test network. This prototype has no authentication, encryption, retransmission, congestion control, microphone privacy integration, or automatic reconnection to a different endpoint. GStreamer/driver calls and shutdown are not forcibly interrupted if the operating system stalls, so the deadline is not a hard real-time process watchdog.
 
@@ -30,7 +35,7 @@ WASAPI PCM packet + separate original device-frame/QPC anchor
   -> continuous 48 kHz stereo float, with an explicit output-frame ledger
   -> bounded appsrc, nominal sample-count timestamps
   -> audioconvert, 48 kHz stereo S24BE
-  -> rtpL24pay -> rtpbin -> RTP and RTCP UDP outputs
+  -> rtpL24pay -> rtpbin -> checked original-anchor RTP extension -> UDP
 ```
 
 The project downmix preserves left/right balance, excludes the LFE channel, and uses one common gain with 10% headroom for bounded full-scale inputs. It is a project policy, not a claim of a standardized broadcast mix. Windows and GStreamer speaker-mask bits are **not interchangeable**; the sender derives GStreamer caps from explicit positions. See [audio conversion policy and fixtures](audio-conversion.md). The final 24-bit conversion disables dither/noise shaping for deterministic initial fixtures; downmix, sample-rate conversion, and quantization are not bit-perfect preservation of the original multichannel float stream. [audioconvert](https://gstreamer.freedesktop.org/documentation/audioconvert/index.html), [audioresample](https://gstreamer.freedesktop.org/documentation/audioresample/index.html), [L24 payloader format](https://gstreamer.freedesktop.org/documentation/rtp/rtpL24pay.html)
@@ -47,24 +52,30 @@ filter because the device clock drifts. Its retained filter tail is discarded on
 stop/reset, not flushed with invented live silence. There is no presentation delay.
 
 **These nominal RTP/RTCP timestamps are not original capture timestamps.** Original
-device-position/mapped-QPC anchors are checked separately in the sender and used
-only for diagnostic rate estimates. They are **not transmitted yet**. The receiver
-therefore cannot infer the device clock from nominal RTP progression or use it for
-adaptive correction. See [nominal conversion validation](nominal-audio-validation.md)
-and the [old conversion failure](conversion-timing.md). Physical content-time
-calibration remains required even after anchor transport is implemented.
+device-position/mapped-QPC anchors are checked separately and selected from actual
+capture packets at least 20 ms apart on the nominal device grid. A versioned
+96-byte RTP extension repeats each selected anchor unchanged alongside the
+packet's separate wire-frame position. The exact calibration snapshot used to
+map QPC is returned with a monotonic revision by `CaptureClockMapper`; a later
+snapshot is not substituted for accepted-anchor provenance. The paired receiver
+can now make diagnostic device-rate estimates, but **does not apply adaptive
+correction**. See the [experimental wire contract](audio-anchor-wire-draft.md),
+[transport validation](audio-anchor-transport-validation.md),
+[nominal conversion validation](nominal-audio-validation.md), and the
+[old conversion failure](conversion-timing.md). Physical content-time calibration
+remains required.
 
 A WASAPI loopback packet can be available before its endpoint timestamp. A bounded diagnostic comparison confirmed that such a lead can already exist between the original QPC timestamp and the raw local clock, rather than being introduced by network-clock conversion. This observation does not establish correct physical playback timing, speaker latency, or A/V alignment. The sender therefore accepts original timestamps at most 100 ms ahead of the shared clock or 100 ms old, including the exact boundaries. It applies the same pure policy before and after pipeline construction. It never subtracts a guessed device latency, adds an offset, or replaces the timestamp with the current time. Clock acquisition, calibration validity, and health gates remain mandatory.
 
 | Wire field | Contract |
 | --- | --- |
 | RTP payload | Dynamic payload type 96, `L24`, 48,000 Hz, stereo |
-| RTP packetization | MTU 1,200 bytes, maximum packet time 4 ms |
+| RTP packetization | Pre-extension MTU 1,096 bytes; 104-byte extension allowance; populated packet <=1,196 bytes, <=180 stereo frames; maximum packet time 4 ms |
 | RTCP time source | `ntp-time-source=clock-time` |
 | RTCP correspondence | `rtcp-sync-send-time=false`: nominal media time, not original capture time or transmission latency |
 | RTCP cadence | Internal session minimum interval 500 ms; not a guaranteed first-report deadline |
 | Time domain | Linux shared monotonic clock represented in RTCP's 32.32 field, **not UTC/NTP wall time** |
-| Epoch reset | Fresh SSRC and fresh conversion/RTP pipeline; no old PCM drained into it |
+| Epoch reset | Stable sender-process session, increasing generation, fresh SSRC and conversion/RTP pipeline; no old PCM drained into it |
 
 The paired receiver must understand this explicit shared-monotonic convention. It stays in **priming** until it obtains a validated sender-report/reference timestamp mapping; it must not substitute packet arrival time. This is not a generic wall-clock RTP interoperability claim. The sender does not yet receive RTCP feedback or implement RTX. [rtpbin properties](https://gstreamer.freedesktop.org/documentation/rtpmanager/rtpbin.html), [GStreamer 1.28.6 capture-time/clock-time correspondence](https://github.com/GStreamer/gstreamer/blob/1.28.6/subprojects/gst-plugins-good/gst/rtpmanager/gstrtpsession.c#L2326)
 
@@ -74,13 +85,23 @@ Each pipeline uses a neutral generated RTCP CNAME. It does not send GStreamer's 
 
 Appsrc has a 100 ms / format-derived byte bound, a 32-buffer count bound, nonblocking pushes, and upstream leaking as a final capacity guard. Reaching `enough-data` triggers a pipeline reset rather than silently accepting a growing backlog. A packet already executing downstream and the operating-system UDP buffers are outside that appsrc queue; their limits and actual behavior still require load/loss testing. Requested UDP send buffers are 16 KiB. [appsrc queue controls](https://gstreamer.freedesktop.org/documentation/app/appsrc.html)
 
+The original-anchor ledger holds at most 32 selected records. Packet decoration
+requires the selected original capture time to be at most 200 ms old / 100 ms
+future, and verifies packet PTS against the independent contiguous wire-frame
+ledger within 1 ns. This is a count cap plus capture-freshness check, not a
+separate FIFO residence timer. Missing/skipped anchors, malformed payloads,
+inconsistent positions, overflow or extension insertion failure latch a visible
+transport fault and stop the finite sender. Buffer-list decoration is bounded
+to 256 packets per callback and validates the complete list before counting it.
+
 A post-start WASAPI discontinuity, device-position gap, uncertain timestamp, unhealthy clock, invalid/nonmonotonic mapped time, capture age over 100 ms, capture time more than 100 ms ahead, or appsrc overflow causes dropping/resetting, not timestamp rebasing. After clock health is lost, reacquisition requires a fresh observation window; old observation counts do not qualify it. At most eight resets are allowed within the original deadline. The first packet of a fresh pipeline is explicitly discontinuous. Endpoint invalidation or pipeline failure exits with an error; it never guesses a new endpoint. Stop/reset drops queued PCM rather than waiting for old audio to play.
 
 These are fail-visible prototype policies, not proven seamless recovery. In
 particular, **fixed-rate conversion is not adaptive device-clock correction**.
 A sound device can drift against the shared clock even when network timing is
-accurate. A bounded ASRC backend is tested offline, but its live controller,
-original-anchor transport and combined real A/V path remain unimplemented.
+accurate. A bounded ASRC backend is tested offline; original-anchor transport is
+now a finite diagnostic. Its live controller and combined real A/V path remain
+unimplemented.
 
 ## Output, build, and validation gates
 

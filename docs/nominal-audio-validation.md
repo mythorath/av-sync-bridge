@@ -146,5 +146,8 @@ with PCM, adaptive correction, clock-uncertainty/load testing, microphone privac
 physical content-time calibration and combined real-video/audio OBS delivery
 remain separate gates. A non-silent diagnostic receiver is not an audible-quality
 or physical A/V test. The existing production setup is not migrated by this code.
-The [wire draft](audio-anchor-wire-draft.md) records the next-stage proposal and
-its missing clock-epoch/calibration-provenance prerequisites; it is not implemented.
+The results above describe the nominal-conversion milestone. The later
+[original-anchor transport milestone](audio-anchor-transport-validation.md) adds
+the experimental [wire contract](audio-anchor-wire-draft.md), explicit finite
+clock-epoch agreement and exact calibration provenance. It remains separate
+from adaptive correction and physical A/V validation.

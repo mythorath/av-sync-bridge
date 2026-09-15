@@ -114,7 +114,9 @@ This does not open an audio endpoint or listener, play audio, or prove physical 
 See [conversion observability](conversion-timing.md).
 
 Ubuntu development packages are `libgstreamer1.0-dev` and
-`libgstreamer-plugins-base1.0-dev`. Review package-manager changes before installing
+`libgstreamer-plugins-base1.0-dev`; the generated RTP tests also require the
+`gstreamer1.0-plugins-good` runtime package for RTP payload/session elements.
+Review package-manager changes before installing
 on a live machine. Then:
 
 ```sh
