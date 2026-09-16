@@ -53,7 +53,7 @@ isolated real-capture development, not production deployment.
   waveform/resource behavior before activating that worker on live PCM.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
-gates. No microphone, adaptive drift control, RTX, combined real A/V OBS handoff,
+gates. No live microphone/correction path, RTX, combined real A/V OBS handoff,
 or production startup migration is included yet. See [network validation](network-validation.md)
 and [physical video validation](video-validation.md) for actual scope and faults.
 The [ASRC design](asrc-design.md) first requires original device-clock anchors to
