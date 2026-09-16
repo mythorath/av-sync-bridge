@@ -226,6 +226,12 @@ if(AVSYNC_BUILD_IPC)
   endif()
   add_executable(avsync-synthetic apps/synthetic_daemon.cpp)
   target_link_libraries(avsync-synthetic PRIVATE avsync_ipc)
+  if(BUILD_TESTING)
+    add_test(NAME avsync-synthetic-restart-arguments
+      COMMAND ${CMAKE_COMMAND} -DEXECUTABLE=$<TARGET_FILE:avsync-synthetic>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_restart_fixture_arguments.cmake)
+    set_tests_properties(avsync-synthetic-restart-arguments PROPERTIES TIMEOUT 40)
+  endif()
   add_executable(avsync-probe apps/probe.cpp)
   target_link_libraries(avsync-probe PRIVATE avsync_ipc)
 endif()

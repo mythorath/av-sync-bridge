@@ -16,6 +16,9 @@ proven. Record evidence separately in validation reports.
 - [x] Synthetic staggered start, video hide/show, producer replacement, 400 ms
   producer pause and rapid mute fixtures (not the full production restart/privacy matrix).
 - [x] Six-cycle, 119-second synthetic check with all 36 markers per audio track.
+- [x] Continuous isolated recording across graceful and hard-crash producer
+  replacement, with distinct queued-old/new audio and picture identities and
+  full-trace absolute timing checks. See [restart recording validation](restart-recording-validation.md).
 
 See [handoff validation](handoff-validation.md) and the preserved
 [initial failures](validation-2026-09-15.md). The synthetic foundation is ready for

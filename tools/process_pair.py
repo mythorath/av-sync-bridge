@@ -23,11 +23,17 @@ from typing import Any
 
 PREFIX = b"AVSYNC_CONTROL "
 MAX_LINE = 4096
+MAX_NATIVE_SUMMARY = 65536
+MAX_CHILD_OUTPUT = 1024 * 1024
 MAX_CONTROL = 1024
 MAX_PENDING = 64
 UINT64_MAX = (1 << 64) - 1
 KEEPALIVE = b"AVSYNC_KEEPALIVE\n"
 STOP = b"AVSYNC_STOP\n"
+OUTPUT_FAILURES = {
+    "output_total_exceeded", "output_line_too_long", "truncated_stdout_line",
+    "stdout_read_failed", "stderr_read_failed", "output_not_drained", "control_output_overflow",
+}
 
 
 class PairError(Exception):
@@ -72,6 +78,115 @@ def parse_control(line: bytes) -> dict[str, Any]:
     return message
 
 
+NATIVE_STATUSES = {
+    "control_stopped", "control_eof", "control_expired", "control_invalid", "control_read_error",
+    "error", "waiting_clock", "waiting_no_rtp", "invalid_nominal_timing",
+    "rtp_output_observed_unverified", "original_anchors_observed", "recovered_with_gap",
+    "awaiting_media_generation", "correction_unqualified", "original_anchors_unqualified",
+    "waiting_media", "priming_reference", "invalid_timing", "timestamps_observed",
+}
+SENDER_COUNTS = (
+    "captured_packets", "captured_frames", "mapped_packets", "anchored_rtp_packets",
+    "rtp_packets_at_output", "sender_reports", "timestamp_errors", "queue_overflows",
+    "rtp_frame_steps", "rtp_nominal_pts_steps", "rtp_invalid_payload", "anchor_transport_errors",
+    "clock_loss_count", "resets", "reject_unhealthy", "dropped_packets",
+)
+RECEIVER_COUNTS = (
+    "packets_accepted", "packets_rejected", "invalid_ingress_anchor_packets",
+    "foreign_identity_rtp_packets", "unadmitted_rtcp_packets", "invalid_sender_reports",
+    "active_generation_usable_measurements", "ipc_published_frames", "ipc_busy_retries",
+    "ipc_retry_queue_peak_blocks", "ipc_recreations", "jitter_num_too_late", "jitter_num_drop_on_latency",
+)
+IPC_FAILURE_CODES = {
+    "none", "retry_deadline", "ipc_write_rejected", "invalid_time",
+    "ipc_heartbeat_rejected", "invalid_block_timestamp_or_capacity",
+}
+MAX_CORRECTION_SESSIONS = 8
+
+
+def _reject_constant(_: str):
+    raise ValueError("nonfinite_number")
+
+
+def parse_native_summary(line: bytes, role: str) -> dict[str, Any]:
+    """Retain only compact allowlisted diagnostics, never arbitrary native text."""
+    if len(line) > MAX_NATIVE_SUMMARY:
+        raise PairError("native_summary_too_large")
+    try:
+        raw = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_object,
+                         parse_constant=_reject_constant)
+        pending, inspected = [raw], 0
+        while pending:
+            value = pending.pop()
+            inspected += 1
+            if inspected > 32768 or (type(value) is float and not math.isfinite(value)):
+                raise ValueError("invalid_number_or_structure")
+            if isinstance(value, dict):
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+    except (UnicodeError, ValueError, RecursionError):
+        raise PairError("invalid_native_json") from None
+    if (not isinstance(raw, dict) or type(raw.get("schema")) is not int or raw["schema"] != 1
+            or not isinstance(raw.get("status"), str) or raw["status"] not in NATIVE_STATUSES):
+        raise PairError("invalid_native_schema")
+    metrics: dict[str, int | bool] = {}
+    counts = SENDER_COUNTS if role == "sender" else RECEIVER_COUNTS
+    booleans = (("clock_usable", "original_anchors_transmitted") if role == "sender" else
+                ("historical_original_anchor_qualification", "correction_diagnostic_pass", "sender_session_pinned"))
+    for name in counts:
+        if name in raw:
+            if type(raw[name]) is not int or not 0 <= raw[name] <= UINT64_MAX:
+                raise PairError("invalid_native_metric")
+            metrics[name] = raw[name]
+    for name in booleans:
+        if name in raw:
+            if type(raw[name]) is not bool:
+                raise PairError("invalid_native_metric")
+            metrics[name] = raw[name]
+    details: dict[str, Any] = {}
+    good_status = raw["status"] in ("control_stopped", "rtp_output_observed_unverified", "original_anchors_observed")
+    if role == "sender":
+        qualified = (good_status and metrics.get("clock_usable") is True
+                     and metrics.get("original_anchors_transmitted") is True
+                     and all(metrics.get(name, 0) > 0 for name in
+                             ("captured_packets", "mapped_packets", "anchored_rtp_packets", "rtp_packets_at_output", "sender_reports"))
+                     and all(metrics.get(name) == 0 for name in
+                             ("timestamp_errors", "queue_overflows", "rtp_frame_steps", "rtp_nominal_pts_steps",
+                              "rtp_invalid_payload", "anchor_transport_errors", "clock_loss_count")))
+    else:
+        sessions = raw.get("correction_sessions")
+        safe_sessions: list[dict[str, int | None]] = []
+        if isinstance(sessions, list):
+            for item in sessions[:MAX_CORRECTION_SESSIONS]:
+                safe_item = {}
+                for name in ("state", "fault", "delivered_frames"):
+                    value = item.get(name) if isinstance(item, dict) else None
+                    safe_item[name] = value if type(value) is int and 0 <= value <= UINT64_MAX else None
+                safe_sessions.append(safe_item)
+        failure = raw.get("ipc_failure")
+        details = {
+            "ipc_failure": failure if isinstance(failure, str) and failure in IPC_FAILURE_CODES else "unknown",
+            "correction_sessions": safe_sessions,
+            "correction_session_count": len(sessions) if isinstance(sessions, list) else None,
+            "correction_sessions_truncated": isinstance(sessions, list) and len(sessions) > MAX_CORRECTION_SESSIONS,
+        }
+        qualified = (good_status and metrics.get("historical_original_anchor_qualification") is True
+                     and metrics.get("correction_diagnostic_pass") is True
+                     and metrics.get("sender_session_pinned") is True
+                     and metrics.get("ipc_published_frames", 0) >= 48000
+                     and metrics.get("active_generation_usable_measurements", 0) >= 3
+                     and details["ipc_failure"] == "none"
+                     and all(metrics.get(name) == 0 for name in
+                             ("invalid_ingress_anchor_packets", "invalid_sender_reports",
+                              "jitter_num_too_late", "jitter_num_drop_on_latency"))
+                     and isinstance(sessions, list) and 1 <= len(sessions) <= MAX_CORRECTION_SESSIONS
+                     and all(item["state"] == 1 and item["fault"] == 0
+                             and item["delivered_frames"] is not None
+                             and item["delivered_frames"] >= 48000 for item in safe_sessions))
+    return {"status": raw["status"], "metrics": metrics, "reported_media_qualified": bool(qualified), **details}
+
+
 @dataclass(frozen=True)
 class Config:
     receiver_argv: tuple[str, ...]
@@ -81,11 +196,13 @@ class Config:
     ready_timeout: float = 10.0
     ack_timeout: float = 10.0
     stop_grace: float = 1.0
+    require_native_summaries: bool = False
+    receiver_scope: str = "direct"
 
     @classmethod
     def from_dict(cls, value: Any) -> "Config":
         allowed = {"receiver_argv", "sender_argv", "total_seconds", "max_attempts",
-                   "ready_timeout", "ack_timeout", "stop_grace"}
+                   "ready_timeout", "ack_timeout", "stop_grace", "require_native_summaries", "receiver_scope"}
         if not isinstance(value, dict) or set(value) - allowed:
             raise PairError("invalid_config_keys")
         for role in ("receiver", "sender"):
@@ -122,6 +239,14 @@ class Config:
         attempts = value.get("max_attempts", 3)
         if type(attempts) is not int or not 1 <= attempts <= 3:
             raise PairError("invalid_attempt_bound")
+        if type(value.get("require_native_summaries", False)) is not bool:
+            raise PairError("invalid_summary_requirement")
+        scope = value.get("receiver_scope", "direct")
+        if scope not in ("direct", "remote"):
+            raise PairError("invalid_receiver_scope")
+        program = value["receiver_argv"][0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if program in ("ssh", "ssh.exe") and scope != "remote":
+            raise PairError("ssh_requires_remote_scope")
         result = cls(**{**value, "receiver_argv": tuple(value["receiver_argv"]),
                         "sender_argv": tuple(value["sender_argv"])})
         # Reserve cooperative cleanup + kill/reap time INSIDE the finite budget.
@@ -199,6 +324,14 @@ class Child:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue(MAX_PENDING)
         self.writes: queue.Queue[bytes | None] = queue.Queue(2)
         self.failure: str | None = None
+        self.native_summary: dict[str, Any] | None = None
+        self.native_summary_error: str | None = None
+        self.native_summary_count = 0
+        self.discarded_stdout_lines = 0
+        self.stdout_done = threading.Event()
+        self.stderr_done = threading.Event()
+        self.output_lock = threading.Lock()
+        self.output_bytes = 0
         self.last_keepalive = -math.inf
         self.threads: list[threading.Thread] = []
         options: dict[str, Any] = {}
@@ -229,18 +362,46 @@ class Child:
         except queue.Full:
             self._fail("control_output_overflow")
 
+    def _count_output(self, size: int) -> bool:
+        with self.output_lock:
+            self.output_bytes += size
+            if self.output_bytes > MAX_CHILD_OUTPUT:
+                self._fail("output_total_exceeded")
+                return False
+        return True
+
+    @staticmethod
+    def _line_limit(line: bytes | bytearray) -> int:
+        if line.startswith(b"AVSYNC_CONTROL"):
+            return MAX_CONTROL
+        return MAX_NATIVE_SUMMARY if line.lstrip().startswith(b"{") else MAX_LINE
+
+    def _capture_summary(self, line: bytes) -> None:
+        self.native_summary_count += 1
+        if self.native_summary_count != 1:
+            self.native_summary_error = "duplicate_native_summary"
+            return
+        try:
+            self.native_summary = parse_native_summary(line, self.role)
+        except PairError as error:
+            self.native_summary_error = str(error)
+
     def _read_stdout(self) -> None:
         pending = bytearray()
         try:
             while True:
                 chunk = self.process.stdout.read(4096)
                 if not chunk:
+                    if pending:
+                        self._fail("truncated_stdout_line")
                     self._emit("error", "stdout_eof")
+                    return
+                if not self._count_output(len(chunk)):
                     return
                 pending.extend(chunk)
                 while b"\n" in pending:
                     end = pending.index(b"\n")
-                    if end > MAX_LINE:
+                    if end > self._line_limit(pending[:end]):
                         self._fail("output_line_too_long")
                         return
                     line = bytes(pending[:end])
@@ -249,18 +410,27 @@ class Child:
                     line = line.removesuffix(b"\r")
                     if line.startswith(b"AVSYNC_CONTROL"):
                         self._emit("control", line)
-                if len(pending) > MAX_LINE:
+                    elif line.lstrip().startswith(b"{"):
+                        self._capture_summary(line)
+                    else:
+                        self.discarded_stdout_lines += 1
+                if len(pending) > self._line_limit(pending):
                     self._fail("output_line_too_long")
                     return
         except (OSError, ValueError):
             self._fail("stdout_read_failed")
+        finally:
+            self.stdout_done.set()
 
     def _drain_stderr(self) -> None:
         try:
-            while self.process.stderr.read(4096):
-                pass  # Deliberately no unbounded logs or trusted handshakes here.
+            while chunk := self.process.stderr.read(4096):
+                if not self._count_output(len(chunk)):
+                    return
         except (OSError, ValueError):
             self._fail("stderr_read_failed")
+        finally:
+            self.stderr_done.set()
 
     def _write_stdin(self) -> None:
         try:
@@ -295,6 +465,8 @@ class Child:
             pass
         for thread in self.threads:
             thread.join(timeout=.05)
+        if not self.stdout_done.is_set() or not self.stderr_done.is_set():
+            self._fail("output_not_drained")
         for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
             try:
                 pipe.close()
@@ -321,6 +493,11 @@ class Result:
     cleanup_failures: int = 0
     stop_failures: int = 0
     elapsed_seconds: float = 0.0
+    native_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    native_summary_requirement_met: bool | None = None
+    reported_media_qualified: bool = False
+    media_verified: bool = False
+    remote_retirement_unverified: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -351,8 +528,12 @@ class Supervisor:
         answer = None
         for child in self.children:
             if child.failure:
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
                 raise PairError(child.role + "_" + child.failure)
             if child.process.poll() is not None:
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
                 raise PairError(child.role + "_exited")
             child.keepalive(time.monotonic())
             # A bounded queue and bounded scan ensure the other child, lease,
@@ -363,6 +544,8 @@ class Supervisor:
                 except queue.Empty:
                     break
                 if kind == "error":
+                    if child.role == "receiver" and self.config.receiver_scope == "remote":
+                        self.result.remote_retirement_unverified = True
                     raise PairError(child.role + "_" + value)
                 message = parse_control(value)
                 if child is not expected or message["event"] != event or answer is not None:
@@ -397,14 +580,19 @@ class Supervisor:
             if child.process.poll() is None:
                 child.send(STOP)
                 asked_to_stop.append(child)
-            elif self.result.status in ("control_completed", "control_completed_with_recovery"):
-                self.result.stop_failures += 1
-                self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_exited_before_stop"))
+            else:
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
+                if self.result.status in ("control_completed", "control_completed_with_recovery"):
+                    self.result.stop_failures += 1
+                    self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_exited_before_stop"))
         grace_end = min(budget_end - .3, time.monotonic() + self.config.stop_grace)
         while time.monotonic() < grace_end and any(c.process.poll() is None for c in children):
             time.sleep(.01)
         for child in children:
             if child.process.poll() is None:
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
                 try:
                     child.process.kill()  # Exact Popen-owned local child only.
                     self.result.forced_local_kills += 1
@@ -415,10 +603,48 @@ class Supervisor:
                 child.process.wait(timeout=max(.01, min(.3, budget_end - time.monotonic())))
             except subprocess.TimeoutExpired:
                 self.result.cleanup_failures += 1
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
             if child in asked_to_stop and child.process.returncode not in (None, 0):
                 self.result.stop_failures += 1
                 self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_nonzero_stop_exit"))
+                if child.role == "receiver" and self.config.receiver_scope == "remote":
+                    self.result.remote_retirement_unverified = True
             child.close_pipes()
+            # Final stdout is produced during STOP, after the last running poll.
+            # EOF is expected here; other reader faults must not disappear.
+            if child.failure in OUTPUT_FAILURES:
+                reason = child.role + "_" + child.failure
+                if not any(f.attempt == self.result.attempts and f.reason == reason for f in self.result.faults):
+                    self.result.stop_failures += 1
+                    self.result.faults.append(Fault(self.result.attempts, "cleanup", reason))
+            for _ in range(MAX_PENDING):
+                try:
+                    kind, _ = child.events.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "control":
+                    self.result.stop_failures += 1
+                    self.result.faults.append(Fault(self.result.attempts, "cleanup", "unexpected_final_control_event"))
+                    break
+            summary = child.native_summary
+            valid = summary is not None and child.native_summary_count == 1 and child.native_summary_error is None
+            reason = child.native_summary_error or ("native_summary_missing" if summary is None else
+                      "reported_qualified" if summary["reported_media_qualified"] else "reported_unqualified")
+            if child.failure:
+                valid, reason = False, "native_output_error"
+            self.result.native_diagnostics.append({
+                "attempt": self.result.attempts, "role": child.role,
+                "summary_count": child.native_summary_count, "valid": valid, "reason": reason,
+                "status": summary["status"] if summary else None,
+                "metrics": summary["metrics"] if summary else {},
+                **({name: summary[name] for name in
+                    ("ipc_failure", "correction_sessions", "correction_session_count", "correction_sessions_truncated")}
+                   if summary and child.role == "receiver" else {}),
+                "reported_media_qualified": valid and bool(summary["reported_media_qualified"]),
+                "discarded_stdout_lines": child.discarded_stdout_lines,
+                "output_bytes": child.output_bytes,
+            })
 
     def run(self) -> Result:
         started = time.monotonic()
@@ -462,11 +688,14 @@ class Supervisor:
                     # A killed SSH child is not proof that a remote receiver has
                     # retired. Never launch another pair after ambiguous cleanup.
                     if (self.result.cleanup_failures or self.result.forced_local_kills or
-                        self.result.stop_failures):
+                        self.result.stop_failures or self.result.remote_retirement_unverified):
                         break
                 if (self.result.forced_local_kills or self.result.cleanup_failures or
                     self.result.stop_failures):
                     self.result.faults.append(Fault(self.result.attempts, "cleanup", "unclean_child_stop"))
+                    self.result.status = "failed"
+                if self.result.remote_retirement_unverified:
+                    self.result.faults.append(Fault(self.result.attempts, "cleanup", "remote_retirement_unverified"))
                     self.result.status = "failed"
         except PairError as error:
             self.result.faults.append(Fault(self.result.attempts, phase, str(error)))
@@ -476,6 +705,14 @@ class Supervisor:
         finally:
             self._stop_pair(final_deadline)
             self.result.elapsed_seconds = round(time.monotonic() - started, 3)
+            diagnostics = self.result.native_diagnostics
+            complete = (len(diagnostics) == 2 * self.result.attempts and self.result.attempts > 0
+                        and all(item["valid"] for item in diagnostics))
+            if self.config.require_native_summaries:
+                self.result.native_summary_requirement_met = complete
+            self.result.reported_media_qualified = (complete
+                and self.result.status in ("control_completed", "control_completed_with_recovery")
+                and all(item["reported_media_qualified"] for item in diagnostics))
         return self.result
 
 

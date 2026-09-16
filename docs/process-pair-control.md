@@ -31,9 +31,10 @@ acknowledgments, and duplicate handshakes fail closed.
 
 These two messages establish **only process agreement**. They do not establish
 qualified clocks, captured PCM, valid correction, fresh IPC, OBS reconnection,
-physical A/V timing, gapless audio, or production readiness. Other diagnostic
-lines are drained, not interpreted as successful audio. Handshakes on stderr
-are not accepted. Result JSON always labels evidence `process_agreement_only`.
+physical A/V timing, gapless audio, or production readiness. Native final JSON
+summaries are collected separately as reported counters, never as independent
+audio verification. Handshakes on stderr are not accepted. Result JSON always
+labels evidence `process_agreement_only` and `media_verified=false`.
 
 The coordinator writes exact ASCII `AVSYNC_KEEPALIVE\n` about once per second
 to both child stdin pipes. Native `--control-stdin` uses a five-second lease;
@@ -69,7 +70,9 @@ network/output arguments appropriate to an explicitly authorized test):
   "max_attempts": 3,
   "ready_timeout": 10,
   "ack_timeout": 10,
-  "stop_grace": 1
+  "stop_grace": 1,
+  "receiver_scope": "remote",
+  "require_native_summaries": true
 }
 ```
 
@@ -81,6 +84,12 @@ in a private directory on a **local filesystem**:
 ```text
 python tools/process_pair.py --config PRIVATE_CONFIG.json --lock-file ABSOLUTE_PRIVATE_LOCK_PATH
 ```
+
+`receiver_scope` is `direct` (the default for local fixtures) or `remote`.
+A known `ssh`/`ssh.exe` executable requires explicit `remote` scope. A trusted
+wrapper that starts SSH must also be declared remote: inspecting its filename
+cannot prove what it launches. This setting is a declared containment boundary,
+not discovery or a sandbox. Never label an SSH wrapper direct to enable retries.
 
 The process holds an OS lock for the run. A second coordinator using that path
 cannot start children. The file is never unlinked, replaced, truncated, or
@@ -119,6 +128,12 @@ ends this run without another attempt: a dead SSH client is not proof that the
 remote writer stopped. Validate the wrapper before a live trial. No
 process-name kill, task-name kill, or remote blanket cleanup is implemented.
 
+In remote scope, **any unexpected receiver transport exit or stdout loss** also
+latches `remote_retirement_unverified` and forbids another attempt, even if the
+SSH process was already dead before cleanup. The owned sender is stopped safely.
+No independent remote-identity/exit-proof mechanism exists yet; a local SSH exit,
+released port, expired heartbeat, or next IPC writer rejection is not that proof.
+
 ## Bounds, cleanup, and results
 
 - The overall deadline policy is 1–180 seconds, at most three pair attempts. Cleanup time
@@ -140,10 +155,12 @@ process-name kill, task-name kill, or remote blanket cleanup is implemented.
   This conservative boundary applies even when the local child does eventually
   finish. The known-dead-child restart fixtures synchronize on the exact process
   handle; they do **not** establish automatic recovery from every real crash.
-- Stdout lines are bounded to 4096 bytes, control messages to 1024 bytes, pending
-  control events to 64, and queued stdin messages to two. Large ordinary output
-  is drained without accumulating a diagnostic log; stderr is discarded in
-  fixed-size chunks. Overflow fails closed.
+- Ordinary stdout lines are bounded to 4096 bytes, native JSON summary lines to
+  65536 bytes, control messages to 1024 bytes, and combined stdout/stderr output
+  to 1 MiB per child. Pending control events are bounded to 64 and queued stdin
+  messages to two. Ordinary text is counted/discarded; stderr is discarded in
+  fixed-size chunks. Final reader errors and unexpected control messages during
+  cleanup are retained, not silently lost after the running poll ends.
 - Fault history survives restart. Exit 0 means only the finite process-control
   interval completed without observed control faults. Exit 3 means it completed
   after a recorded recovery. Exit 1 means failed control/cleanup; exit 2 means
@@ -156,6 +173,39 @@ It does not replace a live receiver owned by another controller. Native IPC
 retirement and OBS stale-read behavior need their own tests; process agreement
 must not be used to mask missing data-plane validation.
 
+## Separate native diagnostics
+
+`require_native_summaries` is a strict boolean, default `false` so existing
+control-only fake children remain valid. Each attempt retains at most one
+sanitized native JSON summary per role. A summary must have schema 1 and a known
+status; duplicate summaries/keys, malformed JSON, nonfinite numbers, invalid
+counter types/ranges, oversized lines, or missing required summaries cannot
+produce a positive diagnostic result. Python integers preserve 64-bit counter
+values without a float conversion.
+
+`native_diagnostics` contains role, attempt, fixed reason/status codes, and a
+small numeric/boolean field allowlist. Unknown strings, paths, peer addresses,
+clock/session identifiers and raw errors are never copied into result JSON.
+Receiver entries retain at most eight `correction_sessions`, containing only
+numeric `state`, `fault`, and `delivered_frames` values (invalid/missing values
+become null), plus `correction_session_count` and
+`correction_sessions_truncated`. They retain `ipc_failure` only from the fixed
+native failure-code allowlist; any other value becomes `unknown`. The exact
+native success code is `none`; empty, missing, and unknown codes are not success.
+`native_summary_requirement_met` is null when optional; when required it checks
+that both roles in every attempt supplied valid summaries. Error or unqualified
+native statuses remain separately visible even when their summary is valid.
+
+`reported_media_qualified` requires native reports of actual packet/anchor and
+corrected-IPC progress, qualified clock/correction counters, and no selected
+timing/queue/fault indicators; a successful STOP alone is insufficient. Per-role
+results retain counter-only qualification, while the aggregate also requires a
+completed control run. These are **native self-reports**, not observed playback,
+OBS receipt, clock accuracy or physical A/V evidence. `media_verified` remains
+false. Missing/invalid/unqualified summaries do not rewrite the independent
+control exit code; callers that request diagnostics must inspect those fields.
+Hard-killed children generally have no final summary: absence stays explicit.
+
 ## Current verification and open work
 
 `python -m unittest discover -s tests -p test_process_pair.py` uses only local
@@ -166,6 +216,10 @@ spoofing, output floods, cooperative stop, forced owned-child cleanup, and EOF.
 Retry-count tests inject crashes only after both handshakes and wait for the
 specific child's exit before coordinator polling; a separate EOF-before-exit
 fixture verifies the conservative no-retry outcome described above.
+It also checks bounded native summaries larger than 4 KiB, exact uint64 counters,
+privacy filtering, missing/duplicate/nonfinite/unqualified reports, final-output
+faults during cleanup, explicit SSH scope, and no retry after remote-wrapper
+exit or stdout loss. These diagnostic cases use generated summaries only.
 These fake-process tests do not contact SSH, a physical device, OBS, or a normal
 audio path.
 

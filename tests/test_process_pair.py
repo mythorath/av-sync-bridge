@@ -24,6 +24,24 @@ sys.modules[SPEC.name] = pair
 SPEC.loader.exec_module(pair)
 
 
+def native_summary(role: str) -> dict:
+    result = {"schema": 1, "status": "control_stopped", "private_note": "DO_NOT_PUBLISH_PRIVATE_TEXT",
+              "clock_epoch": "18446744073709551615", "sender_session": "PRIVATE_TOKEN"}
+    if role == "sender":
+        result.update({name: 0 for name in pair.SENDER_COUNTS})
+        result.update(captured_packets=1000, captured_frames=(1 << 63) + 17, mapped_packets=900,
+                      anchored_rtp_packets=800, rtp_packets_at_output=800, sender_reports=4,
+                      clock_usable=True, original_anchors_transmitted=True)
+    else:
+        result.update({name: 0 for name in pair.RECEIVER_COUNTS})
+        result.update(packets_accepted=804, ipc_published_frames=96000,
+                      active_generation_usable_measurements=3,
+                      historical_original_anchor_qualification=True, correction_diagnostic_pass=True,
+                      sender_session_pinned=True, ipc_failure="none",
+                      correction_sessions=[{"state": 1, "fault": 0, "delivered_frames": 96000}])
+    return result
+
+
 def fake_child() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fake-child", choices=("receiver", "sender"), required=True)
@@ -76,8 +94,11 @@ def fake_child() -> int:
     if mode == "stderr_ack" and role == "sender":
         sys.stderr.buffer.write(line)
         sys.stderr.buffer.flush()
-    if mode in ("stdout_eof", "eof_bad_stop") and role == "sender":
+    if ((mode in ("stdout_eof", "eof_bad_stop") and role == "sender")
+            or (mode == "remote_stdout_eof" and role == "receiver")):
         os.close(sys.stdout.fileno())
+    if mode == "remote_exit" and role == "receiver":
+        return 0
 
     commands: queue.Queue[bytes] = queue.Queue()
 
@@ -102,6 +123,32 @@ def fake_child() -> int:
             if mode == "ignore_stop":
                 continue
             record("stop")
+            if mode.startswith("native_"):
+                summary = native_summary(role)
+                if mode == "native_large":
+                    summary["private_note"] *= 400
+                elif mode == "native_oversize":
+                    summary["private_note"] = "x" * (pair.MAX_NATIVE_SUMMARY + 1)
+                elif mode == "native_nan":
+                    summary["private_note"] = float("nan")
+                elif mode == "native_bad_schema":
+                    summary["schema"] = 2
+                elif mode == "native_unqualified":
+                    summary["clock_usable" if role == "sender" else "correction_diagnostic_pass"] = False
+                elif mode == "native_error":
+                    summary["status"] = "error"
+                encoded = json.dumps(summary).encode("ascii")
+                if mode == "native_truncated":
+                    sys.stdout.buffer.write(encoded)
+                else:
+                    sys.stdout.buffer.write(encoded + b"\n")
+                if mode == "native_duplicate":
+                    sys.stdout.buffer.write(encoded + b"\n")
+                if mode == "native_final_control":
+                    sys.stdout.buffer.write(b"AVSYNC_CONTROL {invalid}\n")
+                if mode == "native_total_overflow":
+                    sys.stdout.buffer.write(b"ordinary log\n" * (pair.MAX_CHILD_OUTPUT // 12 + 2))
+                sys.stdout.buffer.flush()
             return 7 if mode in ("bad_stop", "eof_bad_stop") else 0
         elif not command:
             record("eof")
@@ -172,6 +219,8 @@ class ProtocolTests(unittest.TestCase):
         variants += [{**base, "total_seconds": x} for x in (0, 181, float("nan"), float("inf"), True)]
         variants += [{**base, "stop_grace": 0}, {**base, "extra": 1},
                      {**base, "receiver_argv": "arbitrary shell"}]
+        variants += [{**base, "require_native_summaries": value} for value in (1, None, "true")]
+        variants += [{**base, "receiver_scope": value} for value in ("unknown", None, True)]
         for flag in ("--loopback", "--control-stdin", "--sender-session", "--clock-epoch"):
             argv = list(base["sender_argv"])
             argv.remove(flag)
@@ -182,6 +231,91 @@ class ProtocolTests(unittest.TestCase):
         for value in variants:
             with self.subTest(value=value), self.assertRaises(pair.PairError):
                 pair.Config.from_dict(value)
+
+    def test_known_ssh_requires_explicit_remote_scope(self):
+        for executable in ("ssh", "ssh.exe", "/usr/bin/ssh", "C:\\Windows\\System32\\OpenSSH\\ssh.exe"):
+            base = raw_config(Path("fixture"))
+            base["receiver_argv"][0] = executable
+            with self.subTest(executable=executable), self.assertRaises(pair.PairError):
+                pair.Config.from_dict(base)
+            self.assertEqual(pair.Config.from_dict({**base, "receiver_scope": "remote"}).receiver_scope, "remote")
+
+    def test_native_summary_preserves_uint64_without_private_fields(self):
+        for role in ("receiver", "sender"):
+            original = native_summary(role)
+            original["private_note"] *= 400
+            encoded = json.dumps(original).encode()
+            self.assertGreater(len(encoded), pair.MAX_LINE)
+            summary = pair.parse_native_summary(encoded, role)
+            self.assertTrue(summary["reported_media_qualified"])
+            serialized = json.dumps(summary)
+            for private in ("DO_NOT_PUBLISH", "PRIVATE_TOKEN", "clock_epoch", '"sender_session":', "private_note"):
+                self.assertNotIn(private, serialized)
+            if role == "sender":
+                self.assertEqual(summary["metrics"]["captured_frames"], (1 << 63) + 17)
+                self.assertIs(type(summary["metrics"]["captured_frames"]), int)
+
+    def test_native_summary_rejects_size_schema_duplicates_and_nonfinite(self):
+        base = native_summary("sender")
+        variants = [{**base, "schema": True}, {**base, "schema": 2},
+                    {**base, "status": "DO_NOT_PUBLISH_PRIVATE_ERROR"}, {**base, "status": []},
+                    {**base, "mapped_packets": True}, {**base, "mapped_packets": -1},
+                    {**base, "mapped_packets": 1 << 64}, {**base, "clock_usable": 1},
+                    {**base, "unknown": float("nan")}, {**base, "unknown": float("inf")},
+                    [base], None]
+        lines = [json.dumps(value).encode() for value in variants]
+        lines += [b'{"schema":1,"schema":1,"status":"error"}', b"{bad}", b"{\xff}",
+                  b'{"schema":1,"status":"error","unknown":1e999}', b"{" * (pair.MAX_NATIVE_SUMMARY + 1)]
+        for line in lines:
+            with self.subTest(line=line[:40]), self.assertRaises(pair.PairError):
+                pair.parse_native_summary(line, "sender")
+
+    def test_receiver_requires_exact_native_no_ipc_failure(self):
+        base = native_summary("receiver")
+        summary = pair.parse_native_summary(json.dumps(base).encode(), "receiver")
+        self.assertTrue(summary["reported_media_qualified"])
+        self.assertEqual(summary["ipc_failure"], "none")
+        variants = [{key: value for key, value in base.items() if key != "ipc_failure"}]
+        variants += [{**base, "ipc_failure": value} for value in
+                     ("", "None", None, True, {}, "DO_NOT_PUBLISH_PRIVATE_ERROR", *sorted(pair.IPC_FAILURE_CODES - {"none"}))]
+        for original in variants:
+            with self.subTest(failure=original.get("ipc_failure")):
+                summary = pair.parse_native_summary(json.dumps(original).encode(), "receiver")
+                self.assertFalse(summary["reported_media_qualified"])
+                value = original.get("ipc_failure")
+                expected = value if isinstance(value, str) and value in pair.IPC_FAILURE_CODES else "unknown"
+                self.assertEqual(summary["ipc_failure"], expected)
+                self.assertNotIn("DO_NOT_PUBLISH", json.dumps(summary))
+
+    def test_receiver_session_diagnostics_are_bounded_and_sanitized(self):
+        base = native_summary("receiver")
+        original = {"state": 2, "fault": 5, "delivered_frames": (1 << 63) + 17,
+                    "generation": "PRIVATE_GENERATION", "ssrc": "PRIVATE_SSRC", "private_note": "DO_NOT_PUBLISH"}
+        summary = pair.parse_native_summary(json.dumps({**base, "correction_sessions": [original]}).encode(), "receiver")
+        self.assertFalse(summary["reported_media_qualified"])
+        self.assertEqual(summary["correction_sessions"], [{"state": 2, "fault": 5, "delivered_frames": (1 << 63) + 17}])
+        self.assertEqual(summary["correction_session_count"], 1)
+        self.assertFalse(summary["correction_sessions_truncated"])
+        self.assertNotIn("PRIVATE", json.dumps(summary))
+        self.assertNotIn("DO_NOT_PUBLISH", json.dumps(summary))
+        valid = base["correction_sessions"][0]
+        for sessions in (None, {}, [], [None], [{"state": True, "fault": "PRIVATE", "delivered_frames": 1 << 64}],
+                         [{**valid, "delivered_frames": -1}], [valid] * (pair.MAX_CORRECTION_SESSIONS + 1)):
+            with self.subTest(sessions=sessions):
+                summary = pair.parse_native_summary(json.dumps({**base, "correction_sessions": sessions}).encode(), "receiver")
+                self.assertFalse(summary["reported_media_qualified"])
+                self.assertLessEqual(len(summary["correction_sessions"]), pair.MAX_CORRECTION_SESSIONS)
+                self.assertEqual(summary["correction_session_count"], len(sessions) if isinstance(sessions, list) else None)
+                self.assertEqual(summary["correction_sessions_truncated"], isinstance(sessions, list) and len(sessions) > pair.MAX_CORRECTION_SESSIONS)
+                self.assertNotIn("PRIVATE", json.dumps(summary))
+
+    def test_stop_and_missing_counters_do_not_imply_reported_media_qualification(self):
+        for role in ("sender", "receiver"):
+            summary = pair.parse_native_summary(b'{"schema":1,"status":"control_stopped"}', role)
+            self.assertFalse(summary["reported_media_qualified"])
+            original = native_summary(role)
+            original["status"] = "error"
+            self.assertFalse(pair.parse_native_summary(json.dumps(original).encode(), role)["reported_media_qualified"])
 
     def test_duplicate_lock_and_reacquire_preserves_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -282,6 +416,77 @@ class ProcessTests(unittest.TestCase):
             log = events(state, role)
             self.assertEqual(log[-1]["event"], "stop")
             self.assertTrue(any(event["event"] == "keepalive" for event in log))
+
+    def test_required_large_native_summaries_are_collected_during_stop(self):
+        result, _ = self.run_fixture("native_large", require_native_summaries=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.native_summary_requirement_met)
+        self.assertTrue(result.reported_media_qualified)
+        self.assertFalse(result.media_verified)
+        self.assertEqual(result.evidence, "process_agreement_only")
+        self.assertEqual(len(result.native_diagnostics), 2)
+        self.assertEqual({item["role"] for item in result.native_diagnostics}, {"receiver", "sender"})
+        receiver = next(item for item in result.native_diagnostics if item["role"] == "receiver")
+        self.assertEqual(receiver["ipc_failure"], "none")
+        self.assertEqual(receiver["correction_sessions"], [{"state": 1, "fault": 0, "delivered_frames": 96000}])
+        self.assertEqual(receiver["correction_session_count"], 1)
+        self.assertFalse(receiver["correction_sessions_truncated"])
+        serialized = json.dumps(pair.asdict(result))
+        for private in ("DO_NOT_PUBLISH", "PRIVATE_TOKEN", "private_note", "clock_epoch"):
+            self.assertNotIn(private, serialized)
+
+    def test_required_missing_summary_does_not_imply_media_pass(self):
+        result, _ = self.run_fixture(require_native_summaries=True)
+        self.assertEqual(result.exit_code, 0)  # Control result remains independent.
+        self.assertFalse(result.native_summary_requirement_met)
+        self.assertFalse(result.reported_media_qualified)
+        self.assertTrue(all(item["reason"] == "native_summary_missing" for item in result.native_diagnostics))
+
+    def test_invalid_final_native_summaries_have_separate_diagnostics(self):
+        for mode, reason in (("native_duplicate", "duplicate_native_summary"),
+                             ("native_bad_schema", "invalid_native_schema"),
+                             ("native_nan", "invalid_native_json")):
+            with self.subTest(mode=mode):
+                result, _ = self.run_fixture(mode, require_native_summaries=True)
+                self.assertEqual(result.exit_code, 0)
+                self.assertFalse(result.native_summary_requirement_met)
+                self.assertFalse(result.reported_media_qualified)
+                self.assertTrue(all(item["reason"] == reason for item in result.native_diagnostics))
+
+    def test_valid_error_or_unqualified_summaries_are_not_qualified(self):
+        for mode in ("native_error", "native_unqualified"):
+            with self.subTest(mode=mode):
+                result, _ = self.run_fixture(mode, require_native_summaries=True)
+                self.assertEqual(result.exit_code, 0)
+                self.assertTrue(result.native_summary_requirement_met)
+                self.assertFalse(result.reported_media_qualified)
+
+    def test_bad_final_stdout_is_not_lost_during_cleanup(self):
+        for mode in ("native_truncated", "native_oversize", "native_final_control", "native_total_overflow"):
+            with self.subTest(mode=mode):
+                result, _ = self.run_fixture(mode, require_native_summaries=True)
+                self.assertEqual(result.exit_code, 1)
+                self.assertTrue(any(f.phase == "cleanup" for f in result.faults))
+                if mode != "native_final_control":
+                    self.assertFalse(result.reported_media_qualified)
+
+    def test_remote_receiver_death_never_retries_from_local_ssh_exit_alone(self):
+        result, state = self.run_fixture("receiver_dies_once", receiver_scope="remote", max_attempts=3)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.remote_retirement_unverified)
+        self.assertEqual((state / "receiver.count").read_text(), "1")
+        self.assertEqual((state / "sender.count").read_text(), "1")
+        self.assertEqual(events(state, "sender")[-1]["event"], "stop")
+
+    def test_remote_receiver_exit_or_stdout_loss_never_retries(self):
+        for mode in ("remote_exit", "remote_stdout_eof"):
+            with self.subTest(mode=mode):
+                result, state = self.run_fixture(mode, receiver_scope="remote", max_attempts=3)
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(result.attempts, 1)
+                self.assertTrue(result.remote_retirement_unverified)
+                self.assertEqual((state / "receiver.count").read_text(), "1")
 
     def test_receiver_restart_retires_sender_and_uses_fresh_pair(self):
         result, state = self.run_fixture("receiver_dies_once", total_seconds=5)

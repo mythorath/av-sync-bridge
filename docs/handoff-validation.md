@@ -134,6 +134,11 @@ passed both checks on both tracks, using the final offline-reconnect behavior.
 
 ## Pending validation
 
+A separate [restart-spanning recording](restart-recording-validation.md) now
+checks the entire predecessor/replacement sequence, including rejection of an
+explicitly queued stale marker. The earlier warmup replacement fixture above
+did not record the interruption itself; its narrower result remains unchanged.
+
 Thirty-minute representative load, physical clocks/capture, source activation
 changes, severe handoff stalls, both-machine restarts and real-filter microphone
 privacy remain independent proof gates. The 40 ms handoff does not change the intended presentation timestamps

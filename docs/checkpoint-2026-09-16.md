@@ -80,12 +80,67 @@ The previous three isolated physical timing passes remain recorded in the
 this process-control path. No new physical A/V, reboot, loaded soak, microphone,
 normal-profile migration or sustained 4K60 result is claimed here.
 
+## Follow-up: recording through replacement
+
+The [new restart runner](restart-recording-validation.md) records the interruption
+itself, unlike the older warmup replacement fixture. Two graceful and two SIGKILL
+runs passed with exactly A1–A3 then B1–B6 in each full recording. A4 was fully
+queued before the stop and never replayed. The successor retired the old mapping
+about 1.905 seconds before A4 was due. No timing offsets were retuned.
+
+The final two runs used independently owned Xvfb and libOBS processes, avoiding
+a wrapper-cleanup blind spot discovered during review. Both exited cleanly.
+Their desktop encoded medians were -14.333/-2.333 ms (before/after graceful stop)
+and -13.333/-2.333 ms (before/after SIGKILL). All markers passed the fixed one-frame
+median/two-frame event gates, and raw mixer errors were within 0.612 ms of the
+original intended presentation times. These are generated 640x360/60 recordings,
+not physical capture, remote recovery or sustained 4K60 validation.
+
+A fresh 119-second, six-cycle generated baseline also passed: all 36 markers on
+both generated tracks, encoded median -15.333 ms and range -15.667..-15.000 ms;
+raw desktop error -0.553..+0.114 ms. No prior/later raw marker regions were ignored.
+This short check does not replace the representative 30-minute load gate.
+
+The controller now retains bounded, privacy-filtered final native summaries,
+separately from process-agreement evidence. A quiet-desktop trial completed the
+agreement but reported zero captured/published frames and correctly remained
+media-unqualified. A subsequent playing-desktop trial reported 5,213 outgoing RTP
+packets and 685,440 corrected stereo frames published to private IPC, with no
+reported timestamp, anchor, jitter-late or ingress-validation errors. That first
+live report revealed an interpreter bug: the receiver's success code is the
+literal `none`, not an empty string. The strict parser and its fixture were
+corrected to the native contract; missing, empty and unknown values do not pass.
+These counters are native self-reports, not independently observed playback or
+OBS consumption. No normal OBS source was attached to those network trials.
+
+A fresh trial after that parser fix reported both roles qualified: 5,174 outgoing
+RTP packets, 677,280 corrected stereo frames delivered/published, 17 usable anchor
+measurements, one running correction session with fault code zero and IPC failure
+code `none`. It completed one acknowledged pair in 21.432 seconds, with no control
+faults, forced kills, stop or cleanup failures. `media_verified` correctly remains
+false: no independent content-quality or actual OBS-receipt assertion was made.
+
+Unexpected remote receiver/SSH exit or stdout loss now latches
+`remote_retirement_unverified` and prevents a new attempt. This closes the case
+where an already-dead SSH child previously escaped the forced-kill retry guard.
+It is deliberately conservative; independent authenticated remote retirement
+proof and the real remote failure matrix are still unimplemented.
+
+The expanded Linux ASRC/network/IPC CTest suite passed 35/35; four targeted
+ASAN/UBSAN checks passed with default leak detection. Windows CTest passed 20/20.
+Final Python discovery passed 177 tests on each host (7 Windows/6 Linux skips);
+the process-pair subset contains 39 tests. The new analyzer, queue
+barrier, display ownership and native-report negative fixtures are included in
+the ordinary Python test discovery. No production profile, service, startup task,
+microphone state or display configuration was changed.
+
 ## Continue here
 
 1. Extend the basic native agreement check to qualify the actual remote wrapper
    and finite pair controller under failure:
-   generated network media, sender/receiver/controller failure matrix, and an
-   isolated recording that spans the restart boundary with distinct old/new sound.
+   generated network media and sender/receiver/controller failure matrix with
+   independent authenticated remote retirement proof. The local generated
+   restart-spanning recording is now covered; it does not prove remote containment.
 2. Run the isolated real desktop/video restart matrix and representative load.
    Preserve interruption and timing failures; no offset retuning between repeats.
 3. Only then perform a reversible normal-source/startup migration and physical
