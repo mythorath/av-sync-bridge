@@ -26,6 +26,7 @@
 #include <avsync/audio_anchors.hpp>
 #include <avsync/nominal_audio.hpp>
 #include <avsync/rtp_audio_anchor.hpp>
+#include <avsync/process_control.hpp>
 
 #include <algorithm>
 #include <array>
@@ -87,7 +88,8 @@ struct FormatDeleter { void operator()(WAVEFORMATEX *p) const { CoTaskMemFree(p)
 struct Arguments {
     std::string host;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{};
-    std::uint64_t clock_epoch{};
+    std::uint64_t clock_epoch{}, sender_session{};
+    bool control_stdin{};
 };
 
 bool unsigned_value(std::string_view text, unsigned &value)
@@ -115,6 +117,7 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--loopback" && !loopback) { loopback = true; continue; }
+        if (arg == "--control-stdin" && !result.control_stdin) { result.control_stdin = true; continue; }
         if (i + 1 >= argc) return std::nullopt;
         const std::string_view value(argv[++i]);
         unsigned bit = 0;
@@ -125,18 +128,21 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
         else if (arg == "--rtcp-port") { bit = 8; number = &result.rtcp_port; }
         else if (arg == "--seconds") { bit = 16; number = &result.seconds; }
         else if (arg == "--clock-epoch") bit = 32;
+        else if (arg == "--sender-session") bit = 64;
         else return std::nullopt;
         if (seen & bit) return std::nullopt;
         seen |= bit;
         if (number) {
             if (!unsigned_value(value, *number)) return std::nullopt;
-        } else if (bit == 32) {
-            const auto parsed = std::from_chars(value.data(), value.data()+value.size(), result.clock_epoch);
-            if (parsed.ec != std::errc{} || parsed.ptr != value.data()+value.size() || !result.clock_epoch)
+        } else if (bit == 32 || bit == 64) {
+            auto& identity = bit == 32 ? result.clock_epoch : result.sender_session;
+            const auto parsed = std::from_chars(value.data(), value.data()+value.size(), identity);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data()+value.size() || !identity)
                 return std::nullopt;
         } else result.host = value;
     }
-    if (!loopback || seen != 63 || !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 180)
+    if (!loopback || (seen & 63) != 63 || (result.control_stdin && !result.sender_session) ||
+        !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 180)
         return std::nullopt;
     const auto port = [](unsigned p) { return p >= 1 && p <= 65535; };
     if (!port(result.clock_port) || !port(result.rtp_port) || !port(result.rtcp_port) ||
@@ -870,6 +876,13 @@ int run(const Arguments &args)
     try {
         const auto started = Steady::now();
         const auto deadline = started + std::chrono::seconds(args.seconds);
+        avsync::process::StdinControl control(args.control_stdin);
+        const auto control_result = [&] {
+            write_summary(stats, observed_format ? &*observed_format : nullptr, health,
+                          avsync::process::state_name(control.state()));
+            return control.state() == avsync::process::ControlState::stopped ? 0 : 1;
+        };
+        if (control.poll() != avsync::process::ControlState::active) return control_result();
         GError *error = nullptr;
         if (!gst_init_check(nullptr, nullptr, &error)) {
             const auto code = error ? static_cast<std::uint32_t>(error->code) : 0;
@@ -877,8 +890,8 @@ int run(const Arguments &args)
             throw Failure{"gstreamer_initialize", code};
         }
         ComScope com;
-        std::uint64_t session{};
-        do { session = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!session);
+        std::uint64_t session = args.sender_session;
+        if (!session) do { session = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!session);
         GstPtr<GstBus> clock_bus(gst_bus_new());
         GstPtr<GstClock> clock(gst_net_client_clock_new("avsync-shared-clock", args.host.c_str(),
                                                        static_cast<gint>(args.clock_port), 0));
@@ -899,13 +912,20 @@ int run(const Arguments &args)
         const auto domain = avsync::net::verify_local_monotonic_domain(internal.get());
         stats.domain_bracket_ns = domain.bracket_width_ns;
         require(domain.valid, "qpc_gstreamer_domain_mismatch");
-        while (Steady::now() < deadline) {
+        if (control.poll() != avsync::process::ControlState::active) return control_result();
+        if (args.sender_session) {
+            // Process agreement only: no claim of qualified clock or captured PCM.
+            std::cout << "AVSYNC_CONTROL {\"schema\":1,\"event\":\"sender_started\",\"clock_epoch\":\""
+                      << args.clock_epoch << "\",\"sender_session\":\"" << session << "\"}\n" << std::flush;
+        }
+        while (Steady::now() < deadline && control.poll() == avsync::process::ControlState::active) {
             clock_messages(clock_bus.get(), monitor);
             health = monitor.health(clock.get());
             if (health.usable) break;
             gst_clock_wait_for_sync(clock.get(), 50 * GST_MSECOND);
             Sleep(10);
         }
+        if (control.state() != avsync::process::ControlState::active) return control_result();
         if (!health.usable || Steady::now() >= deadline) {
             write_summary(stats, nullptr, health, "waiting_clock");
             return 3;
@@ -926,8 +946,9 @@ int run(const Arguments &args)
         };
         pipeline = std::make_unique<SenderPipeline>(args, capture.format(), clock.get(), stats, session);
         if (Steady::now() >= deadline) throw Failure{"deadline_before_capture"};
+        if (control.poll() != avsync::process::ControlState::active) return control_result();
         capture.start();
-        while (Steady::now() < deadline) {
+        while (Steady::now() < deadline && control.poll() == avsync::process::ControlState::active) {
             clock_messages(clock_bus.get(), monitor);
             health = monitor.health(clock.get());
             if (clock_was_usable && !health.usable) {
@@ -994,6 +1015,7 @@ int run(const Arguments &args)
             // A rebuild can consume time. Recheck the deadline and capture age,
             // never make an old packet current by changing its timestamp.
             const auto after_build = gst_clock_get_time(clock.get());
+            if (control.poll() != avsync::process::ControlState::active) break;
             if (Steady::now() >= deadline || after_build > static_cast<guint64>(std::numeric_limits<std::int64_t>::max()) ||
                 avsync::capture_window_status(*mapped, static_cast<std::int64_t>(after_build), capture_window) !=
                     avsync::CaptureWindowStatus::accepted) {
@@ -1026,6 +1048,7 @@ int run(const Arguments &args)
         pipeline.reset();
         clock_messages(clock_bus.get(), monitor);
         health = monitor.health(clock.get());
+        if (control.state() != avsync::process::ControlState::active) return control_result();
         const bool invalid_timing = stats.rtp_frame_steps.load() || stats.rtp_nominal_pts_steps.load() ||
                                     stats.rtp_invalid_payload.load() || stats.anchor_transport_errors.load();
         write_summary(stats, &*observed_format, health, invalid_timing ? "invalid_nominal_timing" :
@@ -1043,6 +1066,7 @@ int run(const Arguments &args)
 void help()
 {
     std::cout << "avsync-windows-sender --loopback --host IPV4 --clock-port N --rtp-port N --rtcp-port N --seconds N --clock-epoch N\n"
+                 " [--sender-session N] [--control-stdin] (pinned finite process agreement/5-second stdin lease)\n"
                  "Experimental desktop-only WASAPI -> explicit stereo mix -> 48 kHz L24 RTP.\n"
                  "All options required; seconds is an overall deadline from 1 to 180.\n"
                  "A numeric unicast IPv4 destination and three distinct ports are required.\n"
@@ -1051,6 +1075,7 @@ void help()
                  "No microphone, recording files, startup changes, endpoint changes or OBS changes.\n"
                  "Shared-monotonic RTCP convention, not UTC. No sender presentation delay.\n"
                  "Copy the fresh clock-epoch from the receiver READY line for this finite test.\n"
+                 "Control mode requires sender-session; KEEPALIVE/STOP lines, EOF/expiry stops capture.\n"
                  "Nominal RTP time is NOT capture time; a versioned extension carries original anchors.\n"
                  "Fixed-rate resampling is not long-run device-clock correction.\n";
 }

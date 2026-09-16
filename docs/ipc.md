@@ -8,8 +8,11 @@ Successful IPC tests are **not** proof of hardware timing or encoded OBS A/V syn
 
 `include/avsync/ipc.hpp` is the API. The implementation is Linux-only and requires
 the producer and consumer to share the same architecture and pthread ABI. Protocol
-version 1 records a header size, mapping size, dimensions, capacities, region
-offsets/strides and a random generation identifier; incompatible layouts are rejected.
+version 2 records a header size, mapping size, dimensions, capacities, region
+offsets/strides, a random generation identifier, and the mapping/singleton-lock
+device and inode identities; incompatible layouts and copied mappings are rejected.
+Rebuild every producer, reader and OBS adapter together. Version 1 mappings are
+not converted or accepted by the new binaries.
 All timestamps are signed CLOCK_MONOTONIC nanoseconds. Capture and scheduled
 presentation timestamps remain separate. One generation owns one epoch.
 
@@ -74,6 +77,24 @@ readers safely mapped to the old generation until explicit worker-thread
 expires after 2 seconds. A robust, process-shared mutex marks an epoch offline when
 its lock owner dies, preventing consumption of a partly written slot. A new
 producer/generation is required; it does not pretend an interrupted copy completed.
+
+`ReplacementPolicy::retire_previous` additionally makes whole-process replacement
+explicit. It requires the existing singleton sidecar, matches the predecessor's
+recorded mapping and lock identities, prepares the successor without touching the
+predecessor, then trylocks the old mutex. Under that lock it marks the predecessor
+offline **before** publishing the successor. An old reader therefore cannot read
+queued predecessor PCM after successful successor publication. Missing/replaced
+locks, unknown versions, copied/hardlinked/unsafe files, live producers and busy
+reader mutexes are refused; heartbeat expiry is not takeover authority. A failed
+allocation preserves the predecessor; failure to publish after retirement leaves
+it deliberately offline. Default `atomic_replace` remains available to existing
+single-owner diagnostics and does not promise explicit predecessor retirement.
+
+This is not instantaneous downstream muting: media already copied or submitted
+to OBS cannot be retracted. Before replacement, a crashed writer can remain
+readable until heartbeat expiry. Ordinary writer destruction also uses a blocking
+mutex on its control thread; a stuck reader can delay cooperative shutdown.
+External process cleanup deadlines remain necessary.
 
 This is a trusted-same-user protocol, not a sandbox against malicious same-user
 processes. A producer must not truncate a published mapping; a hostile owner can

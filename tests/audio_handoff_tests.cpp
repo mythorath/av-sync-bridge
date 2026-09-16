@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <signal.h>
 #include <stdexcept>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -21,6 +22,46 @@ struct Temporary {
     }
     ~Temporary() { unlink(path.c_str()); unlink((path+".lock").c_str()); rmdir(dir.c_str()); }
 };
+
+void process_replacement() {
+    Temporary temp;
+    int notice[2], release[2]; check(pipe(notice)==0 && pipe(release)==0);
+    const auto child=fork(); check(child>=0);
+    if (!child) {
+        close(notice[0]); close(release[1]); alarm(5);
+        try {
+            avsync::CorrectedAudioHandoff producer(temp.path,100'000'000);
+            std::array<float,960> pcm; pcm.fill(.25F);
+            const auto now=avsync::ipc::monotonic_ns();
+            if (!producer.consume({{20,1},0,now,480},pcm,now)) _exit(81);
+            const char ready='R'; if (write(notice[1],&ready,1)!=1) _exit(82);
+            char wait{}; if (read(release[0],&wait,1)!=1) _exit(85); _exit(83);
+        } catch (...) { _exit(84); }
+    }
+    close(notice[1]); close(release[0]); char marker{};
+    const bool notified=read(notice[0],&marker,1)==1 && marker=='R'; close(notice[0]);
+    avsync::ipc::Reader previous(temp.path);
+    const auto old_generation=previous.generation();
+    bool live_refused=false;
+    try {
+        avsync::CorrectedAudioHandoff duplicate(temp.path,100'000'000,avsync::ipc::ReplacementPolicy::retire_previous);
+    } catch (const std::runtime_error&) { live_refused=true; }
+    const auto killed=kill(child,SIGKILL); close(release[1]); int code{};
+    const auto waited=waitpid(child,&code,0);
+    check(notified && live_refused && previous.valid() && killed==0 && waited==child &&
+        WIFSIGNALED(code) && WTERMSIG(code)==SIGKILL);
+    avsync::CorrectedAudioHandoff successor(temp.path,100'000'000,avsync::ipc::ReplacementPolicy::retire_previous);
+    std::array<float,960> fresh,output; fresh.fill(-.5F); output.fill(7.F);
+    const auto now=avsync::ipc::monotonic_ns();
+    check(successor.consume({{21,1},0,now,480},fresh,now));
+    avsync::ipc::FrameInfo info;
+    using R=avsync::ipc::ReadResult;
+    check(previous.read_next_due_audio(0,now+100'000'000,output,info)==R::disconnected);
+    for (const auto sample:output) check(sample==7.F);
+    check(previous.reconnect() && previous.generation()!=old_generation);
+    check(previous.read_next_due_audio(0,now+100'000'000,output,info)==R::ok && output==fresh);
+    check(info.sequence==1 && info.capture_ns==now && info.presentation_ns==now+100'000'000);
+}
 }
 int main() {
     try {
@@ -111,6 +152,7 @@ int main() {
         check(reader.read_next_due_audio(0,t+400'000'000,out,info)==R::ok);
         check(info.sequence==1 && info.capture_ns==t+300'000'000 && info.presentation_ns==t+400'000'000);
         for (const auto sample:out) check(sample==-.5F);
+        process_replacement();
         std::cout<<"PASS desktop IPC: exact PCM/timestamps, due scheduling, split quanta, fault/epoch revocation\n";
     } catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

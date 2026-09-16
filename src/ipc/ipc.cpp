@@ -17,7 +17,7 @@
 namespace avsync::ipc {
 namespace {
 constexpr std::uint64_t magic = 0x415653594E433031ULL;
-constexpr std::uint32_t version = 1;
+constexpr std::uint32_t version = 2;
 constexpr std::size_t max_mapping = 2ULL * 1024 * 1024 * 1024;
 constexpr std::int64_t heartbeat_timeout = 2000000000LL;
 constexpr std::size_t align64(std::size_t n) { return (n + 63U) & ~std::size_t(63U); }
@@ -31,6 +31,7 @@ struct Header {
     std::uint64_t offsets[3], strides[3], sequences[3];
     std::uint32_t online, owner_died;
     pthread_mutex_t mutex;
+    std::uint64_t mapping_device, mapping_inode, singleton_device, singleton_inode;
 };
 struct Slot { FrameInfo info; };
 struct Layout {
@@ -62,6 +63,30 @@ bool layout_for(const Config& c, Layout& l) {
 
 bool private_regular(const struct stat& st) {
     return S_ISREG(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 0777) == 0600;
+}
+
+bool same_file(const struct stat& first, const struct stat& second) noexcept {
+    return first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+bool valid_header(const Header& h, std::size_t size, Layout& layout) noexcept {
+    if (h.magic_value != magic || h.protocol_version != version || h.header_size != sizeof(Header) ||
+        h.mapping_size != size || !h.generation || h.epoch_ns < 0 || !h.mapping_inode || !h.singleton_inode ||
+        !layout_for(h.config, layout) || layout.size != size)
+        return false;
+    for (unsigned s = 0; s < 3; ++s)
+        if (h.offsets[s] != layout.offsets[s] || h.strides[s] != layout.strides[s]) return false;
+    return true;
+}
+
+bool bound_mapping(const Header& h, const struct stat& mapping) noexcept {
+    return h.mapping_device == static_cast<std::uint64_t>(mapping.st_dev) &&
+           h.mapping_inode == static_cast<std::uint64_t>(mapping.st_ino);
+}
+
+bool bound_singleton(const Header& h, const struct stat& singleton) noexcept {
+    return h.singleton_device == static_cast<std::uint64_t>(singleton.st_dev) &&
+           h.singleton_inode == static_cast<std::uint64_t>(singleton.st_ino);
 }
 
 bool split_path(const std::string& path, std::string& dir, std::string& leaf) {
@@ -172,12 +197,16 @@ struct Writer::Impl {
     }
 };
 
-Writer::Writer(std::string path, const Config& c, AllocationPolicy allocation)
+Writer::Writer(std::string path, const Config& c, AllocationPolicy allocation, ReplacementPolicy replacement)
     : impl_(std::make_unique<Impl>()) {
     auto& p = *impl_; p.config = c;
     if (allocation != AllocationPolicy::sparse && allocation != AllocationPolicy::reserve_and_prefault) {
         p.error = "invalid IPC allocation policy"; return;
     }
+    if (replacement != ReplacementPolicy::atomic_replace && replacement != ReplacementPolicy::retire_previous) {
+        p.error = "invalid IPC replacement policy"; return;
+    }
+    const bool retire_previous = replacement == ReplacementPolicy::retire_previous;
     if (!validate_config(c, p.error) || !layout_for(c, p.layout)) return;
     std::string parent, leaf;
     if (!split_path(path, parent, leaf)) { p.error = "IPC path must include a parent directory"; return; }
@@ -187,14 +216,41 @@ Writer::Writer(std::string path, const Config& c, AllocationPolicy allocation)
         if (dir >= 0) close(dir);
         p.error = "IPC parent must be user owned and not group/world writable"; return;
     }
-    if (fstatat(dir, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && !private_regular(st)) {
+    struct stat previous_stat{};
+    const bool previous_exists = fstatat(dir, leaf.c_str(), &previous_stat, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!previous_exists && errno != ENOENT) {
+        close(dir); p.error = "cannot inspect existing IPC path"; return;
+    }
+    if (previous_exists && (!private_regular(previous_stat) || (retire_previous && previous_stat.st_nlink != 1))) {
         close(dir); p.error = "existing IPC path is not a private regular file"; return;
     }
     const auto lock_name = leaf + ".lock";
-    p.singleton_fd = openat(dir, lock_name.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    // Existing mappings may only be retired through their EXISTING sidecar.
+    // Creating a replacement lock would not exclude a writer holding the old inode.
+    const auto create_lock = retire_previous && previous_exists ? 0 : O_CREAT;
+    p.singleton_fd = openat(dir, lock_name.c_str(), O_RDWR | create_lock | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (p.singleton_fd < 0 || fstat(p.singleton_fd, &st) != 0 || !private_regular(st) ||
+        (retire_previous && st.st_nlink != 1) ||
         flock(p.singleton_fd, LOCK_EX | LOCK_NB) != 0) {
         close(dir); p.error = "IPC producer already active or lock file is unsafe"; return;
+    }
+    const auto singleton_stat = st;
+    Map previous;
+    Layout previous_layout;
+    if (retire_previous && previous_exists) {
+        previous.fd = openat(dir, leaf.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        struct stat opened{};
+        if (previous.fd < 0 || fstat(previous.fd, &opened) != 0 || !private_regular(opened) || opened.st_nlink != 1 ||
+            !same_file(opened, previous_stat) || opened.st_size < static_cast<off_t>(sizeof(Header)) ||
+            opened.st_size > static_cast<off_t>(max_mapping)) {
+            close(dir); p.error = "prior IPC mapping identity or size is unsafe"; return;
+        }
+        previous.size = static_cast<std::size_t>(opened.st_size);
+        previous.address = mmap(nullptr, previous.size, PROT_READ | PROT_WRITE, MAP_SHARED, previous.fd, 0);
+        if (previous.address == MAP_FAILED || !valid_header(*previous.header(), previous.size, previous_layout) ||
+            !bound_mapping(*previous.header(), opened) || !bound_singleton(*previous.header(), singleton_stat)) {
+            close(dir); p.error = "prior IPC mapping protocol or inode binding is invalid"; return;
+        }
     }
     std::uint64_t generation{};
     if (getrandom(&generation, sizeof(generation), 0) != sizeof(generation))
@@ -247,6 +303,48 @@ Writer::Writer(std::string path, const Config& c, AllocationPolicy allocation)
     h->epoch_ns = h->heartbeat_ns = monotonic_ns(); h->online = 1;
     for (unsigned s = 0; s < 3; ++s) { h->offsets[s] = p.layout.offsets[s]; h->strides[s] = p.layout.strides[s]; }
     h->magic_value = magic;
+    if (fstat(p.map.fd, &st) != 0) { fail("cannot identify new IPC mapping"); return; }
+    h->mapping_device = static_cast<std::uint64_t>(st.st_dev);
+    h->mapping_inode = static_cast<std::uint64_t>(st.st_ino);
+    h->singleton_device = static_cast<std::uint64_t>(singleton_stat.st_dev);
+    h->singleton_inode = static_cast<std::uint64_t>(singleton_stat.st_ino);
+    if (retire_previous) {
+        // Revalidate names after all allocations, before touching predecessor state.
+        struct stat current_lock{}, current_mapping{};
+        if (fstatat(dir, lock_name.c_str(), &current_lock, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !private_regular(current_lock) || current_lock.st_nlink != 1 || !same_file(current_lock, singleton_stat)) {
+            fail("singleton identity changed before IPC publication"); return;
+        }
+        const bool exists_now = fstatat(dir, leaf.c_str(), &current_mapping, AT_SYMLINK_NOFOLLOW) == 0;
+        if (previous_exists != exists_now || (!exists_now && errno != ENOENT) ||
+            (exists_now && (!private_regular(current_mapping) || current_mapping.st_nlink != 1 ||
+                !same_file(current_mapping, previous_stat) || current_mapping.st_size != previous_stat.st_size))) {
+            fail("mapping identity changed before IPC publication"); return;
+        }
+        if (previous_exists) {
+            // Do not use a blocking lock: an active reader can hold the mutex.
+            // No mutation occurs for EBUSY or unrecognized robust-mutex state.
+            auto* prior = previous.header();
+            const auto locked = pthread_mutex_trylock(&prior->mutex);
+            if (locked != 0 && locked != EOWNERDEAD) {
+                fail("prior IPC mapping mutex unavailable"); return;
+            }
+            prior->online = 0;
+            if (locked == EOWNERDEAD) {
+                prior->owner_died = 1;
+                if (pthread_mutex_consistent(&prior->mutex) != 0) {
+                    pthread_mutex_unlock(&prior->mutex);
+                    fail("cannot retire abandoned IPC mapping mutex"); return;
+                }
+            }
+            // Retirement and publication are ordered while the old mutex is held.
+            // Existing readers can never consume old queued PCM after successor visibility.
+            const auto published = renameat(dir, temporary.c_str(), dir, leaf.c_str());
+            pthread_mutex_unlock(&prior->mutex);
+            if (published != 0) { fail("cannot publish IPC mapping after retirement"); return; }
+            close(dir); p.ready = true; return;
+        }
+    }
     if (renameat(dir, temporary.c_str(), dir, leaf.c_str()) != 0) { fail("cannot publish IPC mapping"); return; }
     close(dir); p.ready = true;
 }
@@ -350,13 +448,9 @@ bool Reader::reconnect() {
     p.map.address = mmap(nullptr, p.map.size, PROT_READ | PROT_WRITE, MAP_SHARED, p.map.fd, 0);
     if (p.map.address == MAP_FAILED) { p.error = "cannot map IPC reader"; return false; }
     auto* h = p.map.header();
-    if (h->magic_value != magic || h->protocol_version != version || h->header_size != sizeof(Header) ||
-        h->mapping_size != p.map.size || !h->generation || !layout_for(h->config, p.layout) ||
-        p.layout.size != p.map.size) { p.error = "IPC protocol/header/layout mismatch"; return false; }
-    for (unsigned s = 0; s < 3; ++s)
-        if (h->offsets[s] != p.layout.offsets[s] || h->strides[s] != p.layout.strides[s]) {
-            p.error = "IPC region bounds mismatch"; return false;
-        }
+    if (!valid_header(*h, p.map.size, p.layout) || !bound_mapping(*h, st)) {
+        p.error = "IPC protocol/header/layout or inode binding mismatch"; return false;
+    }
     p.config = h->config; p.generation = h->generation; p.ready = true; return true;
 }
 

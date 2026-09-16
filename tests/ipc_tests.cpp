@@ -15,6 +15,7 @@
 #include <string>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -58,7 +59,8 @@ void no_temporary_files(const TempDir& dir) {
 
 // The child alone has a zero-byte file-size limit. No disk/tmpfs is filled,
 // no device is opened, and the parent's limits and signal dispositions persist.
-void reject_reservation_with_child_limit(const std::string& path, const Config& config) {
+void reject_reservation_with_child_limit(const std::string& path, const Config& config,
+        ReplacementPolicy replacement = ReplacementPolicy::atomic_replace) {
     const auto child = fork(); require(child >= 0, "fork reservation failure fixture");
     if (!child) {
         rlimit limit{};
@@ -69,7 +71,7 @@ void reject_reservation_with_child_limit(const std::string& path, const Config& 
         if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(82);
         bool rejected = false;
         try {
-            Writer writer(path, config, AllocationPolicy::reserve_and_prefault);
+            Writer writer(path, config, AllocationPolicy::reserve_and_prefault, replacement);
             rejected = !writer.valid() && writer.error() == "cannot reserve full IPC mapping";
         } catch (...) { _exit(83); }
         _exit(rejected ? 0 : 84); // Writer has already released mappings and flock.
@@ -283,7 +285,183 @@ void restart_and_security(TempDir& dir) {
     Reader wrong(version_path); require(!wrong.valid(), "reject unknown version");
 }
 
+void explicit_process_replacement(TempDir& dir) {
+    const auto config = small(); const auto path = dir.file("process-replace");
+    auto writer = std::make_unique<Writer>(path, config);
+    require(writer->valid(), "replacement first writer");
+    Reader reader(path); const auto old_generation = reader.generation();
+    {
+        Writer refused(path, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+        require(!refused.valid() && writer->heartbeat(), "replacement cannot seize a live producer");
+    }
+    writer.reset();
+    writer = std::make_unique<Writer>(path, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+    require(writer->valid() && writer->generation() != old_generation, "explicit graceful replacement");
+    Status status;
+    require(reader.poll_status(monotonic_ns(), status) == ReadResult::disconnected, "graceful old mapping remains offline");
+    writer.reset();
+
+    // Actual producer subprocess dies without C++ destruction, leaving online=1
+    // and due/future distinct PCM. The parent must retire that mmap immediately,
+    // not wait for (or derive authority from) the heartbeat timeout.
+    for (const bool abandoned_mutex : {false, true}) {
+#ifndef AVSYNC_IPC_TEST_HOOKS
+        if (abandoned_mutex) continue;
+#endif
+        const auto crashed = dir.file(abandoned_mutex ? "crashed-locked" : "crashed-unlocked");
+        int notification[2], release[2];
+        require(pipe(notification) == 0 && pipe(release) == 0, "replacement child pipes");
+        const auto child = fork(); require(child >= 0, "replacement producer fork");
+        if (!child) {
+            close(notification[0]); close(release[1]); alarm(5);
+            Writer producer(crashed, config);
+            if (!producer.valid()) _exit(81);
+            std::vector<float> old_pcm(audio_samples(config, 0), .25F);
+            const auto capture = monotonic_ns();
+            if (!producer.publish_audio(0, old_pcm, capture, capture + 100'000'000)) _exit(82);
 #ifdef AVSYNC_IPC_TEST_HOOKS
+            if (abandoned_mutex)
+                testing::abandon_mutex(crashed.c_str(), notification[1], release[0]);
+#endif
+            const char ready = 'R';
+            if (write(notification[1], &ready, 1) != 1) _exit(83);
+            char wait{}; if (read(release[0], &wait, 1) != 1) _exit(85);
+            _exit(84);
+        }
+        close(notification[1]); close(release[0]); char marker{};
+        const bool notified = read(notification[0], &marker, 1) == 1 && marker == 'R';
+        close(notification[0]);
+        Reader old_reader(crashed);
+        const auto generation = old_reader.generation();
+        const auto killed = kill(child, SIGKILL);
+        close(release[1]); int code{};
+        const auto waited = waitpid(child, &code, 0);
+        require(notified && killed == 0 && waited == child && WIFSIGNALED(code) && WTERMSIG(code) == SIGKILL,
+                "hard-dead producer was reaped");
+        require(old_reader.valid(), "old reader holds crashed mapping");
+        if (!abandoned_mutex) {
+            // A synthetic earlier 'now' proves the online bit, independently of
+            // scheduler speed and the heartbeat-age gate. Failed allocation must
+            // not prematurely retire the old mapping.
+            require(old_reader.poll_status(0, status) == ReadResult::ok, "hard-dead unlocked writer left online state");
+            reject_reservation_with_child_limit(crashed, config, ReplacementPolicy::retire_previous);
+            require(old_reader.poll_status(0, status) == ReadResult::ok, "pre-retirement allocation failure preserves old state");
+        }
+        Writer successor(crashed, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+        require(successor.valid(), "explicit hard-death replacement");
+        std::vector<float> fresh(audio_samples(config, 0), -.5F), output(fresh.size(), 7.F);
+        const auto capture = monotonic_ns(); FrameInfo info;
+        require(successor.publish_audio(0, fresh, capture, capture + 100'000'000), "successor distinct PCM publish");
+        require(old_reader.poll_status(0, status) == ReadResult::disconnected && !status.online &&
+                status.owner_died == abandoned_mutex, "old generation retired before new publication");
+        require(old_reader.read_next_due_audio(0, capture + 100'000'000, output, info) == ReadResult::disconnected &&
+                std::all_of(output.begin(), output.end(), [](float x) { return x == 7.F; }), "no old queued PCM is copied");
+        require(old_reader.reconnect() && old_reader.generation() != generation, "reader adopts successor explicitly");
+        require(old_reader.read_next_due_audio(0, capture + 100'000'000, output, info) == ReadResult::ok &&
+                output == fresh && info.sequence == 1 && info.capture_ns == capture &&
+                info.presentation_ns == capture + 100'000'000, "successor PCM and dates preserved without rebase");
+    }
+}
+
+void replacement_security(TempDir& dir) {
+    const auto config = small(); const auto fresh = dir.file("replacement-new");
+    { Writer writer(fresh, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+      require(writer.valid(), "retirement policy permits a fresh path"); }
+    const auto corrupted = dir.file("replacement-corrupt");
+    int fd = open(corrupted.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    require(fd >= 0 && ftruncate(fd, 4096) == 0, "unrelated private-file fixture"); close(fd);
+    fd = open((corrupted + ".lock").c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    require(fd >= 0, "unrelated sidecar fixture"); close(fd);
+    struct stat original{}, after{};
+    require(lstat(corrupted.c_str(), &original) == 0, "unrelated file identity");
+    { Writer refused(corrupted, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+      require(!refused.valid(), "unknown private file cannot be retired or replaced"); }
+    require(lstat(corrupted.c_str(), &after) == 0 && after.st_ino == original.st_ino && after.st_size == original.st_size,
+            "unknown file retained unchanged");
+
+    for (const auto* kind : {"missing-lock", "replaced-lock", "mapping-link", "lock-link", "public", "old-version", "copied-map"}) {
+        const auto path = dir.file(std::string("replacement-") + kind);
+        auto live = std::make_unique<Writer>(path, config); require(live->valid(), "unsafe replacement fixture");
+        Reader old(path); const auto generation = old.generation();
+        const bool hold_live = std::string(kind) == "replaced-lock";
+        if (!hold_live) live.reset();
+        if (std::string(kind) == "missing-lock" || hold_live) {
+            require(unlink((path + ".lock").c_str()) == 0, "remove fixture singleton name");
+            if (hold_live) {
+                fd = open((path + ".lock").c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+                require(fd >= 0, "replacement lock inode fixture"); close(fd);
+            }
+        } else if (std::string(kind) == "mapping-link" || std::string(kind) == "lock-link") {
+            const auto alias = dir.file(std::string(kind) + "-alias");
+            require(link((std::string(kind) == "mapping-link" ? path : path + ".lock").c_str(), alias.c_str()) == 0,
+                    "hardlink fixture");
+        } else if (std::string(kind) == "public") {
+            require(chmod(path.c_str(), 0644) == 0, "unsafe mode fixture");
+        } else if (std::string(kind) == "old-version") {
+            fd = open(path.c_str(), O_RDWR); const std::uint32_t obsolete = 1;
+            require(fd >= 0 && pwrite(fd, &obsolete, sizeof(obsolete), sizeof(std::uint64_t)) == sizeof(obsolete),
+                    "obsolete protocol fixture"); close(fd);
+        } else {
+            // Even a byte-perfect header copy is not the inode recorded by its writer.
+            const auto copy = dir.file("replacement-copy-tmp");
+            const int source = open(path.c_str(), O_RDONLY), destination = open(copy.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+            require(source >= 0 && destination >= 0, "copy fixture handles");
+            std::array<char,4096> bytes{}; ssize_t count;
+            while ((count = read(source, bytes.data(), bytes.size())) > 0)
+                require(write(destination, bytes.data(), static_cast<std::size_t>(count)) == count, "copy fixture bytes");
+            require(count == 0, "copy fixture completed"); close(source); close(destination);
+            require(rename(copy.c_str(), path.c_str()) == 0, "copy substitutes wrong mapping inode");
+        }
+        require(lstat(path.c_str(), &original) == 0, "unsafe fixture original inode");
+        { Writer refused(path, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+          require(!refused.valid(), "unsafe predecessor replacement refused"); }
+        require(lstat(path.c_str(), &after) == 0 && after.st_ino == original.st_ino && after.st_size == original.st_size,
+                "unsafe predecessor path not replaced");
+        if (hold_live) {
+            Status status;
+            require(live->heartbeat() && old.poll_status(monotonic_ns(), status) == ReadResult::ok && old.generation() == generation,
+                    "different lock inode cannot retire a live writer");
+        }
+    }
+    const auto symlink = dir.file("replacement-symlink");
+    require(::symlink(fresh.c_str(), symlink.c_str()) == 0, "replacement symlink fixture");
+    { Writer refused(symlink, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+      require(!refused.valid(), "replacement rejects symlink"); }
+    fd = open((fresh + ".lock").c_str(), O_RDWR);
+    require(fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0, "external singleton owner fixture");
+    { Writer refused(fresh, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+      require(!refused.valid(), "replacement respects unrelated current singleton owner"); }
+    close(fd);
+}
+
+#ifdef AVSYNC_IPC_TEST_HOOKS
+void replacement_busy_reader(TempDir& dir) {
+    const auto config = small(); const auto path = dir.file("replacement-reader-busy");
+    { Writer writer(path, config); require(writer.valid(), "busy retirement mapping"); }
+    Reader reader(path); const auto generation = reader.generation();
+    int notice[2], release[2]; require(pipe(notice) == 0 && pipe(release) == 0, "busy retirement pipes");
+    const auto child = fork(); require(child >= 0, "busy retirement helper fork");
+    if (!child) {
+        alarm(5); close(notice[0]); close(release[1]);
+        testing::briefly_hold_mutex(path.c_str(), notice[1], release[0]);
+    }
+    close(notice[1]); close(release[0]); char marker{};
+    const bool notified = read(notice[0], &marker, 1) == 1; close(notice[0]);
+    bool refused = false;
+    {
+        Writer attempt(path, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+        refused = !attempt.valid() && attempt.error() == "prior IPC mapping mutex unavailable";
+    }
+    const bool released = write(release[1], &marker, 1) == 1; close(release[1]);
+    int code{}; const auto waited = waitpid(child, &code, 0);
+    require(notified && released && waited == child && WIFEXITED(code) && WEXITSTATUS(code) == 0,
+            "busy retirement helper bounded and released");
+    require(refused && reader.reconnect() && reader.generation() == generation,
+            "busy old mutex refuses without replacing its mapping");
+    Writer retry(path, config, AllocationPolicy::sparse, ReplacementPolicy::retire_previous);
+    require(retry.valid() && retry.generation() != generation, "retirement succeeds after reader releases mutex");
+}
+
 void video_publication_retry(TempDir& dir) {
     using P=avsync::VideoPublicationResult;
     const auto c=small(); const auto path=dir.file("video-retry");
@@ -374,7 +552,9 @@ int main() {
     try {
         TempDir dir; reserved_allocation_and_cleanup(dir); scheduling_and_bounds(dir);
         bounded_audio_handoff(dir); handoff_restart_phase(dir); restart_and_security(dir);
+        explicit_process_replacement(dir); replacement_security(dir);
 #ifdef AVSYNC_IPC_TEST_HOOKS
+        replacement_busy_reader(dir);
         video_publication_retry(dir);
         owner_death_and_wrap(dir);
 #else

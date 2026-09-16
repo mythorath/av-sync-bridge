@@ -354,6 +354,26 @@ void admission()
     bool thrown{};
     try { AudioStreamAdmission invalid(0); } catch (const std::invalid_argument&) { thrown = true; }
     CHECK(thrown);
+    thrown = false;
+    try { AudioStreamAdmission invalid(31, 0); } catch (const std::invalid_argument&) { thrown = true; }
+    CHECK(thrown);
+
+    // A supervisor pins identity BEFORE the first packet. A foreign process
+    // cannot take first-packet ownership, nor consume the generation budget.
+    AudioStreamAdmission pinned(31, 7);
+    auto expected = origin(), unexpected = expected;
+    unexpected.epoch.session = 8;
+    CHECK(!pinned.admit(unexpected, 99));
+    CHECK(!pinned.active_epoch() && pinned.admitted_ssrc_count() == 0);
+    unexpected = expected; unexpected.clock_epoch = 32;
+    CHECK(!pinned.admit(unexpected, 99));
+    CHECK(pinned.admit(expected, 99));
+    ++expected.epoch.generation;
+    CHECK(pinned.admit(expected, 100));
+    CHECK(!pinned.admit(origin(), 99));
+    unexpected = expected; ++unexpected.epoch.session; ++unexpected.epoch.generation;
+    CHECK(!pinned.admit(unexpected, 101));
+    CHECK(pinned.active_epoch() == expected.epoch && pinned.admitted_ssrc_count() == 2);
 }
 void stale_retirement_classification() {
     auto record=origin(); AudioReceiverValidator validator(record.clock_epoch);

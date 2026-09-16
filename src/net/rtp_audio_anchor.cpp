@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "avsync/rtp_audio_anchor.hpp"
 #include <gst/rtp/gstrtpbuffer.h>
+#include <gst/rtp/gstrtcpbuffer.h>
+#include <algorithm>
 #include <span>
+#include <stdexcept>
 
 namespace avsync::net {
 namespace {
@@ -69,6 +72,61 @@ bool add_audio_anchor(GstBuffer*& buffer, const wire::AudioRecord& record) noexc
     std::uint32_t ssrc{}, timestamp{}, frames{};
     const auto decoded = read_audio_anchor(buffer, ssrc, timestamp, frames);
     return decoded && *decoded == record;
+}
+
+PinnedAudioIngress::PinnedAudioIngress(std::uint64_t expected_clock_epoch,
+        std::uint64_t expected_sender_session)
+    : clock_epoch_(expected_clock_epoch), sender_session_(expected_sender_session) {
+    if (!clock_epoch_ || !sender_session_)
+        throw std::invalid_argument("pinned provider and sender identities must be nonzero");
+}
+
+bool PinnedAudioIngress::known_ssrc(std::uint32_t ssrc) const noexcept {
+    return ssrc && std::find(ssrcs_.begin(), ssrcs_.begin() + count_, ssrc) != ssrcs_.begin() + count_;
+}
+
+PinnedIngressResult PinnedAudioIngress::observe_rtp(GstBuffer* buffer) noexcept {
+    std::uint32_t ssrc{}, timestamp{}, frames{};
+    const auto record = read_audio_anchor(buffer, ssrc, timestamp, frames);
+    if (!record || !ssrc) return PinnedIngressResult::malformed;
+    if (record->clock_epoch != clock_epoch_ || record->epoch.session != sender_session_)
+        return PinnedIngressResult::foreign_identity;
+    // Ordered validation still owns all continuity, origin and capture-time
+    // checks. Even malformed active metadata must not be excused as foreign.
+    if (timestamp != record->rtp_zero + static_cast<std::uint32_t>(record->packet_wire_start))
+        return PinnedIngressResult::malformed;
+    if (known_ssrc(ssrc)) return PinnedIngressResult::accepted;
+    if (count_ == ssrcs_.size()) return PinnedIngressResult::capacity_exhausted;
+    ssrcs_[count_++] = ssrc;
+    return PinnedIngressResult::accepted;
+}
+
+bool PinnedAudioIngress::allows_rtcp(GstBuffer* buffer) const noexcept {
+    if (!buffer || gst_buffer_get_size(buffer) > pinned_audio_rtcp_limit ||
+        !gst_rtcp_buffer_validate_reduced(buffer)) return false;
+    GstRTCPBuffer map = GST_RTCP_BUFFER_INIT;
+    if (!gst_rtcp_buffer_map(buffer, GST_MAP_READ, &map)) return false;
+    GstRTCPPacket packet;
+    bool allowed = gst_rtcp_buffer_get_first_packet(&map, &packet), saw_report = false;
+    if (allowed) do {
+        const auto type = gst_rtcp_packet_get_type(&packet);
+        if (type == GST_RTCP_TYPE_SR) {
+            guint32 ssrc{}, timestamp{}, packets{}, octets{}; guint64 ntp{};
+            gst_rtcp_packet_sr_get_sender_info(&packet, &ssrc, &ntp, &timestamp, &packets, &octets);
+            allowed = known_ssrc(ssrc); saw_report = true;
+        } else if (type == GST_RTCP_TYPE_SDES) {
+            guint items{};
+            allowed = gst_rtcp_packet_sdes_first_item(&packet);
+            if (allowed) do {
+                if (!known_ssrc(gst_rtcp_packet_sdes_get_ssrc(&packet))) { allowed = false; break; }
+                ++items;
+            } while (gst_rtcp_packet_sdes_next_item(&packet));
+            allowed = allowed && items == gst_rtcp_packet_sdes_get_item_count(&packet);
+        } else allowed = false;
+        if (!allowed) break;
+    } while (gst_rtcp_packet_move_to_next(&packet));
+    gst_rtcp_buffer_unmap(&map);
+    return allowed && saw_report;
 }
 
 } // namespace avsync::net

@@ -46,6 +46,10 @@ isolated real-capture development, not production deployment.
   provenance, ordered PCM association and finite generation admission.
 - [ ] Automatic provider/sender restart handshake, loaded loss/reordering/recovery
   and sustained original-anchor uncertainty characterization.
+- [x] Finite process-agreement fixture with pinned sender identities, stdin
+  control leases, bounded pair-restart policy and explicit IPC-v2 retirement.
+  Generated tests qualify these software boundaries only; live restart, remote
+  wrapper fencing and installed startup remain open. See [process control](process-pair-control.md).
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 - [x] Offline desktop feed-forward worker: provisional rate acquisition, fixed-quantum
   command slew, owned bounded queues, original-anchor origin and explicit reset.

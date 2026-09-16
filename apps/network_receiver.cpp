@@ -8,6 +8,7 @@
 #include <gio/gio.h>
 #include "avsync/network_clock.hpp"
 #include "avsync/rtp_audio_anchor.hpp"
+#include "avsync/process_control.hpp"
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
 #include "avsync/audio_diagnostic.hpp"
 #endif
@@ -49,15 +50,28 @@ unsigned number(const char* value, unsigned low, unsigned high) {
             "Invalid numeric argument");
     return result;
 }
+std::uint64_t identity(const char* value) {
+    std::uint64_t result{};
+    const std::string_view text(value);
+    const auto parsed = std::from_chars(text.data(), text.data()+text.size(), result);
+    require(parsed.ec == std::errc{} && parsed.ptr == text.data()+text.size() && result,
+            "Identity must be a nonzero unsigned 64-bit decimal integer");
+    return result;
+}
 struct Options {
     std::string bind, peer, desktop_ipc;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
     bool expect_media{}, expect_anchors{}, correct_desktop{}, recover_desktop_ipc{};
+    bool control_stdin{}, replace_desktop_ipc{};
+    std::optional<std::uint64_t> expected_sender_session;
 };
 void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
                  " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
+                 " [--expect-sender-session N] (pin an explicit nonzero sender identity; requires anchors)\n"
+                 " [--control-stdin] (pinned process agreement, 5-second KEEPALIVE/STOP pipe lease)\n"
+                 " [--replace-desktop-ipc] (requires pinned control mode; retires validated previous IPC v2)\n"
                  " [--correct-desktop] (optional ASRC build; inspect/discard PCM, NEVER playback/OBS)\n"
                  " [--desktop-ipc NEW_PRIVATE_FILE] (explicit IPC+ASRC build; 2-second desktop buffer, no OBS changes)\n"
                  " [--recover-desktop-ipc] (opt in to at most 8 generations from the SAME sender session)\n"
@@ -127,7 +141,7 @@ void remember_original_failure(Branch& branch, avsync::wire::AudioWireStatus sta
 }
 class Receiver {
 public:
-    explicit Receiver(const Options& options) : options_(options), peer_(address(options.peer)) {
+    explicit Receiver(const Options& options) : options_(options), control_(options.control_stdin), peer_(address(options.peer)) {
         address(options.bind);
         require(options.clock_port != options.rtp_port && options.clock_port != options.rtcp_port &&
                 options.rtp_port != options.rtcp_port, "Ports must be distinct");
@@ -138,13 +152,19 @@ public:
         require(!options_.recover_desktop_ipc || !options_.desktop_ipc.empty(),
                 "Desktop recovery requires explicit desktop IPC output");
         do { clock_epoch_ = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!clock_epoch_);
-        admission_.emplace(clock_epoch_);
+        admission_.emplace(clock_epoch_, options_.expected_sender_session);
+        if (options_.expected_sender_session)
+            pinned_ingress_.emplace(clock_epoch_, *options_.expected_sender_session);
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
         avsync::DiagnosticAudioOutput destination;
 #ifdef AVSYNC_HAS_AUDIO_HANDOFF
-        if (!options_.desktop_ipc.empty()) {
-            require(!std::filesystem::exists(options_.desktop_ipc),"Desktop IPC requires a new private file");
-            handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,2'000'000'000);
+        // Honor buffered cancellation/EOF before mutating any prior mapping.
+        if (!options_.desktop_ipc.empty() && control_.poll() == avsync::process::ControlState::active) {
+            require(options_.replace_desktop_ipc || !std::filesystem::exists(options_.desktop_ipc),
+                    "Desktop IPC requires a new private file or explicit supervised replacement");
+            handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,2'000'000'000,
+                options_.replace_desktop_ipc ? avsync::ipc::ReplacementPolicy::retire_previous :
+                                              avsync::ipc::ReplacementPolicy::atomic_replace);
             destination={this,[](void* p,const avsync::CorrectedAudio& block,
                     std::span<const float> pcm,avsync::Nanoseconds now) noexcept {
                 auto* self=static_cast<Receiver*>(p);
@@ -153,6 +173,7 @@ public:
                 auto* self=static_cast<Receiver*>(p); if (self->handoff_) self->handoff_->revoke();
             },[](void* p,avsync::SessionToken) noexcept {
                 auto* self=static_cast<Receiver*>(p);
+                if (self->control_.poll() != avsync::process::ControlState::active) return false;
                 if (self->handoff_ && self->handoff_->valid()) return true;
                 try {
                     if (self->handoff_) {
@@ -161,7 +182,9 @@ public:
                         self->retired_ipc_peak_=std::max(self->retired_ipc_peak_,self->handoff_->queue_peak());
                         self->handoff_.reset();
                     }
-                    self->handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(self->options_.desktop_ipc,2'000'000'000);
+                    self->handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(self->options_.desktop_ipc,2'000'000'000,
+                        self->options_.replace_desktop_ipc ? avsync::ipc::ReplacementPolicy::retire_previous :
+                                                          avsync::ipc::ReplacementPolicy::atomic_replace);
                     ++self->ipc_recreations_; return true;
                 } catch (...) { return false; }
             }};
@@ -176,6 +199,9 @@ public:
 #endif
     }
     ~Receiver() {
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+        if (handoff_) handoff_->revoke(); // Also covers startup exceptions/control cancellation.
+#endif
         if (pipeline_) {
             gst_element_set_state(pipeline_, GST_STATE_NULL);
             gst_element_get_state(pipeline_, nullptr, nullptr, 5*GST_SECOND);
@@ -185,6 +211,8 @@ public:
         if (clock_) gst_object_unref(clock_);
     }
     int run() {
+        const auto run_started = Steady::now();
+        if (control_.poll() != avsync::process::ControlState::active) return early_control_exit();
         clock_ = gst_system_clock_obtain();
         require(clock_ != nullptr, "Cannot obtain shared clock");
         GstClockType clock_type;
@@ -223,16 +251,48 @@ public:
         gst_element_set_base_time(pipeline_, 0);
         require(gst_element_set_state(pipeline_, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE,
                 "Cannot start receiver");
+        if (options_.expected_sender_session) {
+            GstState current = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+            const auto ready_deadline = run_started + std::chrono::seconds(std::min(options_.seconds, 5u));
+            GstStateChangeReturn ready = GST_STATE_CHANGE_ASYNC;
+            do {
+                if (control_.poll() != avsync::process::ControlState::active) return early_control_exit();
+                ready = gst_element_get_state(pipeline_, &current, &pending, 20 * GST_MSECOND);
+            } while (ready == GST_STATE_CHANGE_ASYNC && Steady::now() < ready_deadline);
+            require((ready == GST_STATE_CHANGE_SUCCESS || ready == GST_STATE_CHANGE_NO_PREROLL) &&
+                    current == GST_STATE_PLAYING, "Receiver startup state did not become ready");
+        }
+        if (control_.poll() != avsync::process::ControlState::active) return early_control_exit();
         auto* bus = gst_element_get_bus(pipeline_);
+        if (options_.expected_sender_session) {
+            bool startup_error = false, drained = false;
+            for (unsigned count = 0; count < 256; ++count) {
+                auto* message = gst_bus_pop(bus);
+                if (!message) { drained = true; break; }
+                if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR || GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS)
+                    startup_error = true;
+                if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING) ++warnings_;
+                gst_message_unref(message);
+            }
+            if (startup_error || !drained || fatal_.load()) {
+                gst_object_unref(bus);
+                throw std::runtime_error("Receiver startup reported an error or exceeded its message budget");
+            }
+        }
         const auto start = Steady::now();
-        const auto deadline = start + std::chrono::seconds(options_.seconds);
+        const auto deadline = (options_.control_stdin ? run_started : start) + std::chrono::seconds(options_.seconds);
         std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic pcm_saved="
                   <<(options_.desktop_ipc.empty()?"false":"true")<<" clock_epoch="
                   << clock_epoch_ << "\n" << std::flush;
+        if (options_.expected_sender_session)
+            std::cout << "AVSYNC_CONTROL {\"schema\":1,\"event\":\"receiver_ready\",\"clock_epoch\":\""
+                      << clock_epoch_ << "\",\"sender_session\":\"" << *options_.expected_sender_session
+                      << "\"}\n" << std::flush;
         bool error = false;
         bool clock_paused = false, clock_resumed = false;
         std::optional<avsync::Nanoseconds> clock_pause_ns;
-        while (Steady::now() < deadline && !fatal_.load()) {
+        while (Steady::now() < deadline && !fatal_.load() &&
+               control_.poll() == avsync::process::ControlState::active) {
             if (options_.clock_pause_after) {
                 const auto elapsed = Steady::now()-start;
                 if (!clock_paused && elapsed >= std::chrono::seconds(options_.clock_pause_after)) {
@@ -295,6 +355,9 @@ public:
                   << "\"packets_accepted\":" << accepted_.load() << ",\"packets_rejected\":" << rejected_.load()
                   << ",\"invalid_sender_reports\":" << invalid_reports_.load()
                   << ",\"invalid_ingress_anchor_packets\":" << invalid_ingress_anchors_.load()
+                  << ",\"sender_session_pinned\":" << (options_.expected_sender_session ? "true" : "false")
+                  << ",\"foreign_identity_rtp_packets\":" << foreign_identity_rtp_.load()
+                  << ",\"unadmitted_rtcp_packets\":" << unadmitted_rtcp_.load()
                   << ",\"clock_pause_fixture\":" << (clock_paused ? "true" : "false")
                   << ",\"clock_resumed\":" << (clock_resumed ? "true" : "false")
                   << ",\"warnings\":" << warnings_
@@ -452,15 +515,30 @@ public:
 #endif
         }
 #endif
-        std::cout << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" :
+        const bool controlled_stop = control_.state() != avsync::process::ControlState::active;
+        std::cout << ",\"control_state\":\"" << avsync::process::state_name(control_.state()) << "\""
+            << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" :
+            controlled_stop ? avsync::process::state_name(control_.state()) :
             awaiting_generation ? "awaiting_media_generation" :
             recovered_with_gap && !bad_anchors && !invalid ? "recovered_with_gap" :
             bad_correction ? "correction_unqualified" : bad_anchors ? "original_anchors_unqualified" :
             !buffers ? "waiting_media" : !timed ? "priming_reference" : invalid ? "invalid_timing" :
             options_.expect_anchors ? "original_anchors_observed" : "timestamps_observed") << "\"}\n";
-        return error || fatal_ ? 1 : bad_correction || bad_anchors || (options_.expect_media && (!timed || invalid)) ? 3 : 0;
+        if (error || fatal_) return 1;
+        // STOP acknowledges control cleanup only; qualification/fault fields above
+        // remain independent. EOF/lease expiry/invalid input are failed control.
+        if (controlled_stop) return control_.state() == avsync::process::ControlState::stopped ? 0 : 1;
+        return bad_correction || bad_anchors || (options_.expect_media && (!timed || invalid)) ? 3 : 0;
     }
 private:
+    int early_control_exit() {
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+        if (handoff_) handoff_->revoke();
+#endif
+        std::cout << "{\"schema\":1,\"status\":\"" << avsync::process::state_name(control_.state())
+                  << "\",\"capture_timing_verified\":false}\n";
+        return control_.state() == avsync::process::ControlState::stopped ? 0 : 1;
+    }
     static void new_jitterbuffer(GstElement*, GstElement* jitterbuffer,
             guint session, guint, gpointer opaque) {
         if (session != 0) return;
@@ -536,6 +614,20 @@ private:
     }
     static GstPadProbeReturn observe_rtp(GstPad*, GstPadProbeInfo* info, gpointer opaque) {
         auto* self = static_cast<Receiver*>(opaque);
+        if (self->pinned_ingress_) {
+            avsync::net::PinnedIngressResult result;
+            {
+                std::lock_guard lock(self->report_mutex_);
+                result = self->pinned_ingress_->observe_rtp(GST_PAD_PROBE_INFO_BUFFER(info));
+            }
+            if (result == avsync::net::PinnedIngressResult::foreign_identity) {
+                ++self->foreign_identity_rtp_; return GST_PAD_PROBE_DROP;
+            }
+            if (result != avsync::net::PinnedIngressResult::accepted) {
+                ++self->invalid_ingress_anchors_; self->fatal_.store(true);
+                return GST_PAD_PROBE_DROP;
+            }
+        }
         std::uint32_t ssrc{}, timestamp{}, frames{};
         const auto record = avsync::net::read_audio_anchor(
             GST_PAD_PROBE_INFO_BUFFER(info), ssrc, timestamp, frames);
@@ -558,6 +650,12 @@ private:
         auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
         if (!buffer || !gst_rtcp_buffer_validate_reduced(buffer)) {
             ++self->invalid_reports_; return GST_PAD_PROBE_DROP;
+        }
+        if (self->pinned_ingress_) {
+            std::lock_guard lock(self->report_mutex_);
+            if (!self->pinned_ingress_->allows_rtcp(buffer)) {
+                ++self->unadmitted_rtcp_; return GST_PAD_PROBE_DROP;
+            }
         }
         GstRTCPBuffer rtcp = GST_RTCP_BUFFER_INIT;
         if (!gst_rtcp_buffer_map(buffer, GST_MAP_READ, &rtcp)) return GST_PAD_PROBE_DROP;
@@ -772,6 +870,7 @@ private:
         } catch (...) { fatal_.store(true); return false; }
     }
     Options options_;
+    avsync::process::StdinControl control_;
     Inet peer_;
     GstElement *pipeline_{}, *rtpbin_{};
     GstClock* clock_{};
@@ -780,6 +879,7 @@ private:
     std::mutex report_mutex_;
     std::mutex admission_mutex_;
     std::optional<avsync::wire::AudioStreamAdmission> admission_;
+    std::optional<avsync::net::PinnedAudioIngress> pinned_ingress_;
     std::uint64_t clock_epoch_{};
     std::array<ReportSlot, 8> reports_;
     std::vector<std::unique_ptr<Branch>> branches_;
@@ -787,6 +887,7 @@ private:
     std::atomic<std::uint64_t> accepted_{0}, rejected_{0};
     std::atomic<std::uint64_t> invalid_reports_{0};
     std::atomic<std::uint64_t> invalid_ingress_anchors_{0};
+    std::atomic<std::uint64_t> foreign_identity_rtp_{0}, unadmitted_rtcp_{0};
     std::uint64_t warnings_{};
     // Main bus-loop owner; constant storage for this finite diagnostic run.
     std::uint64_t jitter_drop_messages_{}, jitter_num_too_late_{}, jitter_num_drop_on_latency_{};
@@ -812,6 +913,12 @@ int main(int argc,char** argv) {
             if(arg=="--expect-anchors") { options.expect_anchors=true; continue; }
             if(arg=="--correct-desktop") { options.correct_desktop=true; options.expect_anchors=true; continue; }
             if(arg=="--recover-desktop-ipc") { options.recover_desktop_ipc=true; continue; }
+            if(arg=="--control-stdin") {
+                require(!options.control_stdin,"Duplicate control option"); options.control_stdin=true; continue;
+            }
+            if(arg=="--replace-desktop-ipc") {
+                require(!options.replace_desktop_ipc,"Duplicate replacement option"); options.replace_desktop_ipc=true; continue;
+            }
             require(i+1<argc,"Missing option value");
             const auto* value=argv[++i];
             if(arg=="--bind") options.bind=value;
@@ -820,6 +927,10 @@ int main(int argc,char** argv) {
             else if(arg=="--rtp-port") options.rtp_port=number(value,1024,65535);
             else if(arg=="--rtcp-port") options.rtcp_port=number(value,1024,65535);
             else if(arg=="--seconds") options.seconds=number(value,1,180);
+            else if(arg=="--expect-sender-session") {
+                require(!options.expected_sender_session, "Duplicate expected sender session");
+                options.expected_sender_session=identity(value);
+            }
             else if(arg=="--desktop-ipc") { options.desktop_ipc=value; options.correct_desktop=true; options.expect_anchors=true; }
             else if(arg=="--clock-pause-after") options.clock_pause_after=number(value,1,179);
             else if(arg=="--clock-pause-seconds") options.clock_pause_seconds=number(value,1,10);
@@ -827,6 +938,12 @@ int main(int argc,char** argv) {
         }
         require(!options.bind.empty() && !options.peer.empty() && options.clock_port && options.rtp_port && options.rtcp_port,
                 "Explicit bind, peer and three ports are required");
+        require(!options.expected_sender_session || options.expect_anchors,
+                "Pinned sender identity requires original-anchor mode");
+        require(!options.control_stdin || options.expected_sender_session,
+                "Control stdin requires an explicit pinned sender identity");
+        require(!options.replace_desktop_ipc || (options.control_stdin && !options.desktop_ipc.empty()),
+                "IPC replacement requires explicit desktop output and pinned stdin control");
         gst_init(nullptr,nullptr);
         Receiver receiver(options);
         return receiver.run();

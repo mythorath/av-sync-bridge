@@ -85,11 +85,13 @@ private:
 
 // Global diagnostic-run admission, after successful per-branch validation.
 // Foreign sender sessions require an explicit new run/control agreement; this
-// helper never infers identity from arrival order. External caller serializes it.
+// helper never switches sessions by arrival order. With an expected session,
+// even initial admission is pinned. External caller serializes it.
 class AudioStreamAdmission {
 public:
     static constexpr std::size_t maximum_ssrcs = 8;
-    explicit AudioStreamAdmission(std::uint64_t expected_clock_epoch);
+    explicit AudioStreamAdmission(std::uint64_t expected_clock_epoch,
+        std::optional<std::uint64_t> expected_sender_session = std::nullopt);
     [[nodiscard]] bool admit(const AudioRecord&, std::uint32_t ssrc) noexcept;
     [[nodiscard]] std::optional<SessionToken> active_epoch() const noexcept { return active_epoch_; }
     [[nodiscard]] std::optional<std::uint32_t> active_ssrc() const noexcept
@@ -97,6 +99,7 @@ public:
     [[nodiscard]] std::size_t admitted_ssrc_count() const noexcept { return count_; }
 private:
     std::uint64_t expected_clock_epoch_{};
+    std::optional<std::uint64_t> expected_sender_session_;
     std::optional<SessionToken> active_epoch_;
     std::uint32_t active_ssrc_{};
     std::array<std::uint32_t, maximum_ssrcs> history_{};

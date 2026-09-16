@@ -17,12 +17,15 @@ These paths are now connected for [isolated combined physical tests](docs/physic
 not normal OBS operation. Following clock-freshness, video-publication and
 reference-scheduling fixes, three unchanged-setting physical timing passes
 succeeded. Production integration, loaded stability and whole-process/reboot
-recovery remain unqualified. See the [current checkpoint](docs/checkpoint-2026-09-15.md).
+recovery remain unqualified. See the [current checkpoint](docs/checkpoint-2026-09-16.md).
 A separate [metadata-only WASAPI probe](docs/windows-capture.md)
 remains available without transmitting PCM.
 Opt-in [same-sender recovery](docs/desktop-recovery.md) has now reconnected an
 isolated OBS recording after a planned clock interruption, with a measured
 silence gap. It is not whole-process or reboot recovery.
+A [finite process-pair controller](docs/process-pair-control.md) now adds explicit
+sender/provider agreement, controller-loss shutdown and validated IPC replacement.
+Generated control/IPC tests are not a physical restart or production verdict.
 
 ## Intended use
 

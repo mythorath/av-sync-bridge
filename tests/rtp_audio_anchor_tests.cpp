@@ -338,22 +338,95 @@ void fail_closed_tests() {
     CHECK(!deliver(ahead_receiver, ahead.get(), arrival(180)).accepted && ahead_receiver.faulted());
 }
 
-Buffer sender_report() {
+Buffer sender_report(std::uint32_t report_ssrc = ssrc_value, std::uint32_t description_ssrc = ssrc_value) {
     Buffer result(gst_rtcp_buffer_new(256));
     CHECK(result);
     GstRTCPBuffer map = GST_RTCP_BUFFER_INIT;
     CHECK(gst_rtcp_buffer_map(result.get(), GST_MAP_READWRITE, &map));
     GstRTCPPacket sr, sdes;
     CHECK(gst_rtcp_buffer_add_packet(&map, GST_RTCP_TYPE_SR, &sr));
-    gst_rtcp_packet_sr_set_sender_info(&sr, ssrc_value, 10ULL << 32, rtp_zero, 1, 1080);
+    gst_rtcp_packet_sr_set_sender_info(&sr, report_ssrc, 10ULL << 32, rtp_zero, 1, 1080);
     CHECK(gst_rtcp_buffer_add_packet(&map, GST_RTCP_TYPE_SDES, &sdes));
-    CHECK(gst_rtcp_packet_sdes_add_item(&sdes, ssrc_value));
+    CHECK(gst_rtcp_packet_sdes_add_item(&sdes, description_ssrc));
     constexpr std::array<guint8, 7> cname{'f','i','x','t','u','r','e'};
     CHECK(gst_rtcp_packet_sdes_add_entry(&sdes, GST_RTCP_SDES_CNAME,
         static_cast<guint8>(cname.size()), cname.data()));
     CHECK(gst_rtcp_buffer_unmap(&map));
     CHECK(gst_rtcp_buffer_validate(result.get()));
     return result;
+}
+
+void pinned_ingress_tests() {
+    using avsync::net::PinnedAudioIngress;
+    using Result = avsync::net::PinnedIngressResult;
+    auto custom = [](AudioRecord record, std::uint32_t ssrc) {
+        auto result = packet(record.packet_wire_start, 180, false);
+        GstRTPBuffer map = GST_RTP_BUFFER_INIT;
+        CHECK(gst_rtp_buffer_map(result.get(), GST_MAP_READWRITE, &map));
+        gst_rtp_buffer_set_ssrc(&map, ssrc);
+        gst_rtp_buffer_unmap(&map);
+        auto* value = result.release();
+        CHECK(avsync::net::add_audio_anchor(value, record)); result.reset(value);
+        return result;
+    };
+    PinnedAudioIngress ingress(clock_epoch, 17);
+    CHECK(!ingress.known_ssrc(0) && !ingress.known_ssrc(ssrc_value));
+    CHECK(!ingress.allows_rtcp(nullptr));
+    CHECK(!ingress.allows_rtcp(sender_report().get())); // No RTCP-first allocation.
+    CHECK(ingress.observe_rtp(nullptr) == Result::malformed);
+    auto plain = packet(0, 180, false);
+    CHECK(ingress.observe_rtp(plain.get()) == Result::malformed);
+    for (unsigned i = 0; i < 32; ++i) {
+        auto foreign = record_for(0);
+        if (i % 2) ++foreign.clock_epoch;
+        else ++foreign.epoch.session;
+        auto value = custom(foreign, ssrc_value + i);
+        CHECK(ingress.observe_rtp(value.get()) == Result::foreign_identity);
+        CHECK(ingress.ssrc_count() == 0);
+        CHECK(!ingress.allows_rtcp(sender_report(ssrc_value + i, ssrc_value + i).get()));
+    }
+    // Malformed framing is never excused as an old process, even if its body
+    // names a foreign identity. Ordered active corruption still fails closed.
+    auto foreign = record_for(0); ++foreign.epoch.session;
+    auto malformed = custom(foreign, ssrc_value);
+    byte(malformed.get(), 114, 1);
+    CHECK(ingress.observe_rtp(malformed.get()) == Result::malformed);
+    auto bad_timestamp = packet(0, 180); byte(bad_timestamp.get(), 7, 1);
+    CHECK(ingress.observe_rtp(bad_timestamp.get()) == Result::malformed);
+    auto zero_ssrc = custom(record_for(0), 0);
+    CHECK(ingress.observe_rtp(zero_ssrc.get()) == Result::malformed);
+    CHECK(ingress.ssrc_count() == 0);
+    auto expected = packet(0, 180);
+    CHECK(ingress.observe_rtp(expected.get()) == Result::accepted);
+    CHECK(ingress.known_ssrc(ssrc_value) && ingress.ssrc_count() == 1);
+    CHECK(ingress.allows_rtcp(sender_report().get()));
+    CHECK(!ingress.allows_rtcp(sender_report(ssrc_value + 1, ssrc_value).get()));
+    CHECK(!ingress.allows_rtcp(sender_report(ssrc_value, ssrc_value + 1).get()));
+    auto invalid_report = sender_report(); byte(invalid_report.get(), 0, 0);
+    CHECK(!ingress.allows_rtcp(invalid_report.get()));
+    CHECK(ingress.observe_rtp(expected.get()) == Result::accepted && ingress.ssrc_count() == 1);
+    // Pre-jitter matching is NOT admission: timestamp-consistent reordered or
+    // discontinuous packets still reach the strict ordered validator unchanged.
+    auto reordered = packet(360, 180);
+    CHECK(ingress.observe_rtp(reordered.get()) == Result::accepted);
+    AudioReceiverValidator validator(clock_epoch);
+    CHECK(deliver(validator, expected.get(), arrival(0)).accepted);
+    CHECK(!deliver(validator, reordered.get(), arrival(360)).accepted && validator.faulted());
+    for (unsigned i = 1; i < avsync::wire::AudioStreamAdmission::maximum_ssrcs; ++i) {
+        auto value = custom(record_for(0), ssrc_value + i);
+        CHECK(ingress.observe_rtp(value.get()) == Result::accepted);
+    }
+    CHECK(ingress.ssrc_count() == avsync::wire::AudioStreamAdmission::maximum_ssrcs);
+    auto overflow = custom(record_for(0), ssrc_value + 8);
+    CHECK(ingress.observe_rtp(overflow.get()) == Result::capacity_exhausted);
+    CHECK(!ingress.allows_rtcp(sender_report(ssrc_value + 8, ssrc_value + 8).get()));
+    CHECK(ingress.observe_rtp(expected.get()) == Result::accepted);
+    for (const auto pair : {std::pair<std::uint64_t, std::uint64_t>{0, 17}, {clock_epoch, 0}}) {
+        bool rejected = false;
+        try { PinnedAudioIngress invalid(pair.first, pair.second); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
 }
 
 // Synchronous calls into the real rtpsession sink pads impose an exact order
@@ -559,7 +632,8 @@ void startup_jitter_tests() {
 int main() {
     try {
         gst_init(nullptr, nullptr);
-        adapter_tests(); generated_transport_tests(); fail_closed_tests(); startup_probation_tests(); startup_jitter_tests();
+        adapter_tests(); generated_transport_tests(); fail_closed_tests(); pinned_ingress_tests();
+        startup_probation_tests(); startup_jitter_tests();
         std::cout << checks << " RTP anchor / generated L24 checks passed; no live capture or network\n";
         return 0;
     } catch (const std::exception& error) {

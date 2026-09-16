@@ -42,6 +42,14 @@ The project downmix preserves left/right balance, excludes the LFE channel, and 
 
 ## Clock and wire contract
 
+Optional `--sender-session NONZERO_UINT64` lets an explicit coordinator pin the
+process identity agreed with the receiver; default manual runs still generate
+their own identity. `--control-stdin` requires that explicit identity and polls
+a five-second KEEPALIVE/STOP pipe lease during clock acquisition and capture.
+EOF, invalid input or expiry stops the run; an expired lease cannot be revived.
+Its `sender_started` acknowledgment precedes clock qualification and does not
+prove PCM is flowing. See [finite process-pair control](process-pair-control.md).
+
 The Linux test receiver provides a monotonic media clock through `GstNetTimeProvider`. The Windows sender obtains it through `GstNetClientClock`. This changes no operating-system clock. Startup requires both a synchronized client and the helper's explicit health checks. The raw Windows QPC / GStreamer internal-clock relationship is checked at runtime. Historical WASAPI QPC values are mapped through the **underlying network clock's calibration**, not through the wrapper's already adjusted time and not through packet arrival time. See [network clock helper](network-clock.md) and [GStreamer network clocks](https://gstreamer.freedesktop.org/documentation/net/gstnetclientclock.html).
 
 The sender's pipeline uses base time zero and start time `GST_CLOCK_TIME_NONE`.

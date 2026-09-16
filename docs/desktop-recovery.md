@@ -75,7 +75,9 @@ per-generation faults, not equate process liveness or recovery with a clean run.
 
 This is not complete reboot/process-restart recovery. A new sender process has
 a new session identity, and a receiver restart has a new provider clock token;
-those require a separate authorized rendezvous/startup manager. A receiver-only
+those require a separate authorized rendezvous/startup manager. The new
+[finite process-pair control fixture](process-pair-control.md) begins that work;
+it is not an installed service or physical restart qualification. A receiver-only
 packet/metadata failure is not repaired by pretending later packets belong to a
 new generation. The current peer filter is not authentication or encryption.
 

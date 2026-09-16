@@ -21,6 +21,7 @@ struct Config {
 enum class ReadResult { ok, empty, busy, disconnected, invalid, buffer_too_small, stale };
 enum class WriteResult { ok, busy, disconnected, invalid };
 enum class AllocationPolicy { sparse, reserve_and_prefault };
+enum class ReplacementPolicy { atomic_replace, retire_previous };
 
 // Maximum explicit audio handoff lead. Long intentional delays remain in the ring.
 inline constexpr std::int64_t max_audio_lookahead_ns = 100000000;
@@ -56,8 +57,20 @@ public:
     // and removes only this attempt's temporary file. No sparse fallback is used.
     // This is initialization work, not memory locking: pages can later be reclaimed
     // or swapped, so it does not guarantee zero future faults or real-time latency.
+    // retire_previous is an explicit process-restart operation: after acquiring
+    // the unchanged singleton sidecar, validate a protocol-v2 predecessor's own
+    // inode and sidecar inode bindings, trylock its mutex, and mark it offline
+    // BEFORE publishing the successor. Busy/unsafe/unrecognized predecessors are
+    // refused; heartbeat expiry is never takeover authority. A missing sidecar
+    // beside an existing mapping is refused. No v1 conversion is attempted.
+    // Allocation/setup failure before retirement preserves the predecessor; a
+    // final rename failure after retirement deliberately leaves it offline.
+    // This assumes cooperative same-user ownership; it is not a hostile-owner
+    // sandbox. Never unlink/replace the singleton sidecar while a writer lives.
+    // Protocol v2 requires matching rebuilt producers/readers/OBS adapters.
     explicit Writer(std::string path, const Config& config,
-                    AllocationPolicy allocation = AllocationPolicy::sparse);
+                    AllocationPolicy allocation = AllocationPolicy::sparse,
+                    ReplacementPolicy replacement = ReplacementPolicy::atomic_replace);
     ~Writer();
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;

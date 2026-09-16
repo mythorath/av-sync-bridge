@@ -11,7 +11,10 @@ namespace avsync {
 // No source is automatically added to OBS; no microphone/video is published.
 class CorrectedAudioHandoff {
 public:
-    CorrectedAudioHandoff(std::string path, Nanoseconds delay_ns);
+    // Process replacement is explicit; see IPC's strict predecessor-retirement
+    // contract. Default same-owner diagnostic behavior remains unchanged.
+    CorrectedAudioHandoff(std::string path, Nanoseconds delay_ns,
+        ipc::ReplacementPolicy replacement = ipc::ReplacementPolicy::atomic_replace);
     bool consume(const CorrectedAudio&, std::span<const float>, Nanoseconds now) noexcept;
     void revoke() noexcept;
     bool heartbeat(Nanoseconds now) noexcept;

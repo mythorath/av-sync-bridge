@@ -208,15 +208,19 @@ std::optional<RateEstimate> AudioReceiverValidator::current_estimate(Nanoseconds
     return !faulted_ && tracker_ ? tracker_->current_estimate(now) : std::nullopt;
 }
 
-AudioStreamAdmission::AudioStreamAdmission(std::uint64_t expected_clock_epoch)
-    : expected_clock_epoch_(expected_clock_epoch)
+AudioStreamAdmission::AudioStreamAdmission(std::uint64_t expected_clock_epoch,
+        std::optional<std::uint64_t> expected_sender_session)
+    : expected_clock_epoch_(expected_clock_epoch), expected_sender_session_(expected_sender_session)
 {
     if (!expected_clock_epoch) throw std::invalid_argument("expected provider clock epoch must be nonzero");
+    if (expected_sender_session && !*expected_sender_session)
+        throw std::invalid_argument("expected sender session must be nonzero");
 }
 
 bool AudioStreamAdmission::admit(const AudioRecord& record, std::uint32_t ssrc) noexcept
 {
     if (!ssrc || !valid_record(record) || record.clock_epoch != expected_clock_epoch_) return false;
+    if (expected_sender_session_ && record.epoch.session != *expected_sender_session_) return false;
     if (active_epoch_) {
         if (record.epoch == *active_epoch_) return ssrc == active_ssrc_;
         if (record.epoch.session != active_epoch_->session ||

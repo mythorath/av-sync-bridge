@@ -1,8 +1,10 @@
 # Bounded network receiver diagnostics
 
 The optional Linux `avsync-network-receiver` provides a shared monotonic clock
-and inspects desktop PCM received through RTP/RTCP. It never opens an audio
-device, saves PCM, changes OBS, or feeds the IPC playout bridge. This is a
+and inspects desktop PCM received through RTP/RTCP. Its default inspect/discard
+mode never opens an audio device, saves PCM, changes OBS, or publishes IPC.
+The explicit optional `--desktop-ipc` mode instead publishes corrected PCM to a
+private buffer; see [handoff](startup-handoff-validation.md). This is a
 transport/timestamp experiment, not an audible or physical A/V validation.
 
 ```text
@@ -42,6 +44,21 @@ from the receiver's READY line into the sender's required `--clock-epoch` option
 Restarting the receiver requires a new token and a new sender invocation. This
 manual finite-run agreement does not implement authentication or unattended
 recovery. A provider pause within the same diagnostic retains its epoch.
+
+For an explicitly coordinated run, `--expect-sender-session NONZERO_UINT64`
+pins the sender before first-packet admission and requires original-anchor mode.
+Well-formed RTP bearing another provider/session is counted and discarded before
+jitter-buffer branches or report slots are allocated. RTCP is accepted only for
+SSRCs already seen in valid pinned RTP. This is not authentication: a colliding
+SSRC in old RTCP can still match; RTCP alone cannot authorize foreign RTP PCM.
+Malformed active RTP and existing continuity/clock/correction failures remain
+fail-closed. The fixed eight-SSRC budget is unchanged.
+
+`--control-stdin` requires that pin and enables a bounded controller lease;
+`--replace-desktop-ipc` additionally requires explicit desktop output and opts into
+validated predecessor retirement using IPC v2. An existing mapping is never
+deleted to bypass its ownership checks. See [process-pair control](process-pair-control.md)
+for readiness, stop/EOF semantics and the remaining physical/production gates.
 
 Each received SSRC gets a bounded appsink. In original-anchor mode, the app
 validates the extension and PCM inside the same owned, ordered RTP buffer,
