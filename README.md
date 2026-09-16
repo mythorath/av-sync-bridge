@@ -74,8 +74,11 @@ now combines validated PCM, original-clock estimates and bounded resampling;
 see its [generated-media results and open gates](docs/audio-correction-validation.md).
 A [model-based phase safeguard](docs/audio-phase-guard.md) now checks that worker
 against original capture anchors before releasing output. It passes separate
-generated-waveform and fault checks, not live A/V validation. Sound-quality/load
-gates, live adaptive correction and combined physical A/V delivery remain open.
+generated-waveform and fault checks, not live A/V validation. The
+[quality/resource and isolated live correction milestone](docs/audio-live-correction-validation.md)
+now exercises actual desktop PCM through ASRC in an explicit inspect-and-discard
+receiver mode. It is **not connected to OBS**. Loaded clock/recovery reliability,
+physical calibration and combined A/V delivery remain open.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

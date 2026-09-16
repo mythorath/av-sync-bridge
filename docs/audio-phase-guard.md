@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # Model-based audio phase guard
 
-Status: **offline-tested runtime safeguard; not enabled on live audio or OBS**.
+Status: **offline-tested runtime safeguard, now used in the optional live desktop
+inspect-and-discard diagnostic; no OBS output**. See
+[live boundary evidence](audio-live-correction-validation.md).
 The worker checks every proposed output sample against original capture anchors
 before calling the DSP or exposing that quantum. This monitors timing consistency,
 not acoustic events or the correctness of capture metadata.

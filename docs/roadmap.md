@@ -51,11 +51,15 @@ isolated real-capture development, not production deployment.
   command slew, owned bounded queues, original-anchor origin and explicit reset.
 - [x] Model-based runtime phase guard, pinned backend audit, independent linear-PCM
   phase check and fault/no-false-alarm fixtures with generated media.
-- [ ] Complete variable-ratio sound-quality/resource gates and source-timestamp
-  uncertainty validation before activating that worker on live PCM.
+- [x] Variable-ratio sound-quality fixtures, worker allocation/failure audit and
+  individual-call paced CPU measurements (affinity-conditioned pass on test host).
+- [x] Combined generated 192 kHz conversion/RTP/correction marker checks and
+  bounded desktop-only live inspect-and-discard adapter; no OBS output.
+- [ ] Loaded clock/recovery repeatability, source-timestamp uncertainty and
+  complete resource qualification before a production or OBS correction path.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
-gates. No live microphone/correction path, RTX, combined real A/V OBS handoff,
+gates. No live microphone path, RTX, combined real A/V OBS handoff,
 or production startup migration is included yet. See [network validation](network-validation.md)
 and [physical video validation](video-validation.md) for actual scope and faults.
 The [ASRC design](asrc-design.md) first requires original device-clock anchors to
@@ -64,9 +68,9 @@ See [offline DSP evidence](asrc-validation.md), the measured old
 [conversion failure](conversion-timing.md) and the
 [nominal conversion replacement](nominal-audio-validation.md). A tested resampler is not a completed
 live rate controller. The [original-anchor transport milestone](audio-anchor-transport-validation.md)
-preserves the timing relationship diagnostically; it does not yet drive ASRC or OBS.
-The [offline correction worker](audio-correction.md) now drives ASRC from generated
-original anchors. See its [validation report](audio-correction-validation.md);
+preserves the timing relationship. The [bounded correction worker](audio-correction.md)
+now also drives ASRC from actual desktop packets in an isolated diagnostic.
+See [quality/resource and live results](audio-live-correction-validation.md);
 the broader live controller gate remains open.
 
 If the shared timestamp relationship does not survive either capture or OBS

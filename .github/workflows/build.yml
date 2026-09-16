@@ -66,13 +66,18 @@ jobs:
       fail-fast: false
       matrix:
         sanitizers: ["OFF", "ON"]
+        include:
+          - sanitizers: "OFF"
+            allocation_audit: "ON"
+          - sanitizers: "ON"
+            allocation_audit: "OFF"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           persist-credentials: false
-      - name: Install optional resampler development files
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsamplerate0-dev
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAVSYNC_BUILD_ASRC=ON -DAVSYNC_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
+      - name: Install optional resampler and packet fixture development files
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsamplerate0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAVSYNC_BUILD_ASRC=ON -DAVSYNC_BUILD_NETWORK=ON -DAVSYNC_BUILD_ALLOCATION_AUDIT=${{ matrix.allocation_audit }} -DAVSYNC_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
       - run: cmake --build build --parallel 2
       - name: Synthetic ASRC and negative controls (no devices, playback or network)
         run: ctest --test-dir build --output-on-failure --timeout 30

@@ -99,14 +99,51 @@ active generation, with its latest estimate still in range. Earlier generations
 and repeated anchors cannot satisfy this gate. Reports expose all out-of-range
 windows, rather than concealing them. Qualification is explicitly **historical**:
 the receiver normally outlives its finite sender, and it does not claim present
-lock, physical capture accuracy, or active correction. Neither mode submits
-audio to the resampler or OBS. Missing/lost media currently faults the generation;
+lock, physical capture accuracy, or active correction. Those two modes do not
+submit audio to the resampler or OBS. Missing/lost media currently faults the generation;
 RTX and seamless re-priming are separate work.
 
 Runtime dependencies include rtpbin, udpsrc, rtpL24depay and appsink. Build with
 `AVSYNC_BUILD_NETWORK=ON`; see [building](building.md). Help/default CTest does
 not bind sockets or capture audio. Do not publish local addresses, hostnames or
 raw device logs in public bug reports.
+
+## Opt-in correction diagnostic (still no OBS output)
+
+Build with both `AVSYNC_BUILD_NETWORK=ON` and `AVSYNC_BUILD_ASRC=ON`, then add
+`--correct-desktop`. This implies `--expect-anchors` and requires the audited
+libsamplerate version. It does not affect default diagnostics or production
+routes. Follow [measured quality/resource limits](audio-live-correction-validation.md)
+before a live trial; on the tested host only the explicitly CPU-affined paced
+trial met the proposed p99 CPU gate. Affinity is not installed automatically.
+
+The ordered RTP callback validates the original record and decodes its same
+packet's signed stereo L24 payload into an owned fixed-size float block. A short
+mutex-protected copy places it in a 64-packet queue. The receiver's ordinary
+main thread polls at 2 ms, drains at most 64 packets, and performs at most eight
+480-frame DSP calls per dispatch. No DSP executes in the network callback and
+no OBS callback is involved. Queue residence over 100 ms, overflow and backward
+local time fail the diagnostic; the correction worker has its separate bounded
+input/output/phase ledger and health watchdog.
+
+The worker observes frame zero during RTCP startup but discards all priming
+PCM. Running output additionally requires a sender report received within two
+seconds. Missing/stale reports or a provider pause fail the current generation,
+clear filter/queue state and require a separately admitted new generation.
+There is no arrival-time rate estimate or timestamp rebasing. Corrected PCM is
+inspected for finite values/levels and immediately discarded. No output is
+audible, saved, scheduled for presentation, or submitted to IPC/OBS.
+
+Reports separate ingress, ordered original frames, priming discards and corrected
+frames. A normal correction diagnostic requires exactly one running session
+with at least one second of inspected output. The explicit clock-pause fixture
+requires exactly two, with the first health fault observed within 100 ms after
+the actual provider-pause edge and the second running. Extra unplanned recovery,
+wrong fault reasons/timing, queue failure or missing output return exit 3 rather
+than treating eventual recovery as a pass. The first fault timestamp is retained.
+Keep the sender active through the receiver deadline for this finite verdict:
+ordinary sender termination correctly makes the diagnostic's current generation
+stale. Teardown tails are not an exact sender/receiver packet-count test.
 
 ## Explicit clock-loss fixture
 

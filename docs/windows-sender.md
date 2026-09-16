@@ -100,12 +100,28 @@ These are fail-visible prototype policies, not proven seamless recovery. In
 particular, **fixed-rate conversion is not adaptive device-clock correction**.
 A sound device can drift against the shared clock even when network timing is
 accurate. A bounded ASRC backend is tested offline; original-anchor transport is
-now a finite diagnostic. Its live controller and combined real A/V path remain
-unimplemented.
+now a finite diagnostic. The receiver's explicit
+[`--correct-desktop` experiment](audio-live-correction-validation.md) can inspect
+and discard corrected real PCM; combined A/V presentation and OBS delivery
+remain unimplemented.
 
 ## Output, build, and validation gates
 
 The final JSON contains format metadata, capture/mapping counters, resets/drops, clock-health observations, paired first/last device/QPC/mapped timestamps, and RTP/RTCP output counters. `rtp_packets_at_output` is observed at the sender's output pad **before** the UDP sink; it is not proof of socket delivery or receiver playback. `last_sr_clock_32_32` uses the agreed monotonic convention, not wall time. Raw clock RTT and observation age are diagnostics, not a guaranteed synchronization-error bound.
+
+Clock qualification loss now retains its cause **before** resetting the monitor:
+up to eight edge snapshots contain a fixed reason, elapsed time, observation
+age, RTT, calibration rate and mapped-packet count, plus the total loss count.
+Final `clock_reason=no statistics` therefore no longer erases the earlier cause.
+These snapshots contain no PCM or endpoint identities.
+
+The sender explicitly sets and reads back a 250 ms maximum polling/retry timeout
+on the underlying network clock, not the wrapper's unrelated inherited timeout.
+The 100 ms minimum update interval and all existing clock-health rejection
+limits stay unchanged. This is a bounded diagnostic polling policy, not an OS
+clock change, NTP configuration or guaranteed maximum time to an accepted
+observation; upstream still rejects unsuitable RTT measurements. See the
+[measured follow-up and limits](audio-live-correction-validation.md).
 
 Rejection diagnostics distinguish invalid mapping, invalid current clock, future beyond the bound, stale data, nonmonotonic data, unhealthy clock, and post-build deadline/window failures. They retain at most the first eight rejected-packet examples plus the final rejection, and aggregate timestamp-difference ranges. The calibration snapshot is taken after the actual mapping and can differ if a concurrent calibration update occurs. No rejected PCM is logged. The pure capture-window tests cover exact boundaries, invalid inputs, asymmetric limits, near-overflow values, and consistent pre/post-work decisions without opening an endpoint or network connection.
 

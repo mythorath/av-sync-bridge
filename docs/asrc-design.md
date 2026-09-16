@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # Receiver ASRC: design and staged implementation
 
-Status: **complete-system design with offline-tested components, 2026-09-15**.
+Status: **complete-system design with tested components and an isolated live
+desktop diagnostic, 2026-09-15**.
 The [bounded DSP backend](asrc-backend.md), [original-anchor metadata policy](audio-anchors.md)
 and [generated-signal fixture](asrc-validation.md) are now implemented separately.
 The [original-anchor wire diagnostic](audio-anchor-transport-validation.md) now
@@ -9,9 +10,12 @@ preserves that timing separately from nominal RTP progression. A bounded
 [offline feed-forward worker](audio-correction.md) implements acquisition,
 fixed-quantum command control and failure/reset handling. A separate
 [model-based phase guard](audio-phase-guard.md) now monitors that offline worker;
-live integration and full uncertainty/quality/resource gates remain open. There is still no hardware/OBS
-synchronization claim. The [old conversion diagnostic](conversion-timing.md)
-measured the gate-zero failure predicted below; live activation stays off.
+the [quality/resource and live diagnostic](audio-live-correction-validation.md)
+now extends those checks to real desktop PCM, with output inspected and discarded.
+Full uncertainty, sustained-load and OBS integration gates remain open. There
+is still no hardware/OBS synchronization claim. The
+[old conversion diagnostic](conversion-timing.md) measured the gate-zero failure
+predicted below; production activation stays off.
 The contracts in [network-clock.md](network-clock.md),
 [audio-conversion.md](audio-conversion.md), and [timing.md](timing.md) remain
 authoritative. This first milestone concerns desktop audio, not the microphone.
@@ -95,9 +99,9 @@ The **offline ASRC harness with independently generated anchors**, conversion
 observability fixture, and timestamp-free nominal converter are now implemented
 and tested separately. The bounded [original-anchor transport diagnostic](audio-anchor-transport-validation.md)
 also preserves original metadata and its exact nominal sample association.
-Live correction remains disabled: the owned-PCM correction worker now has an
-offline fixture and model-based phase guard. Changing-ratio signal-quality/resource
-gates, source-timestamp uncertainty and presentation scheduling still need measurements.
+Production correction remains disabled. The owned-PCM correction worker now has
+offline signal/phase/resource checks and an explicit isolated live diagnostic.
+Loaded source-timestamp uncertainty and presentation scheduling remain open.
 No silent timestamp rewrite is approved.
 
 ## Receiver placement and one correction owner
@@ -248,5 +252,7 @@ late drops, reset reason, ratio saturation, no-progress calls and stale anchors.
 Log aggregate timing/peak/resource diagnostics, not endpoint identities or PCM.
 The [offline worker/harness report](audio-correction-validation.md) now records
 the initial subset; [phase-guard evidence](audio-phase-validation.md) extends it.
-Variable-ratio quality, uncertainty and resource measurements are next; they must not change startup services,
-normal OBS sources, mute macros, or the current production audio route.
+The [quality/resource and live boundary report](audio-live-correction-validation.md)
+records the next measured subset. Remaining uncertainty, presentation and loaded
+recovery work must not silently change startup services, normal OBS sources,
+mute macros or the current production audio route.

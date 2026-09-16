@@ -8,6 +8,9 @@
 #include <gio/gio.h>
 #include "avsync/network_clock.hpp"
 #include "avsync/rtp_audio_anchor.hpp"
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+#include "avsync/audio_diagnostic.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -28,6 +31,12 @@
 namespace {
 using Steady = std::chrono::steady_clock;
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+avsync::Nanoseconds monotonic_now() {
+    const auto value=gst_util_get_timestamp();
+    require(value<=static_cast<guint64>(std::numeric_limits<avsync::Nanoseconds>::max()),
+            "Local monotonic timestamp overflow");
+    return static_cast<avsync::Nanoseconds>(value);
+}
 unsigned number(const char* value, unsigned low, unsigned high) {
     unsigned result{};
     const std::string_view text(value);
@@ -40,11 +49,12 @@ struct Options {
     std::string bind, peer;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
-    bool expect_media{}, expect_anchors{};
+    bool expect_media{}, expect_anchors{}, correct_desktop{};
 };
 void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
                  " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
+                 " [--correct-desktop] (optional ASRC build; inspect/discard PCM, NEVER playback/OBS)\n"
                  " [--clock-pause-after SECONDS --clock-pause-seconds 1..10] (test fixture only)\n"
                  "Explicit private-link diagnostic listener and shared monotonic clock provider.\n"
                  "PT96/L24/48kHz/stereo; accepts only the supplied peer's media packets.\n"
@@ -121,6 +131,11 @@ public:
                 "Clock pause needs both options and must finish before the diagnostic deadline");
         do { clock_epoch_ = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!clock_epoch_);
         admission_.emplace(clock_epoch_);
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+        if (options_.correct_desktop) correction_=std::make_unique<avsync::AudioCorrectionDiagnostic>(clock_epoch_);
+#else
+        require(!options_.correct_desktop,"Desktop correction requires an explicit optional ASRC build");
+#endif
     }
     ~Receiver() {
         if (pipeline_) {
@@ -173,15 +188,17 @@ public:
         auto* bus = gst_element_get_bus(pipeline_);
         const auto start = Steady::now();
         const auto deadline = start + std::chrono::seconds(options_.seconds);
-        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic metadata_only=true clock_epoch="
+        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic pcm_saved=false clock_epoch="
                   << clock_epoch_ << "\n" << std::flush;
         bool error = false;
         bool clock_paused = false, clock_resumed = false;
+        std::optional<avsync::Nanoseconds> clock_pause_ns;
         while (Steady::now() < deadline && !fatal_.load()) {
             if (options_.clock_pause_after) {
                 const auto elapsed = Steady::now()-start;
                 if (!clock_paused && elapsed >= std::chrono::seconds(options_.clock_pause_after)) {
                     g_object_set(provider_, "active", FALSE, nullptr);
+                    clock_pause_ns=monotonic_now();
                     clock_paused = true;
                 }
                 if (clock_paused && !clock_resumed && elapsed >=
@@ -190,7 +207,13 @@ public:
                     clock_resumed = true;
                 }
             }
-            auto* message = gst_bus_timed_pop_filtered(bus, 100*GST_MSECOND,
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+            if (correction_) {
+                correction_->tick(monotonic_now(),!clock_paused || clock_resumed);
+                if (correction_->failed()) { error=true; break; }
+            }
+#endif
+            auto* message = gst_bus_timed_pop_filtered(bus, (options_.correct_desktop ? 2:100)*GST_MSECOND,
                 static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
                     GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT));
             if (!message) continue;
@@ -221,7 +244,8 @@ public:
                   << "\"capture_timing_verified\":false,\"reference_semantics\":\"sender_media_time_not_proof_of_capture_time\","
                   << "\"original_anchor_mode\":" << (options_.expect_anchors ? "true" : "false")
                   << ",\"jitter_faststart_min_packets\":" << (options_.expect_anchors ? 2 : 0)
-                  << ",\"adaptive_correction\":false,\"clock_epoch\":" << clock_epoch_ << ','
+                  << ",\"adaptive_correction\":" << (options_.correct_desktop ? "true":"false")
+                  << ",\"clock_epoch\":" << clock_epoch_ << ','
                   << "\"packets_accepted\":" << accepted_.load() << ",\"packets_rejected\":" << rejected_.load()
                   << ",\"invalid_sender_reports\":" << invalid_reports_.load()
                   << ",\"invalid_ingress_anchor_packets\":" << invalid_ingress_anchors_.load()
@@ -329,11 +353,43 @@ public:
             << ",\"active_generation_last_estimate_within_limit\":" << (!active_windows ? "null" :
                 active_last_estimate_within_limit ? "true" : "false")
             << ",\"historical_original_anchor_qualification\":" << (historical_qualified ? "true" : "false")
-            << ",\"qualification_semantics\":\"historical_active_generation_windows_not_present_lock\""
-            << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" : bad_anchors ? "original_anchors_unqualified" :
+            << ",\"qualification_semantics\":\"historical_active_generation_windows_not_present_lock\"";
+        bool bad_correction=false;
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+        if (correction_) {
+            std::cout<<",\"correction_queue_peak_packets\":"<<correction_->queue_peak()<<",\"correction_sessions\":[";
+            const auto sessions=correction_->sessions();
+            bad_correction=!avsync::correction_diagnostic_pass(sessions,correction_->failed(),clock_pause_ns);
+            for (std::size_t i=0;i<sessions.size();++i) {
+                const auto& s=sessions[i]; const auto& d=s.correction;
+                if (i) std::cout<<',';
+                std::cout<<"{\"generation\":"<<s.epoch.generation<<",\"ssrc\":"<<s.ssrc
+                    <<",\"state\":"<<static_cast<unsigned>(s.state)<<",\"fault\":"<<static_cast<unsigned>(s.fault)
+                    <<",\"packets\":"<<s.packets<<",\"received_frames\":"<<d.received_frames
+                    <<",\"priming_discarded_frames\":"<<d.priming_discarded_frames
+                    <<",\"produced_frames\":"<<d.produced_frames<<",\"delivered_frames\":"<<s.delivered_frames
+                    <<",\"command_ppm\":"<<s.command_ppm<<",\"target_ppm\":"<<s.target_ppm
+                    <<",\"maximum_predicted_phase_ns\":"<<d.maximum_predicted_phase_ns
+                    <<",\"maximum_output_age_ns\":"<<s.maximum_output_age_ns
+                    <<",\"peak_input_frames\":"<<d.peak_input_frames<<",\"peak_output_frames\":"<<d.peak_output_frames
+                    <<",\"maximum_dispatch_quanta\":"<<s.dispatch_calls_max
+                    <<",\"first_capture_ns\":"<<s.first_capture_ns<<",\"last_capture_ns\":"<<s.last_capture_ns
+                    <<",\"output_peak\":"<<s.peak<<",\"output_rms\":"
+                    <<(s.delivered_frames ? std::sqrt(static_cast<double>(s.sum_squares/(2*s.delivered_frames))):0)
+                    <<",\"first_fault_ns\":";
+                json_optional(s.first_fault_ns); std::cout<<'}';
+            }
+            std::cout<<"],\"correction_state_codes\":{\"priming\":0,\"running\":1,\"faulted\":2}"
+                <<",\"correction_fault_codes\":{\"none\":0,\"metadata\":1,\"pcm\":2,\"rate\":3,\"overflow\":4,\"stale\":5,\"health\":6,\"backend\":7,\"timeline\":8,\"phase\":9}"
+                <<",\"corrected_pcm_destination\":\"in_memory_statistics_then_discard\""
+                <<",\"correction_diagnostic_pass\":"<<(bad_correction?"false":"true");
+        }
+#endif
+        std::cout << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" :
+            bad_correction ? "correction_unqualified" : bad_anchors ? "original_anchors_unqualified" :
             !buffers ? "waiting_media" : !timed ? "priming_reference" : invalid ? "invalid_timing" :
             options_.expect_anchors ? "original_anchors_observed" : "timestamps_observed") << "\"}\n";
-        return error || fatal_ ? 1 : bad_anchors || (options_.expect_media && (!timed || invalid)) ? 3 : 0;
+        return error || fatal_ ? 1 : bad_correction || bad_anchors || (options_.expect_media && (!timed || invalid)) ? 3 : 0;
     }
 private:
     static void new_jitterbuffer(GstElement*, GstElement* jitterbuffer,
@@ -500,6 +556,9 @@ private:
         auto* buffer = gst_sample_get_buffer(sample);
         GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
         GstMapInfo map{};
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+        std::optional<avsync::DiagnosticAudioPacket> correction_packet;
+#endif
         if (b.validator) {
             std::uint32_t ssrc{}, timestamp{}, payload_frames{};
             const auto record = avsync::net::read_audio_anchor(buffer, ssrc, timestamp, payload_frames);
@@ -546,6 +605,17 @@ private:
             if (!gst_rtp_buffer_map(buffer, GST_MAP_READ, &rtp)) { gst_sample_unref(sample); return GST_FLOW_ERROR; }
             map.data = static_cast<guint8*>(gst_rtp_buffer_get_payload(&rtp));
             map.size = gst_rtp_buffer_get_payload_len(&rtp);
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+            if (b.owner->correction_) {
+                correction_packet.emplace();
+                correction_packet->record=*record; correction_packet->ssrc=ssrc;
+                correction_packet->timestamp=timestamp; correction_packet->frames=payload_frames;
+                correction_packet->arrival_ns=static_cast<avsync::Nanoseconds>(now);
+                const auto sr=b.report ? b.report->last_received.load():GST_CLOCK_TIME_NONE;
+                if (GST_CLOCK_TIME_IS_VALID(sr) && sr<=static_cast<guint64>(std::numeric_limits<std::int64_t>::max()))
+                    correction_packet->last_report_ns=static_cast<avsync::Nanoseconds>(sr);
+            }
+#endif
         } else if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
             gst_sample_unref(sample); return GST_FLOW_ERROR;
         }
@@ -560,6 +630,11 @@ private:
             b.peak = std::max(b.peak, std::abs(normalized)); b.sum_squares += normalized*normalized; ++b.samples;
         }
         auto* reference = gst_buffer_get_reference_timestamp_meta(buffer, nullptr);
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+        if (correction_packet && (!avsync::decode_l24(
+                std::span(reinterpret_cast<const std::byte*>(map.data),map.size),*correction_packet) ||
+                !b.owner->correction_->submit(*correction_packet))) b.owner->fatal_.store(true);
+#endif
         const auto now = gst_util_get_timestamp();
         const auto last_report = b.report ? b.report->last_received.load() : GST_CLOCK_TIME_NONE;
         if (!reference) { if (b.timed) ++b.untimed_after_lock; else ++b.untimed; }
@@ -607,6 +682,9 @@ private:
     std::uint64_t jitter_drop_messages_{}, jitter_num_too_late_{}, jitter_num_drop_on_latency_{};
     std::uint64_t invalid_jitter_drop_messages_{};
     std::optional<unsigned> first_jitter_drop_seqnum_, first_jitter_drop_reason_;
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+    std::unique_ptr<avsync::AudioCorrectionDiagnostic> correction_;
+#endif
 };
 }
 int main(int argc,char** argv) {
@@ -617,6 +695,7 @@ int main(int argc,char** argv) {
             const std::string_view arg(argv[i]);
             if(arg=="--expect-media") { options.expect_media=true; continue; }
             if(arg=="--expect-anchors") { options.expect_anchors=true; continue; }
+            if(arg=="--correct-desktop") { options.correct_desktop=true; options.expect_anchors=true; continue; }
             require(i+1<argc,"Missing option value");
             const auto* value=argv[++i];
             if(arg=="--bind") options.bind=value;

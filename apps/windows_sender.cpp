@@ -316,6 +316,10 @@ struct Rejection {
 };
 
 struct Statistics {
+    struct ClockLoss { avsync::net::ClockHealth health; std::uint64_t elapsed_ms{}, mapped_packets{}; };
+    std::array<ClockLoss,8> first_clock_losses{};
+    std::uint64_t clock_losses{};
+    std::uint64_t clock_poll_timeout_ns{};
     std::uint64_t captured_packets{}, captured_frames{}, silent_packets{}, initial_discontinuities{};
     std::uint64_t discontinuities{}, timestamp_errors{}, dropped_packets{}, resets{}, queue_overflows{};
     std::uint64_t mapped_packets{}, first_device_position{}, last_device_position{};
@@ -807,6 +811,19 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
     if (s.maximum_mapped_minus_now) std::cout << ",\"maximum_mapped_minus_now_ns\":" << *s.maximum_mapped_minus_now;
     if (s.minimum_qpc_minus_internal) std::cout << ",\"minimum_qpc_minus_internal_ns\":" << *s.minimum_qpc_minus_internal;
     if (s.maximum_qpc_minus_internal) std::cout << ",\"maximum_qpc_minus_internal_ns\":" << *s.maximum_qpc_minus_internal;
+    std::cout<<",\"clock_poll_timeout_ns\":"<<s.clock_poll_timeout_ns
+        <<",\"clock_loss_count\":"<<s.clock_losses<<",\"first_clock_losses\":[";
+    for (std::size_t i=0;i<std::min<std::uint64_t>(s.clock_losses,s.first_clock_losses.size());++i) {
+        const auto& loss=s.first_clock_losses[i]; const auto& h=loss.health;
+        if (i) std::cout<<',';
+        std::cout<<"{\"reason\":\""<<h.reason<<"\",\"elapsed_ms\":"<<loss.elapsed_ms
+            <<",\"mapped_packets\":"<<loss.mapped_packets<<",\"observations\":"<<h.observations;
+        if (h.observation_age_ns) std::cout<<",\"observation_age_ns\":"<<*h.observation_age_ns;
+        if (h.rtt_ns) std::cout<<",\"rtt_ns\":"<<*h.rtt_ns;
+        if (h.rate_error_ppm) std::cout<<",\"rate_ppm\":"<<*h.rate_error_ppm;
+        std::cout<<'}';
+    }
+    std::cout<<']';
     const auto write_rejection = [](const Rejection &r) {
         std::cout << "{\"reason\":\"" << r.reason << "\",\"device_position\":" << r.device_position
                   << ",\"qpc_100ns\":" << r.qpc_100ns << ",\"network_now_ns\":" << r.network_now
@@ -841,7 +858,8 @@ int run(const Arguments &args)
     avsync::net::CaptureClockMapper mapper;
     avsync::net::ClockHealth health{};
     try {
-        const auto deadline = Steady::now() + std::chrono::seconds(args.seconds);
+        const auto started = Steady::now();
+        const auto deadline = started + std::chrono::seconds(args.seconds);
         GError *error = nullptr;
         if (!gst_init_check(nullptr, nullptr, &error)) {
             const auto code = error ? static_cast<std::uint32_t>(error->code) : 0;
@@ -861,6 +879,13 @@ int run(const Arguments &args)
         g_object_get(clock.get(), "internal-clock", &raw_internal, nullptr);
         GstPtr<GstClock> internal(raw_internal);
         require(internal != nullptr, "missing_internal_network_clock");
+        // The NetClientClock wrapper's inherited timeout is NOT the polling
+        // clock. Bound the actual internal clock's adaptive polling/retry wait
+        // to 250 ms, leaving headroom inside the unchanged 2-second health gate.
+        // Upstream may still reject RTT outliers; this is not an error bound.
+        gst_clock_set_timeout(internal.get(),250*GST_MSECOND);
+        stats.clock_poll_timeout_ns=gst_clock_get_timeout(internal.get());
+        require(stats.clock_poll_timeout_ns==250*GST_MSECOND,"clock_poll_timeout");
         const auto domain = avsync::net::verify_local_monotonic_domain(internal.get());
         stats.domain_bracket_ns = domain.bracket_width_ns;
         require(domain.valid, "qpc_gstreamer_domain_mismatch");
@@ -896,6 +921,10 @@ int run(const Arguments &args)
             clock_messages(clock_bus.get(), monitor);
             health = monitor.health(clock.get());
             if (clock_was_usable && !health.usable) {
+                if (stats.clock_losses<stats.first_clock_losses.size())
+                    stats.first_clock_losses[stats.clock_losses]={health,static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(Steady::now()-started).count()),stats.mapped_packets};
+                ++stats.clock_losses;
                 // Require a fresh observation window after health loss. Reset
                 // once on the edge, not repeatedly while still acquiring.
                 monitor.reset();

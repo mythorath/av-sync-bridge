@@ -1,13 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# Offline desktop correction worker
+# Bounded desktop correction worker
 
-Status: **partial controller milestone, not connected to live transport or OBS**.
+Status: **partial controller milestone; optional live diagnostic, no OBS output**.
 `avsync_audio_correction` combines the original-anchor validator and libsamplerate
 backend. It accepts ordered stereo PCM with the original record belonging to
-that packet. This is a reusable library and generated-only fixture, not a
+that packet. This is a reusable library with generated fixtures, not a
 background service or production replacement.
 It now includes a [model-based runtime phase guard](audio-phase-guard.md), limited
 to the audited libsamplerate 0.2.2 implementation and independently tested offline.
+A separate [owned-queue diagnostic adapter](network-receiver.md) now connects
+actual network PCM to the worker and inspects/discards its output. See the
+[quality/resource and live boundary evidence](audio-live-correction-validation.md).
 
 ## Contract
 

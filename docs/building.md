@@ -150,6 +150,12 @@ Do not replace a functioning production runtime just to build this experiment.
 In the build shell only, prepend that SDK's `bin` to PATH and set PKG_CONFIG_PATH
 to its `lib/pkgconfig`. Configure with Visual Studio 2022 x64 and the network
 option above. Use `--config Release` for building and `-C Release` for CTest.
+Configuration checks the matching SDK's core/audio runtime DLLs. CTest now
+prepends that SDK's `bin` to each test's local PATH, including Python fixture
+children, so tests also work from a fresh terminal. Override a nonstandard layout
+with `-DAVSYNC_GSTREAMER_RUNTIME_DIR=SDK_BIN_DIRECTORY`. This does not edit the
+user/system PATH or install/copy DLLs into Windows. If the SDK is moved, configure
+again with its new directory before testing.
 Run diagnostics from a shell with the same process-local SDK PATH; avoid mixing
 DLLs/plugins from different installations. The normal CI Windows job tests the
 dependency-free core/probe, not the optional SDK sender. Linux CI compiles the
@@ -297,3 +303,40 @@ fixtures do not establish privacy through arbitrary real audio filters.
 `--cycles 3` runs a roughly one-minute multi-cycle check (`mute` and `rapid-mute`
 currently require one cycle). This is not a 30-minute load test. The runner
 cleans up only processes it creates and reports cleanup failures as failures.
+
+## Changing-ratio quality and test-only allocation audit
+
+With the optional ASRC build, run generated signals before any live trial:
+
+```sh
+./build-asrc/avsync-asrc-quality-probe --seconds 24
+./build-asrc/avsync-asrc-quality-probe --paced --seconds 60 --require-budget
+```
+
+The first command enforces quality but reports CPU timing without making CI
+depend on shared-runner scheduling. `--require-budget` additionally returns 2
+when any positive case's p99 backend-call upper bound is not below 2 ms. A
+quality/error verdict returns 1. Negative controls must fail quality as designed.
+`--paced` tests only stereo multitone in real time, then an accelerated eight-second
+attenuation control. CPU affinity, when explicitly selected for an isolated
+Linux trial, can be applied with `taskset -c CPU_NUMBER`; no global scheduler or
+service setting changes. See the [failed and passing conditions](audio-live-correction-validation.md).
+
+The Linux/glibc allocation interposer is **separately opt-in and test-only**:
+
+```sh
+cmake -S . -B build-audit -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DAVSYNC_BUILD_ASRC=ON -DAVSYNC_BUILD_ALLOCATION_AUDIT=ON
+cmake --build build-audit --parallel 2
+ctest --test-dir build-audit -R avsync-audio-allocation --output-on-failure
+env LD_PRELOAD="$PWD/build-audit/libavsync_allocation_audit.so" \
+  ./build-audit/avsync-audio-allocation-probe --seconds 600
+```
+
+Do not export LD_PRELOAD globally or load this library into OBS/services. It
+must not be combined with ASan; use a separate sanitizer build. It counts
+requested heap bytes rather than process RSS. Both network and ASRC options
+enable the combined generated conversion/RTP/correction test and the receiver's
+explicit `--correct-desktop` inspect-and-discard mode. Default tests still do not
+capture devices or bind sockets. Receiver use is described in
+[network diagnostics](network-receiver.md).
