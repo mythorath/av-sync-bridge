@@ -123,8 +123,8 @@ false: no independent content-quality or actual OBS-receipt assertion was made.
 Unexpected remote receiver/SSH exit or stdout loss now latches
 `remote_retirement_unverified` and prevents a new attempt. This closes the case
 where an already-dead SSH child previously escaped the forced-kill retry guard.
-It is deliberately conservative; independent authenticated remote retirement
-proof and the real remote failure matrix are still unimplemented.
+That initial implementation was deliberately conservative; the follow-up below
+adds optional independent retirement proof without changing the no-proof default.
 
 The expanded Linux ASRC/network/IPC CTest suite passed 35/35; four targeted
 ASAN/UBSAN checks passed with default leak detection. Windows CTest passed 20/20.
@@ -134,13 +134,81 @@ barrier, display ownership and native-report negative fixtures are included in
 the ordinary Python test discovery. No production profile, service, startup task,
 microphone state or display configuration was changed.
 
+## Follow-up: independent remote retirement
+
+The optional [remote helper](remote-receiver-control.md) now binds each finite
+Linux receiver attempt to a fresh run ID, immutable launch intent and receipt,
+private authorization lock, and irreversible cancellation tombstone. A uniquely
+named transient user service contains the receiver and descendants, with restart
+disabled and finite runtime/stop limits. Nothing is installed into normal startup.
+
+The coordinator issues a separate authenticated retirement query for **every**
+attempt, including healthy STOP and pre-READY uncertainty. Only a bounded exact
+proof matching the run, sender session and fresh challenge can authorize retry.
+It must fence a not-yet-started receiver, establish a previous boot, or confirm
+the exact recorded invocation is terminal and its cgroup empty/absent. The start
+and retirement commands must share one trusted host/user/helper/state directory;
+arbitrary argv configuration does not prove that association. Missing proof,
+identity/schema errors, output corruption, failed sender cleanup and unreaped
+local processes remain terminal. Recovery retains its original fault history.
+
+Three fresh generated-process checks passed against a real systemd 255.4 user
+manager on unified cgroup v2: cancellation before launch refused the late start;
+cooperative STOP retired cleanly; and killing the launcher left a stubborn
+receiver plus descendant alive until the independent manager stop. Held kernel
+pidfds independently confirmed one/two process exits in the latter two cases.
+Fresh repeated proofs also passed. These silent tests used no capture device,
+network listener or OBS source.
+
+The first stubborn-process attempt failed closed because the parser did not
+recognize systemd's explicit empty `Job=` as the no-pending-job representation.
+The manager had stopped the processes, but no proof was accepted. That failed
+attempt was retained; the parser now accepts only explicit known no-job values,
+still requires the property to exist, and rejects pending or malformed jobs.
+The complete three-case suite then passed with fresh identities/state.
+
+A separate real authenticated Windows/Linux SSH check used generated silent
+sender/receiver processes. Its healthy pair completed in 9.253 seconds with one
+retirement proof. After deliberate loss of the exact owned receiver SSH client,
+the controller verified retirement and acknowledged a fresh second pair in a
+17.251-second run. Both attempts had matching positive retirement proofs; the
+old receiver's exit preceded the successor's start, with distinct sender/provider
+identities. The result was `control_completed_with_recovery` (exit 3), preserving
+`receiver_exited` in fault history, not relabeling the run fault-free. This tests
+actual SSH recovery and process containment, not PCM or OBS output.
+
+Two further finite trials used the real Windows desktop-loopback sender and
+native Linux receiver through this same helper, publishing only to private IPC.
+The healthy run completed in 34.282 seconds: both native summaries qualified,
+9,041 outgoing RTP packets and 1,298,400 corrected stereo frames published, with
+29 usable original-anchor measurements. In the 44.252-second interruption run,
+the owned receiver SSH client was deliberately killed after ten seconds of
+acknowledged operation. Independent retirement verified the first attempt before
+a fresh pair started, then verified the final attempt on STOP. The successor
+reported 8,102 outgoing RTP packets, 1,148,160 corrected stereo frames and 26
+usable measurements. Its sender and receiver reported qualified; no timestamp,
+anchor-validation or jitter-late errors appeared in their retained summaries.
+
+The interrupted run correctly retained `receiver_exited` and exit 3. Its first
+receiver summary was lost with the transport, so whole-run native-summary
+completeness/qualification remains false even though the successor reports pass.
+These are self-reported counters, not independently measured content or encoded
+sync. No OBS consumer was attached; `media_verified` remains false for both runs.
+The physical display, production sources, old audio services and mic were untouched.
+
+Final Python discovery passed 228 tests on each host (12 Windows skips, 6 Linux
+skips); the process-pair subset has 60 cases. Negative cases include replayed or
+malformed proofs, incomplete output, unavailable verification, pre-READY failure,
+post-transport output corruption, sender cleanup failure and cancellation races.
+No C++ or installed plugin was changed in this follow-up. The real-systemd check
+is deliberately opt-in and is not part of ordinary test discovery or hosted CI.
+
 ## Continue here
 
-1. Extend the basic native agreement check to qualify the actual remote wrapper
-   and finite pair controller under failure:
-   generated network media and sender/receiver/controller failure matrix with
-   independent authenticated remote retirement proof. The local generated
-   restart-spanning recording is now covered; it does not prove remote containment.
+1. Extend the covered local generated restart recordings and remote containment
+   checks to recorded network media and the remaining sender/receiver/controller
+   failure matrix. Full coordinator death recovery needs durable pending-attempt
+   reconciliation; this finite in-process retry path does not implement it.
 2. Run the isolated real desktop/video restart matrix and representative load.
    Preserve interruption and timing failures; no offset retuning between repeats.
 3. Only then perform a reversible normal-source/startup migration and physical

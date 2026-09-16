@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from typing import Any
+from retirement_proof import parse_retirement, verify_retirement
 
 
 PREFIX = b"AVSYNC_CONTROL "
@@ -198,11 +199,14 @@ class Config:
     stop_grace: float = 1.0
     require_native_summaries: bool = False
     receiver_scope: str = "direct"
+    retire_argv: tuple[str, ...] | None = None
+    retire_timeout: float = 8.0
 
     @classmethod
     def from_dict(cls, value: Any) -> "Config":
         allowed = {"receiver_argv", "sender_argv", "total_seconds", "max_attempts",
-                   "ready_timeout", "ack_timeout", "stop_grace", "require_native_summaries", "receiver_scope"}
+                   "ready_timeout", "ack_timeout", "stop_grace", "require_native_summaries", "receiver_scope",
+                   "retire_argv", "retire_timeout"}
         if not isinstance(value, dict) or set(value) - allowed:
             raise PairError("invalid_config_keys")
         for role in ("receiver", "sender"):
@@ -214,6 +218,8 @@ class Config:
             placeholders = {"{sender_session}", "{seconds}"}
             if role == "sender":
                 placeholders.add("{clock_epoch}")
+            elif value.get("retire_argv") is not None:
+                placeholders.add("{run_id}")
             for arg in argv:
                 if ("{" in arg or "}" in arg) and arg not in placeholders:
                     raise PairError("non_exact_placeholder")
@@ -224,6 +230,8 @@ class Config:
                 required["--clock-epoch"] = "{clock_epoch}"
                 if argv.count("--loopback") != 1:
                     raise PairError("desktop_loopback_required")
+            elif value.get("retire_argv") is not None:
+                required["--run-id"] = "{run_id}"
             if argv.count("--control-stdin") != 1:
                 raise PairError("control_stdin_required")
             for flag, token in required.items():
@@ -231,7 +239,7 @@ class Config:
                     argv[argv.index(flag) + 1] != token):
                     raise PairError("required_flag_placeholder")
         for key, low, high in (("total_seconds", 1, 180), ("ready_timeout", .1, 30),
-                               ("ack_timeout", .1, 30), ("stop_grace", .05, 2)):
+                               ("ack_timeout", .1, 30), ("stop_grace", .05, 2), ("retire_timeout", .1, 10)):
             setting = value.get(key, getattr(cls, key))
             if (type(setting) not in (int, float) or not math.isfinite(setting) or
                 not low <= setting <= high):
@@ -247,18 +255,41 @@ class Config:
         program = value["receiver_argv"][0].replace("\\", "/").rsplit("/", 1)[-1].lower()
         if program in ("ssh", "ssh.exe") and scope != "remote":
             raise PairError("ssh_requires_remote_scope")
+        retire = value.get("retire_argv")
+        if retire is not None:
+            if (scope != "remote" or not isinstance(retire, list) or not 1 <= len(retire) <= 128 or
+                    any(not isinstance(arg, str) or not arg or len(arg) > 4096 or
+                        any(c in arg for c in "\r\n\0") for arg in retire)):
+                raise PairError("invalid_retire_argv")
+            expected = {"{run_id}", "{sender_session}", "{challenge}"}
+            if any(retire.count(token) != 1 for token in expected) or any(
+                    ("{" in arg or "}" in arg) and arg not in expected for arg in retire):
+                raise PairError("invalid_retire_placeholders")
+            for flag, token in (("--run-id", "{run_id}"), ("--expect-sender-session", "{sender_session}"),
+                                ("--challenge", "{challenge}")):
+                if retire.count(flag) != 1 or retire.index(flag) + 1 >= len(retire) or retire[retire.index(flag) + 1] != token:
+                    raise PairError("invalid_retire_flag")
+        elif "retire_timeout" in value:
+            raise PairError("retire_timeout_requires_query")
         result = cls(**{**value, "receiver_argv": tuple(value["receiver_argv"]),
-                        "sender_argv": tuple(value["sender_argv"])})
+                        "sender_argv": tuple(value["sender_argv"]),
+                        "retire_argv": tuple(retire) if retire is not None else None})
         # Reserve cooperative cleanup + kill/reap time INSIDE the finite budget.
-        if result.total_seconds <= result.stop_grace + .6:
+        if result.total_seconds <= result.stop_grace + .6 + (result.retire_timeout + .5 if retire is not None else 0):
             raise PairError("insufficient_cleanup_budget")
         return result
 
-    def argv(self, role: str, session: str, clock: str | None, seconds: int) -> list[str]:
+    def argv(self, role: str, session: str, clock: str | None, seconds: int, run_id: str | None = None) -> list[str]:
         replacements = {"{sender_session}": session, "{seconds}": str(seconds)}
         if clock is not None:
             replacements["{clock_epoch}"] = clock
+        if run_id is not None:
+            replacements["{run_id}"] = run_id
         return [replacements.get(arg, arg) for arg in getattr(self, role + "_argv")]
+
+    def retirement_argv(self, run_id: str, session: str, challenge: str) -> list[str]:
+        replacements = {"{run_id}": run_id, "{sender_session}": session, "{challenge}": challenge}
+        return [replacements.get(arg, arg) for arg in (self.retire_argv or ())]
 
 
 class InstanceLock:
@@ -324,6 +355,7 @@ class Child:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue(MAX_PENDING)
         self.writes: queue.Queue[bytes | None] = queue.Queue(2)
         self.failure: str | None = None
+        self.output_failure: str | None = None
         self.native_summary: dict[str, Any] | None = None
         self.native_summary_error: str | None = None
         self.native_summary_count = 0
@@ -353,6 +385,10 @@ class Child:
     def _fail(self, reason: str) -> None:
         # Assignment of a reference is atomic under the supported CPython
         # runtime. All reasons here are fixed codes, never child output.
+        # A recoverable broken stdin pipe must not hide a later stdout/stderr
+        # corruption fault from another reader thread during retirement.
+        if reason in OUTPUT_FAILURES and self.output_failure is None:
+            self.output_failure = reason
         if self.failure is None:
             self.failure = reason
 
@@ -498,6 +534,7 @@ class Result:
     reported_media_qualified: bool = False
     media_verified: bool = False
     remote_retirement_unverified: bool = False
+    remote_retirement_checks: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
@@ -514,6 +551,18 @@ class Supervisor:
         self.children: list[Child] = []
         self.sessions: set[str] = set()
         self.clocks: set[str] = set()
+        self.proof_tokens: set[str] = set()
+        self.pending_retirement: tuple[str, str] | None = None
+        self.terminal_cleanup = False
+        self.terminal_protocol = False
+
+    def _new_proof_token(self) -> str:
+        for _ in range(16):
+            token = secrets.token_hex(16)
+            if token not in self.proof_tokens:
+                self.proof_tokens.add(token)
+                return token
+        raise PairError("retirement_entropy_failed")
 
     def _new_session(self) -> str:
         for _ in range(16):
@@ -575,6 +624,8 @@ class Supervisor:
 
     def _stop_pair(self, budget_end: float) -> None:
         children, self.children = self.children, []
+        retirement, self.pending_retirement = self.pending_retirement, None
+        proof_enabled = self.config.retire_argv is not None
         asked_to_stop: list[Child] = []
         for child in children:
             if child.process.poll() is None:
@@ -586,6 +637,8 @@ class Supervisor:
                 if self.result.status in ("control_completed", "control_completed_with_recovery"):
                     self.result.stop_failures += 1
                     self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_exited_before_stop"))
+                    if not proof_enabled or child.role != "receiver":
+                        self.terminal_cleanup = True
         grace_end = min(budget_end - .3, time.monotonic() + self.config.stop_grace)
         while time.monotonic() < grace_end and any(c.process.poll() is None for c in children):
             time.sleep(.01)
@@ -596,6 +649,9 @@ class Supervisor:
                 try:
                     child.process.kill()  # Exact Popen-owned local child only.
                     self.result.forced_local_kills += 1
+                    self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_forced_local_stop"))
+                    if not proof_enabled or child.role != "receiver":
+                        self.terminal_cleanup = True
                 except OSError:
                     pass
         for child in children:
@@ -603,6 +659,7 @@ class Supervisor:
                 child.process.wait(timeout=max(.01, min(.3, budget_end - time.monotonic())))
             except subprocess.TimeoutExpired:
                 self.result.cleanup_failures += 1
+                self.terminal_cleanup = True
                 if child.role == "receiver" and self.config.receiver_scope == "remote":
                     self.result.remote_retirement_unverified = True
             if child in asked_to_stop and child.process.returncode not in (None, 0):
@@ -610,11 +667,14 @@ class Supervisor:
                 self.result.faults.append(Fault(self.result.attempts, "cleanup", child.role + "_nonzero_stop_exit"))
                 if child.role == "receiver" and self.config.receiver_scope == "remote":
                     self.result.remote_retirement_unverified = True
+                if not proof_enabled or child.role != "receiver":
+                    self.terminal_cleanup = True
             child.close_pipes()
             # Final stdout is produced during STOP, after the last running poll.
             # EOF is expected here; other reader faults must not disappear.
-            if child.failure in OUTPUT_FAILURES:
-                reason = child.role + "_" + child.failure
+            if child.output_failure is not None:
+                self.terminal_cleanup = True
+                reason = child.role + "_" + child.output_failure
                 if not any(f.attempt == self.result.attempts and f.reason == reason for f in self.result.faults):
                     self.result.stop_failures += 1
                     self.result.faults.append(Fault(self.result.attempts, "cleanup", reason))
@@ -624,6 +684,7 @@ class Supervisor:
                 except queue.Empty:
                     break
                 if kind == "control":
+                    self.terminal_cleanup = True
                     self.result.stop_failures += 1
                     self.result.faults.append(Fault(self.result.attempts, "cleanup", "unexpected_final_control_event"))
                     break
@@ -645,12 +706,33 @@ class Supervisor:
                 "discarded_stdout_lines": child.discarded_stdout_lines,
                 "output_bytes": child.output_bytes,
             })
+        if retirement is not None:
+            run_id, session = retirement
+            self.result.remote_retirement_unverified = True
+            try:
+                challenge = self._new_proof_token()
+                proof = verify_retirement(self.config.retirement_argv(run_id, session, challenge),
+                    run_id, session, challenge, min(self.config.retire_timeout, budget_end - time.monotonic() - .5))
+            except PairError:
+                proof = {"verified": False, "proof": None, "reason": "retirement_entropy_failed",
+                         "forced_local_kill": False}
+            self.result.remote_retirement_checks.append({"attempt": self.result.attempts, **proof})
+            if proof["verified"]:
+                self.result.remote_retirement_unverified = False
+            else:
+                self.result.faults.append(Fault(self.result.attempts, "retirement", proof["reason"]))
+                self.terminal_cleanup = True
+        if proof_enabled and (self.terminal_cleanup or self.terminal_protocol):
+            self.result.status = "failed"
+        elif proof_enabled and self.result.status == "control_completed" and self.result.faults:
+            self.result.status = "control_completed_with_recovery"
 
     def run(self) -> Result:
         started = time.monotonic()
         final_deadline = started + self.config.total_seconds
         # Stop media/control early enough for cleanup within this finite run.
-        active_deadline = final_deadline - self.config.stop_grace - .6
+        active_deadline = final_deadline - self.config.stop_grace - .6 - (
+            self.config.retire_timeout + .5 if self.config.retire_argv is not None else 0)
         phase = "lock"
         try:
             with InstanceLock(self.lock_path):
@@ -662,8 +744,14 @@ class Supervisor:
                     phase = "receiver_start"
                     try:
                         session = self._new_session()
+                        run_id = self._new_proof_token() if self.config.retire_argv is not None else None
+                        if run_id is not None:
+                            # Before starting SSH: even a pre-READY uncertainty
+                            # needs an independent irreversible cancellation fence.
+                            self.pending_retirement = (run_id, session)
+                            self.result.remote_retirement_unverified = True
                         seconds = max(1, min(180, math.ceil(final_deadline - time.monotonic())))
-                        receiver = Child("receiver", self.config.argv("receiver", session, None, seconds))
+                        receiver = Child("receiver", self.config.argv("receiver", session, None, seconds, run_id))
                         self.children.append(receiver)
                         clock = self._wait_handshake(receiver, "receiver_ready", session, None,
                                                      self.config.ready_timeout, active_deadline)
@@ -683,15 +771,25 @@ class Supervisor:
                         break
                     except PairError as error:
                         self.result.faults.append(Fault(attempt, phase, str(error)))
+                        if self.config.retire_argv is not None and str(error) not in {
+                            "receiver_spawn_failed", "sender_spawn_failed", "receiver_exited", "sender_exited",
+                            "receiver_stdout_eof", "sender_stdout_eof", "receiver_stdin_write_failed",
+                            "receiver_stdin_backpressure", "receiver_ready_timeout", "sender_started_timeout",
+                        }:
+                            # Proof resolves process containment only. It cannot
+                            # excuse invalid source identity or protocol corruption.
+                            self.terminal_protocol = True
                     finally:
                         self._stop_pair(final_deadline)
                     # A killed SSH child is not proof that a remote receiver has
                     # retired. Never launch another pair after ambiguous cleanup.
-                    if (self.result.cleanup_failures or self.result.forced_local_kills or
-                        self.result.stop_failures or self.result.remote_retirement_unverified):
+                    unsafe = (self.terminal_cleanup or self.terminal_protocol) if self.config.retire_argv is not None else (
+                        self.result.cleanup_failures or self.result.forced_local_kills or self.result.stop_failures)
+                    if unsafe or self.result.remote_retirement_unverified:
                         break
-                if (self.result.forced_local_kills or self.result.cleanup_failures or
-                    self.result.stop_failures):
+                unsafe = (self.terminal_cleanup or self.terminal_protocol) if self.config.retire_argv is not None else (
+                    self.result.forced_local_kills or self.result.cleanup_failures or self.result.stop_failures)
+                if unsafe:
                     self.result.faults.append(Fault(self.result.attempts, "cleanup", "unclean_child_stop"))
                     self.result.status = "failed"
                 if self.result.remote_retirement_unverified:

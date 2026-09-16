@@ -46,7 +46,10 @@ an already expired lease by consuming old buffered keepalives.
 
 Use Python 3.10 or newer. The private configuration must contain command **argv
 arrays**, not shell snippets. Only exact arguments `{sender_session}`,
-`{clock_epoch}` (sender only), and `{seconds}` are substituted. Embedded string
+`{clock_epoch}` (sender only), and `{seconds}` are substituted in the base
+configuration. The optional retirement mode also supplies `{run_id}` to the
+receiver, and `{run_id}`, `{sender_session}`, `{challenge}` to its independent
+retirement command. Embedded string
 interpolation is rejected; execution uses `shell=False`. Both commands must
 include `--seconds {seconds}`. Windows children use `CREATE_NO_WINDOW`.
 
@@ -91,6 +94,47 @@ wrapper that starts SSH must also be declared remote: inspecting its filename
 cannot prove what it launches. This setting is a declared containment boundary,
 not discovery or a sandbox. Never label an SSH wrapper direct to enable retries.
 
+### Optional independent retirement
+
+The base configuration above has no independent proof command and retains its
+conservative no-retry behavior after ambiguous remote loss. To opt into bounded
+proof-backed recovery, use the [Linux remote receiver helper](remote-receiver-control.md)
+through trusted private launch and retirement wrappers, and add:
+
+- `retire_argv`: a nonempty trusted argv array, permitted only with
+  `receiver_scope: "remote"`. It must contain each exact flag/placeholder pair
+  once: `--run-id {run_id}`, `--expect-sender-session {sender_session}`, and
+  `--challenge {challenge}`. No embedded placeholders are allowed.
+- `retire_timeout`: 0.1–10 seconds, default 8. It is invalid without
+  `retire_argv`; it bounds the independent query, not media runtime.
+- Add `--run-id {run_id}` to `receiver_argv`. The receiver launch still requires
+  its existing session/duration/control arguments; the sender command is unchanged.
+
+Both command templates **must share the same fixed authenticated host, user,
+helper deployment, and absolute private state directory**. Generate them from
+one trusted base configuration. Arbitrary argv arrays cannot prove this binding:
+querying an unrelated empty state directory could produce a matching
+`fenced_never_started` response without fencing the real launch. Matching tokens
+are freshness/identity checks, not authentication, enrollment or a sandbox.
+
+Before attempting each receiver launch, the coordinator records a fresh
+128-bit hexadecimal run ID alongside its fresh sender session. Cleanup generates
+a separate fresh 128-bit challenge and executes the independent retirement
+command **for every attempted launch**, including a failed spawn, pre-READY
+failure, and healthy STOP. The remote helper commits a cancellation fence before
+examining its receipt/unit; delayed launches cannot authorize native execution
+after that fence. Cancellation-before-start is therefore covered explicitly.
+
+Only verifier exit 0 plus exactly one bounded `AVSYNC_RETIRE` line with the exact
+schema, run/session identity and fresh challenge is accepted. Its proof must be
+one of `fenced_empty_cgroup`, `fenced_never_started`, or `fenced_prior_boot`, with
+the invariants described in the helper document. Stale/foreign proofs, duplicate
+keys/lines, extra fields, bad types, nonzero exit, missing output, output overflow,
+timeout or failed verifier cleanup remain unverified. `remote_retirement_checks`
+retains sanitized per-attempt verdicts and fixed reason codes, not private tokens
+or command output. A valid proof clears only the remote-retirement uncertainty;
+it does not erase fault counters, authorize a schema violation, or verify media.
+
 The process holds an OS lock for the run. A second coordinator using that path
 cannot start children. The file is never unlinked, replaced, truncated, or
 reclaimed based on a recorded PID. All operators of this pair must use the same
@@ -106,9 +150,12 @@ local users are outside this fixture.
 ### SSH boundary
 
 An authenticated SSH client can be the local receiver child, with a fixed trusted
-remote wrapper that validates numeric arguments and **execs** the receiver in
-the foreground. Do not allocate a pseudo-terminal, detach/background the remote
-receiver, or redirect away its control stdin/stdout. Configure bounded SSH
+remote wrapper that validates arguments and **execs** the receiver in the
+foreground. With retirement configured, the helper instead execs `systemd-run`
+and uses its pipe/wait mode to retain the same native control stream inside a
+uniquely identified, finite user service. Do not allocate a pseudo-terminal,
+independently detach the remote receiver, or redirect away its control
+stdin/stdout. Configure bounded SSH
 connection attempts/timeouts, noninteractive authentication, and strict host-key
 verification in the private command/config. Never disable host-key verification
 to make a test pass.
@@ -123,37 +170,60 @@ cannot guarantee termination of arbitrary grandchildren or remote daemons by
 killing SSH. The native stdin lease requests cooperative retirement after a
 disconnect; it is not a hard guarantee against a native process stuck in a
 third-party call or blocked cleanup. A wrapper must not buffer/replay keepalives
-or keep the pipe alive after SSH loss. Any forced local kill or failed cleanup
-ends this run without another attempt: a dead SSH client is not proof that the
-remote writer stopped. Validate the wrapper before a live trial. No
+or keep the pipe alive after SSH loss. Without the optional proof command, any
+forced local kill or failed cleanup ends this run without another attempt: a dead
+SSH client is not proof that the remote writer stopped. Validate the wrapper
+before a live trial. No
 process-name kill, task-name kill, or remote blanket cleanup is implemented.
 
 In remote scope, **any unexpected receiver transport exit or stdout loss** also
-latches `remote_retirement_unverified` and forbids another attempt, even if the
-SSH process was already dead before cleanup. The owned sender is stopped safely.
-No independent remote-identity/exit-proof mechanism exists yet; a local SSH exit,
-released port, expired heartbeat, or next IPC writer rejection is not that proof.
+latches `remote_retirement_unverified`, even if the SSH process was already dead
+before cleanup. The owned sender is stopped safely. With no proof command, this
+forbids another attempt exactly as before. With a configured command, only its
+fresh positive proof can clear that uncertainty; a local SSH exit, released port,
+expired heartbeat, or next IPC writer rejection still cannot do so.
+
+Proof-backed retry is deliberately narrow. Spawn/observed-exit/stdout-EOF
+failures, receiver stdin loss/backpressure, and receiver-ready/sender-started
+timeouts are potentially recoverable only after exact local cleanup and remote
+proof, with time and attempt budget remaining. A forced stop or nonzero exit of
+the reaped receiver transport may likewise be resolved by that proof. These
+events remain visible in fault history and counters.
+
+Malformed or duplicate control messages, wrong/reused clock or session identity,
+unexpected final control output, reader/output corruption or bounds failures,
+sender stdin failures, forced/nonzero sender cleanup, and any unreaped local
+child remain terminal. A valid remote proof does not repair them. Missing or
+unqualified native media summaries remain separate diagnostics as described
+below; a containment verdict must not be promoted to clean audio evidence.
 
 ## Bounds, cleanup, and results
 
 - The overall deadline policy is 1–180 seconds, at most three pair attempts. Cleanup time
   is reserved inside that budget; the running interval is shorter than the
-  requested total. Native finite-duration limits remain in force.
+  requested total. Proof mode reserves an additional `retire_timeout + 0.5`
+  seconds beyond the existing `stop_grace + 0.6` cleanup reserve; configurations
+  too short to leave an active interval are rejected. Each query is further
+  clamped to the remaining deadline and reap allowance. Native finite-duration
+  limits remain in force; recovery queries consume the same overall budget.
 - Ready and acknowledgment waits are independently bounded by 0.1–30 seconds
   and the remaining overall deadline. A timeout is not successful agreement.
 - Either child exiting, losing its output pipe, or failing its control input
   retires the entire pair. A fresh attempt never overlaps live owned children.
 - Cooperative stop is sent to both, then only non-exiting owned local children
   are killed and reaped. Nonzero cooperative-stop exits are retained as failures.
-  A forced kill, nonzero stop, or failed reap is an unclean result; no restart
-  follows any of them. Process creation, kernel scheduling, blocked external
+  Without proof mode, a forced kill, nonzero stop, or failed reap remains an
+  unclean result with no restart. Proof mode permits only the receiver-transport
+  exception above; sender cleanup failures and any failed reap remain terminal.
+  Process creation, kernel scheduling, blocked external
   I/O, and bounded thread/reap waits can exceed a nominal deadline; this is a
   finite normal-path policy, not a real-time or remote-termination guarantee.
 - Stdout EOF can precede publication of a child's nonzero process exit. If
   cleanup sees that child as still alive when requesting STOP, its subsequent
-  nonzero exit is deliberately treated as ambiguous cleanup and ends retries.
-  This conservative boundary applies even when the local child does eventually
-  finish. The known-dead-child restart fixtures synchronize on the exact process
+  nonzero exit is deliberately treated as ambiguous cleanup. It ends retries
+  unless it is the reaped receiver transport and an optional independent proof
+  resolves it. This conservative default applies even when the local child does
+  eventually finish. The known-dead-child restart fixtures synchronize on the exact process
   handle; they do **not** establish automatic recovery from every real crash.
 - Ordinary stdout lines are bounded to 4096 bytes, native JSON summary lines to
   65536 bytes, control messages to 1024 bytes, and combined stdout/stderr output
@@ -218,8 +288,11 @@ specific child's exit before coordinator polling; a separate EOF-before-exit
 fixture verifies the conservative no-retry outcome described above.
 It also checks bounded native summaries larger than 4 KiB, exact uint64 counters,
 privacy filtering, missing/duplicate/nonfinite/unqualified reports, final-output
-faults during cleanup, explicit SSH scope, and no retry after remote-wrapper
-exit or stdout loss. These diagnostic cases use generated summaries only.
+faults during cleanup, explicit SSH scope, and no-proof refusal after
+remote-wrapper exit or stdout loss. Generated proof fixtures separately exercise
+fresh identity/challenge checks, mandatory healthy/pre-READY retirement,
+proof-backed transport recovery and terminal protocol/cleanup faults. These
+diagnostic cases use generated summaries and proof responses only.
 These fake-process tests do not contact SSH, a physical device, OBS, or a normal
 audio path.
 

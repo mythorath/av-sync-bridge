@@ -51,8 +51,14 @@ isolated real-capture development, not production deployment.
   and sustained original-anchor uncertainty characterization.
 - [x] Finite process-agreement fixture with pinned sender identities, stdin
   control leases, bounded pair-restart policy and explicit IPC-v2 retirement.
-  Generated tests qualify these software boundaries only; live restart, remote
-  wrapper fencing and installed startup remain open. See [process control](process-pair-control.md).
+  Generated tests qualify these software boundaries only; recorded remote-media
+  restart and installed startup remain open. See [process control](process-pair-control.md).
+- [x] Optional authenticated remote retirement query, durable cancellation fence
+  and finite Linux user-service containment. Real-manager generated-process checks
+  and a two-host generated SSH-loss/replacement check passed. A separate short
+  desktop-native interruption trial reported qualified successor media counters;
+  none of these qualify recorded media recovery, whole-controller death or reboot. See
+  [remote containment scope](remote-receiver-control.md).
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 - [x] Offline desktop feed-forward worker: provisional rate acquisition, fixed-quantum
   command slew, owned bounded queues, original-anchor origin and explicit reset.

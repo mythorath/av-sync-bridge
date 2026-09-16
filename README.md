@@ -26,6 +26,10 @@ silence gap. It is not whole-process or reboot recovery.
 A [finite process-pair controller](docs/process-pair-control.md) now adds explicit
 sender/provider agreement, controller-loss shutdown and validated IPC replacement.
 Generated control/IPC tests are not a physical restart or production verdict.
+Optional [remote receiver containment](docs/remote-receiver-control.md) now fences
+late launches and requires independent retirement proof before retrying after
+SSH loss. Generated real-manager and two-host control checks have passed; this
+does not qualify automatic production or reboot recovery.
 
 ## Intended use
 

@@ -18,6 +18,7 @@ import unittest
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "process_pair.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("avsync_process_pair", MODULE_PATH)
 pair = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pair
@@ -51,6 +52,7 @@ def fake_child() -> int:
     parser.add_argument("--sender-session")
     parser.add_argument("--clock-epoch")
     parser.add_argument("--seconds")
+    parser.add_argument("--run-id")
     parser.add_argument("--control-stdin", action="store_true")
     parser.add_argument("--loopback", action="store_true")
     args = parser.parse_args()
@@ -65,7 +67,8 @@ def fake_child() -> int:
     def record(event: str) -> None:
         with log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"event": event, "pid": os.getpid(), "session": session,
-                                     "clock": clock, "count": count}) + "\n")
+                                     "clock": clock, "count": count, "run_id": args.run_id,
+                                     "at_ns": time.monotonic_ns()}) + "\n")
 
     record("start")
     message = {"schema": 1, "event": "receiver_ready" if role == "receiver" else "sender_started",
@@ -75,7 +78,7 @@ def fake_child() -> int:
     if mode == "foreign_session" and role == "receiver":
         message["sender_session"] = "1" if session != "1" else "2"
     line = b"AVSYNC_CONTROL " + json.dumps(message).encode("ascii") + b"\n"
-    suppress = (mode == "no_ready" and role == "receiver") or (mode in ("no_ack", "stderr_ack") and role == "sender")
+    suppress = ((mode == "no_ready" or (mode in ("no_ready_once", "remote_hang_once") and count == 1)) and role == "receiver") or (mode in ("no_ack", "stderr_ack") and role == "sender")
     if mode == "long_line" and role == "receiver":
         sys.stdout.buffer.write(b"x" * (pair.MAX_LINE + 20) + b"\n")
         sys.stdout.buffer.flush()
@@ -120,7 +123,7 @@ def fake_child() -> int:
             record("keepalive")
             lease = time.monotonic() + 5
         elif command == pair.STOP:
-            if mode == "ignore_stop":
+            if mode == "ignore_stop" or (mode == "remote_hang_once" and role == "receiver" and count == 1):
                 continue
             record("stop")
             if mode.startswith("native_"):
@@ -160,6 +163,65 @@ def fake_child() -> int:
     return 1
 
 
+def fake_retirement() -> int:
+    """Independent finite subprocess protocol fixture, not remote proof itself."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fake-retirement", action="store_true")
+    parser.add_argument("--proof-mode", required=True)
+    parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--expect-sender-session", dest="sender_session", required=True)
+    parser.add_argument("--challenge", required=True)
+    args = parser.parse_args()
+    path = args.state / "retirement.log"
+    previous = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    current = {"run_id": args.run_id, "sender_session": args.sender_session,
+               "challenge": args.challenge, "at_ns": time.monotonic_ns()}
+    with path.open("a", encoding="ascii") as handle:
+        handle.write(json.dumps(current) + "\n")
+    mode = args.proof_mode
+    if mode == "fail_second":
+        mode = "nonzero" if previous else "valid"
+    if mode == "replay_second":
+        mode = "replay" if previous else "valid"
+    proof = {"schema": 1, "event": "receiver_retired", "run_id": args.run_id,
+             "sender_session": args.sender_session, "challenge": args.challenge,
+             "proof": "fenced_empty_cgroup"}
+    if mode in ("never_started", "prior_boot"):
+        proof["proof"] = "fenced_" + mode
+    elif mode in ("wrong_run", "wrong_challenge"):
+        key = "run_id" if mode == "wrong_run" else "challenge"
+        proof[key] = "0" * 32 if proof[key] != "0" * 32 else "1" * 32
+    elif mode == "wrong_session":
+        proof["sender_session"] = "1" if args.sender_session != "1" else "2"
+    elif mode == "replay":
+        proof.update({key: previous[0][key] for key in ("run_id", "sender_session", "challenge")})
+    line = b"AVSYNC_RETIRE " + json.dumps(proof).encode("ascii") + b"\n"
+    if mode in ("hang", "valid_then_hang"):
+        if mode == "valid_then_hang":
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+        time.sleep(30)  # The controller must kill/reap this exact bounded fixture.
+        return 1
+    if mode == "stderr_only":
+        sys.stderr.buffer.write(line)
+    else:
+        if mode == "stdout_noise":
+            sys.stdout.buffer.write(b"DO_NOT_PUBLISH_PRIVATE_PROOF_DIAGNOSTIC\n")
+        sys.stdout.buffer.write(line[:-1] if mode == "truncated" else line)
+        if mode == "duplicate":
+            sys.stdout.buffer.write(line)
+        if mode == "stdout_overflow":
+            sys.stdout.buffer.write(b"x" * (1024 * 1024 + 1))
+    if mode == "stderr_overflow":
+        sys.stderr.buffer.write(b"x" * (1024 * 1024 + 1))
+    if mode == "stderr_noise":
+        sys.stderr.buffer.write(b"DO_NOT_PUBLISH_PRIVATE_PROOF_DIAGNOSTIC\n")
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.flush()
+    return 7 if mode == "nonzero" else 0
+
+
 def raw_config(state: Path, mode: str = "healthy", **changes) -> dict:
     common = [sys.executable, str(Path(__file__).resolve()), "--mode", mode, "--state", str(state)]
     result = {
@@ -178,6 +240,18 @@ def raw_config(state: Path, mode: str = "healthy", **changes) -> dict:
         "max_attempts": 3,
     }
     return {**result, **changes}
+
+
+def retirement_config(state: Path, mode: str = "healthy", proof_mode: str = "valid", **changes) -> dict:
+    result = raw_config(state, mode, total_seconds=changes.pop("total_seconds", 5),
+                        retire_timeout=changes.pop("retire_timeout", .8), **changes)
+    result["receiver_scope"] = "remote"
+    result["receiver_argv"] += ["--run-id", "{run_id}"]
+    result["retire_argv"] = [sys.executable, str(Path(__file__).resolve()), "--fake-retirement",
+                             "--proof-mode", proof_mode, "--state", str(state),
+                             "--run-id", "{run_id}", "--expect-sender-session", "{sender_session}",
+                             "--challenge", "{challenge}"]
+    return result
 
 
 def events(state: Path, role: str) -> list[dict]:
@@ -213,6 +287,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--sender-session") + 1], "123")
         self.assertEqual(argv[argv.index("--clock-epoch") + 1], "456")
 
+    def test_recoverable_stdin_fault_cannot_mask_later_terminal_output_fault(self):
+        child = object.__new__(pair.Child)
+        child.failure = None
+        child.output_failure = None
+        child._fail("stdin_write_failed")
+        child._fail("output_total_exceeded")
+        child._fail("stdout_read_failed")
+        self.assertEqual(child.failure, "stdin_write_failed")
+        self.assertEqual(child.output_failure, "output_total_exceeded")
+
     def test_invalid_configs(self):
         base = raw_config(Path("fixture"))
         variants = [{**base, "max_attempts": x} for x in (0, 4, True)]
@@ -239,6 +323,37 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(executable=executable), self.assertRaises(pair.PairError):
                 pair.Config.from_dict(base)
             self.assertEqual(pair.Config.from_dict({**base, "receiver_scope": "remote"}).receiver_scope, "remote")
+
+    def test_retirement_configuration_exact_argument_substitution(self):
+        config = pair.Config.from_dict(retirement_config(Path("private fixture")))
+        run_id, session, challenge = "a" * 32, "9007199254740993", "b" * 32
+        receiver = config.argv("receiver", session, None, 4, run_id=run_id)
+        self.assertEqual(receiver[receiver.index("--run-id") + 1], run_id)
+        query = config.retirement_argv(run_id, session, challenge)
+        for flag, expected in (("--run-id", run_id), ("--expect-sender-session", session),
+                               ("--challenge", challenge)):
+            self.assertEqual(query[query.index(flag) + 1], expected)
+        self.assertIn("private fixture", query)
+        self.assertIsInstance(config.retire_argv, tuple)
+
+    def test_invalid_retirement_configurations(self):
+        base = retirement_config(Path("fixture"))
+        variants = [{**base, "receiver_scope": "direct"}, {**base, "retire_argv": []},
+                    {**base, "retire_argv": "shell command"}]
+        variants += [{**base, "retire_timeout": value} for value in
+                     (0, .01, 10.01, True, None, float("nan"), float("inf"))]
+        variants += [{**base, "receiver_argv": base["receiver_argv"][:-2]},
+                     {**base, "receiver_argv": base["receiver_argv"] + ["--run-id", "{run_id}"]}]
+        for token in ("{run_id}", "{sender_session}", "{challenge}"):
+            variants.append({**base, "retire_argv": [arg for arg in base["retire_argv"] if arg != token]})
+        for arg in ("--challenge={challenge}", "{clock_epoch}", "{seconds}", "\nprivate", "\0"):
+            variants.append({**base, "retire_argv": base["retire_argv"] + [arg]})
+        variants += [{**raw_config(Path("fixture")), "retire_timeout": .8},
+                     {**raw_config(Path("fixture")), "receiver_scope": "remote",
+                      "receiver_argv": base["receiver_argv"]}]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(pair.PairError):
+                pair.Config.from_dict(value)
 
     def test_native_summary_preserves_uint64_without_private_fields(self):
         for role in ("receiver", "sender"):
@@ -361,6 +476,96 @@ class ProtocolTests(unittest.TestCase):
             os.chmod(state, 0o700)
 
 
+class RetirementProofTests(unittest.TestCase):
+    run_id = "a" * 32
+    session = "9007199254740993"
+    challenge = "b" * 32
+
+    def proof_line(self, **changes):
+        message = {"schema": 1, "event": "receiver_retired", "run_id": self.run_id,
+                   "sender_session": self.session, "challenge": self.challenge,
+                   "proof": "fenced_empty_cgroup"}
+        return b"AVSYNC_RETIRE " + json.dumps({**message, **changes}).encode("ascii") + b"\n"
+
+    def parse(self, line):
+        return pair.parse_retirement(line, self.run_id, self.session, self.challenge)
+
+    def test_only_exact_fenced_proofs_with_bound_attempt_identity(self):
+        for kind in ("fenced_empty_cgroup", "fenced_never_started", "fenced_prior_boot"):
+            self.assertEqual(self.parse(self.proof_line(proof=kind)), kind)
+        variants = [{"schema": value} for value in (True, 0, 2, "1")]
+        variants += [{"event": "receiver_ready"}, {"proof": "not_running"},
+                     {"proof": "ssh_exited"}, {"proof": True}, {"private": "extra"}]
+        for key, values in (("run_id", ("c" * 32, "A" * 32, "a" * 31, 123)),
+                             ("challenge", ("c" * 32, "B" * 32, "b" * 33, None)),
+                             ("sender_session", ("7", int(self.session), "0", "01", str(1 << 64)))):
+            variants += [{key: value} for value in values]
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                self.parse(self.proof_line(**variant))
+
+    def test_malformed_or_duplicate_proof_rejected(self):
+        valid = self.proof_line()
+        variants = (valid.replace(b'"schema": 1', b'"schema":1,"schema":1'),
+                    valid.replace(b'"schema": 1', b'"schema":NaN'),
+                    b"AVSYNC_RETIRE \xff", b"AVSYNC_RETIRE {", b"AVSYNC_RETIRE []",
+                    b"AVSYNC_RETIREX {}", b"AVSYNC_RETIRE " + b"x" * 4097,
+                    valid + b"\n" + valid)
+        for value in variants:
+            with self.subTest(value=value[:50]), self.assertRaises(ValueError):
+                self.parse(value)
+
+    def verify_fixture(self, mode, timeout=.8):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name)
+        argv = retirement_config(state, proof_mode=mode)["retire_argv"]
+        substitutions = {"{run_id}": self.run_id, "{sender_session}": self.session,
+                         "{challenge}": self.challenge}
+        argv = [substitutions.get(arg, arg) for arg in argv]
+        before = time.monotonic()
+        result = pair.verify_retirement(argv, self.run_id, self.session, self.challenge, timeout)
+        self.assertLess(time.monotonic() - before, timeout + .75, result)
+        serialized = json.dumps(result)
+        for private in (self.run_id, self.session, self.challenge, str(state), "DO_NOT_PUBLISH"):
+            self.assertNotIn(private, serialized)
+        return result
+
+    def test_fresh_independent_process_complete_exit_and_bounded_stderr(self):
+        for mode, proof in (("valid", "fenced_empty_cgroup"), ("stderr_noise", "fenced_empty_cgroup"),
+                            ("never_started", "fenced_never_started"), ("prior_boot", "fenced_prior_boot")):
+            with self.subTest(mode=mode):
+                result = self.verify_fixture(mode)
+                self.assertTrue(result["verified"], result)
+                self.assertEqual(result["proof"], proof)
+                self.assertFalse(result["forced_local_kill"], result)
+
+    def test_nonzero_partial_replayed_or_malicious_output_never_proves_retirement(self):
+        for mode in ("nonzero", "duplicate", "stdout_noise", "truncated", "wrong_run",
+                     "wrong_session", "wrong_challenge", "stderr_only", "stdout_overflow", "stderr_overflow"):
+            with self.subTest(mode=mode):
+                result = self.verify_fixture(mode)
+                self.assertFalse(result["verified"], result)
+                self.assertIsNone(result["proof"], result)
+                self.assertIsInstance(result["reason"], str)
+
+    def test_valid_line_without_successful_exit_is_not_proof(self):
+        for mode in ("hang", "valid_then_hang"):
+            with self.subTest(mode=mode):
+                result = self.verify_fixture(mode, timeout=.4)
+                self.assertFalse(result["verified"], result)
+                self.assertTrue(result["forced_local_kill"], result)
+                self.assertIsNone(result["proof"], result)
+
+    def test_invalid_query_budget_never_spawns_a_process(self):
+        from unittest.mock import patch
+        for timeout in (0, -.1, True, float("inf"), float("nan"), 10.1):
+            with self.subTest(timeout=timeout), patch.object(subprocess, "Popen") as spawn:
+                result = pair.verify_retirement(["unused"], self.run_id, self.session, self.challenge, timeout)
+                self.assertFalse(result["verified"])
+                spawn.assert_not_called()
+
+
 class ProcessTests(unittest.TestCase):
     def assertEqual(self, first, second, msg=None):
         # Include retained protocol/cleanup history in every fixture assertion.
@@ -368,11 +573,13 @@ class ProcessTests(unittest.TestCase):
             msg = self.last_result
         return super().assertEqual(first, second, msg)
 
-    def run_fixture(self, mode="healthy", **changes):
+    def run_fixture(self, mode="healthy", proof_mode=None, **changes):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         state = Path(directory.name)
-        config = pair.Config.from_dict(raw_config(state, mode, **changes))
+        raw = (raw_config(state, mode, **changes) if proof_mode is None else
+               retirement_config(state, mode, proof_mode, **changes))
+        config = pair.Config.from_dict(raw)
         class FaultBarrierSupervisor(pair.Supervisor):
             """Inject a real child crash only after both acknowledgments.
 
@@ -386,6 +593,13 @@ class ProcessTests(unittest.TestCase):
 
             def _poll(self, expected=None, event=None):
                 attempt = self.result.attempts
+                if expected is None and mode == "masked_output_failure" and attempt not in self.injected_attempts:
+                    if self.result.acknowledged_pairs < attempt:
+                        raise AssertionError("output failure injected before complete pair agreement")
+                    target = next(child for child in self.children if child.role == "receiver")
+                    target._fail("stdin_write_failed")
+                    target._fail("output_total_exceeded")
+                    self.injected_attempts.add(attempt)
                 inject = ((mode in ("receiver_dies_once", "sender_dies_once", "reused_provider") and attempt == 1)
                           or mode == "always_dies")
                 if expected is None and inject and attempt not in self.injected_attempts:
@@ -487,6 +701,161 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(result.attempts, 1)
                 self.assertTrue(result.remote_retirement_unverified)
                 self.assertEqual((state / "receiver.count").read_text(), "1")
+
+    def test_remote_healthy_stop_still_requires_independent_proof(self):
+        result, state = self.run_fixture(proof_mode="valid")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.attempts, 1)
+        self.assertFalse(result.remote_retirement_unverified)
+        self.assertEqual(len(result.remote_retirement_checks), 1)
+        self.assertTrue(result.remote_retirement_checks[0]["verified"])
+        queries = events(state, "retirement")
+        receiver = events(state, "receiver")
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0]["run_id"], receiver[0]["run_id"])
+        self.assertEqual(queries[0]["sender_session"], receiver[0]["session"])
+        self.assertGreater(queries[0]["at_ns"], receiver[-1]["at_ns"])
+        serialized = json.dumps(pair.asdict(result))
+        for private in (queries[0]["run_id"], queries[0]["sender_session"], queries[0]["challenge"], str(state)):
+            self.assertNotIn(private, serialized)
+
+    def test_verified_remote_retirement_enables_fresh_retry_without_erasing_fault(self):
+        result, state = self.run_fixture("receiver_dies_once", proof_mode="valid", total_seconds=7)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.acknowledged_pairs, 2)
+        self.assertFalse(result.remote_retirement_unverified)
+        self.assertEqual(len(result.remote_retirement_checks), 2)
+        self.assertTrue(all(item["verified"] for item in result.remote_retirement_checks))
+        self.assertTrue(any(fault.attempt == 1 and fault.reason.startswith("receiver_") for fault in result.faults))
+        starts = [item for item in events(state, "receiver") if item["event"] == "start"]
+        queries = events(state, "retirement")
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(queries), 2)
+        self.assertGreater(starts[1]["at_ns"], queries[0]["at_ns"])
+        for key in ("run_id", "session", "clock"):
+            self.assertNotEqual(starts[0][key], starts[1][key])
+        self.assertNotEqual(queries[0]["challenge"], queries[1]["challenge"])
+        for start, query in zip(starts, queries):
+            self.assertEqual(start["run_id"], query["run_id"])
+            self.assertEqual(start["session"], query["sender_session"])
+
+    def test_unknown_startup_window_is_fenced_before_retry(self):
+        result, state = self.run_fixture("no_ready_once", proof_mode="never_started",
+                                         ready_timeout=.6, total_seconds=7)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.acknowledged_pairs, 1)
+        self.assertTrue(any(f.reason == "receiver_ready_timeout" for f in result.faults))
+        self.assertEqual(len(result.remote_retirement_checks), 2)
+        self.assertTrue(all(item["verified"] for item in result.remote_retirement_checks))
+        starts = [item for item in events(state, "receiver") if item["event"] == "start"]
+        queries = events(state, "retirement")
+        self.assertEqual(queries[0]["run_id"], starts[0]["run_id"])
+        self.assertGreater(starts[1]["at_ns"], queries[0]["at_ns"])
+        self.assertEqual((state / "sender.count").read_text(), "1")
+
+    def test_failed_proof_without_ready_never_launches_second_receiver(self):
+        result, state = self.run_fixture("no_ready_once", proof_mode="nonzero", ready_timeout=.6)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.remote_retirement_unverified)
+        self.assertEqual(len(result.remote_retirement_checks), 1)
+        self.assertFalse(result.remote_retirement_checks[0]["verified"])
+        self.assertFalse((state / "sender.count").exists())
+        self.assertEqual((state / "receiver.count").read_text(), "1")
+
+    def test_fence_is_required_even_when_receiver_transport_spawn_raises(self):
+        from unittest.mock import patch
+        original_child = pair.Child
+        for proof_mode, expected_exit in (("never_started", 3), ("nonzero", 1)):
+            with self.subTest(proof_mode=proof_mode):
+                failed_once = False
+
+                def child_factory(role, argv):
+                    nonlocal failed_once
+                    if role == "receiver" and not failed_once:
+                        failed_once = True
+                        raise pair.PairError("receiver_spawn_failed")
+                    return original_child(role, argv)
+
+                with patch.object(pair, "Child", side_effect=child_factory):
+                    result, state = self.run_fixture(proof_mode=proof_mode)
+                self.assertEqual(result.exit_code, expected_exit)
+                self.assertEqual(result.attempts, 2 if expected_exit == 3 else 1)
+                self.assertTrue(any(f.reason == "receiver_spawn_failed" for f in result.faults))
+                self.assertEqual(len(result.remote_retirement_checks), result.attempts)
+                queries = events(state, "retirement")
+                self.assertEqual(len(queries), result.attempts)
+                if expected_exit == 3:
+                    start = next(item for item in events(state, "receiver") if item["event"] == "start")
+                    self.assertNotEqual(queries[0]["run_id"], start["run_id"])
+                    self.assertGreater(start["at_ns"], queries[0]["at_ns"])
+                else:
+                    self.assertFalse((state / "receiver.count").exists())
+
+    def test_failed_proof_also_rejects_otherwise_healthy_stop(self):
+        result, _ = self.run_fixture(proof_mode="nonzero")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.remote_retirement_unverified)
+        self.assertEqual(len(result.remote_retirement_checks), 1)
+        self.assertFalse(result.remote_retirement_checks[0]["verified"])
+
+    def test_old_proof_cannot_retire_successor_and_failed_second_proof_is_terminal(self):
+        for mode in ("fail_second", "replay_second"):
+            with self.subTest(mode=mode):
+                result, state = self.run_fixture("receiver_dies_once", proof_mode=mode, total_seconds=7)
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(result.attempts, 2)
+                self.assertTrue(result.remote_retirement_unverified)
+                self.assertEqual(len(result.remote_retirement_checks), 2)
+                self.assertTrue(result.remote_retirement_checks[0]["verified"])
+                self.assertFalse(result.remote_retirement_checks[1]["verified"])
+                self.assertEqual((state / "receiver.count").read_text(), "2")
+
+    def test_verified_remote_fence_allows_only_exact_receiver_transport_kill(self):
+        result, _ = self.run_fixture("remote_hang_once", proof_mode="valid", ready_timeout=.6,
+                                     total_seconds=7)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.forced_local_kills, 1)
+        self.assertTrue(result.faults)
+        self.assertTrue(all(item["verified"] for item in result.remote_retirement_checks))
+
+    def test_remote_proof_never_excuses_sender_forced_kill(self):
+        result, _ = self.run_fixture("ignore_stop", proof_mode="valid")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(result.forced_local_kills, 2)
+        self.assertTrue(result.remote_retirement_checks[0]["verified"])
+
+    def test_remote_proof_never_excuses_identity_or_output_corruption(self):
+        for mode in ("foreign_session", "stale_ack", "duplicate_ready", "long_line"):
+            with self.subTest(mode=mode):
+                result, _ = self.run_fixture(mode, proof_mode="valid", max_attempts=3)
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(result.attempts, 1)
+                self.assertTrue(result.remote_retirement_checks[0]["verified"])
+
+    def test_remote_proof_cannot_excuse_terminal_output_fault_masked_by_stdin_failure(self):
+        result, state = self.run_fixture("masked_output_failure", proof_mode="valid")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.remote_retirement_checks[0]["verified"])
+        self.assertTrue(any(f.reason == "receiver_stdin_write_failed" for f in result.faults))
+        self.assertTrue(any(f.reason == "receiver_output_total_exceeded" for f in result.faults))
+        self.assertEqual((state / "receiver.count").read_text(), "1")
+
+    def test_remote_proof_timeout_stays_inside_overall_budget_and_never_retries(self):
+        result, state = self.run_fixture("no_ready_once", proof_mode="valid_then_hang", ready_timeout=.6,
+                                         retire_timeout=.4, total_seconds=4)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.remote_retirement_unverified)
+        self.assertTrue(result.remote_retirement_checks[0]["forced_local_kill"])
+        self.assertFalse(result.remote_retirement_checks[0]["verified"])
+        self.assertEqual((state / "receiver.count").read_text(), "1")
 
     def test_receiver_restart_retires_sender_and_uses_fresh_pair(self):
         result, state = self.run_fixture("receiver_dies_once", total_seconds=5)
@@ -627,6 +996,8 @@ class ProcessTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if "--fake-retirement" in sys.argv:
+        os._exit(fake_retirement())
     if "--fake-child" in sys.argv:
         # Model a native process exit, without CPython waiting on the daemon
         # thread that deliberately blocks in the stdin fixture.
