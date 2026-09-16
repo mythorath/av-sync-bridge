@@ -69,9 +69,12 @@ stepped its timestamps under simulated clock mismatch. A new
 progression separate from original capture-clock diagnostics. A bounded
 [original-anchor transport diagnostic](docs/audio-anchor-transport-validation.md)
 now preserves those records independently of nominal RTP time, with strict
-sample-position and generation checks. Live adaptive correction and combined
-physical A/V delivery remain separate gates; continuous nominal timestamps alone
-cannot satisfy them.
+sample-position and generation checks. An [offline correction worker](docs/audio-correction.md)
+now combines validated PCM, original-clock estimates and bounded resampling;
+see its [generated-media results and open gates](docs/audio-correction-validation.md).
+Runtime phase monitoring, live adaptive correction and combined physical A/V
+delivery remain separate gates; continuous nominal timestamps alone cannot
+satisfy them.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

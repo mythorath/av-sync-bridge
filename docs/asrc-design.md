@@ -1,12 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# Receiver ASRC: proposed next milestone
+# Receiver ASRC: design and staged implementation
 
 Status: **complete-system design with offline-tested components, 2026-09-15**.
 The [bounded DSP backend](asrc-backend.md), [original-anchor metadata policy](audio-anchors.md)
 and [generated-signal fixture](asrc-validation.md) are now implemented separately.
-There is still no live adaptive controller, original-anchor wire transport or
-hardware/OBS synchronization claim. The [current conversion diagnostic](conversion-timing.md)
-now measures the gate-zero failure predicted below; live activation stays off.
+The [original-anchor wire diagnostic](audio-anchor-transport-validation.md) now
+preserves that timing separately from nominal RTP progression. A bounded
+[offline feed-forward worker](audio-correction.md) implements acquisition,
+fixed-quantum command control and failure/reset handling, but not the required
+runtime phase monitor or live integration. There is still no hardware/OBS
+synchronization claim. The [old conversion diagnostic](conversion-timing.md)
+measured the gate-zero failure predicted below; live activation stays off.
 The contracts in [network-clock.md](network-clock.md),
 [audio-conversion.md](audio-conversion.md), and [timing.md](timing.md) remain
 authoritative. This first milestone concerns desktop audio, not the microphone.
@@ -90,9 +94,10 @@ The **offline ASRC harness with independently generated anchors**, conversion
 observability fixture, and timestamp-free nominal converter are now implemented
 and tested separately. The bounded [original-anchor transport diagnostic](audio-anchor-transport-validation.md)
 also preserves original metadata and its exact nominal sample association.
-Live correction remains disabled: the next boundary is owned validated PCM
-through one bounded correction worker and presentation schedule, with independent
-content-time/load/restart measurements. No silent timestamp rewrite is approved.
+Live correction remains disabled: the owned-PCM correction worker now has an
+offline fixture. Runtime phase monitoring, changing-ratio signal-quality/resource
+gates and connection to a presentation schedule still require measurements.
+No silent timestamp rewrite is approved.
 
 ## Receiver placement and one correction owner
 
@@ -240,6 +245,7 @@ Keep generated audio and detailed run logs outside the public repository.
 Use separate counters for received/consumed/produced frames, priming discards,
 late drops, reset reason, ratio saturation, no-progress calls and stale anchors.
 Log aggregate timing/peak/resource diagnostics, not endpoint identities or PCM.
-The next implementation deliverable should be the optional worker plus offline
-harness and a clear pass/fail report; it should not change startup services,
+The [offline worker/harness report](audio-correction-validation.md) now records
+the implemented subset. Runtime phase monitoring, variable-ratio quality and
+resource measurements are the next gates; they must not change startup services,
 normal OBS sources, mute macros, or the current production audio route.

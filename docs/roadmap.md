@@ -47,6 +47,10 @@ isolated real-capture development, not production deployment.
 - [ ] Automatic provider/sender restart handshake, loaded loss/reordering/recovery
   and sustained original-anchor uncertainty characterization.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
+- [x] Offline desktop feed-forward worker: stable-rate acquisition, fixed-quantum
+  command slew, owned bounded queues, original-anchor origin and explicit reset.
+- [ ] Runtime phase-error monitor and independently validated variable-ratio
+  waveform/resource behavior before activating that worker on live PCM.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
 gates. No microphone, adaptive drift control, RTX, combined real A/V OBS handoff,
@@ -59,6 +63,9 @@ See [offline DSP evidence](asrc-validation.md), the measured old
 [nominal conversion replacement](nominal-audio-validation.md). A tested resampler is not a completed
 live rate controller. The [original-anchor transport milestone](audio-anchor-transport-validation.md)
 preserves the timing relationship diagnostically; it does not yet drive ASRC or OBS.
+The [offline correction worker](audio-correction.md) now drives ASRC from generated
+original anchors. See its [validation report](audio-correction-validation.md);
+the broader live controller gate remains open.
 
 If the shared timestamp relationship does not survive either capture or OBS
 delivery, stop and revise that boundary. Do not disguise failure with a new offset.

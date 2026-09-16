@@ -91,6 +91,17 @@ the quick suite. Windows tests the dependency-free anchor policy; no Windows ASR
 binary or performance certification is implied. See [backend contract](asrc-backend.md)
 and [offline results and limitations](asrc-validation.md).
 
+The same option also builds `avsync_audio_correction` and its generated-only
+controller fixture. It does not enable live correction. Run its bounded long
+matrix with:
+
+```sh
+python3 tools/run_audio_correction_suite.py \
+  --executable build-asrc/avsync-audio-correction-fixture --long --jobs 2
+```
+
+See the [worker contract](audio-correction.md) and [controller results](audio-correction-validation.md).
+
 ## Optional network diagnostics
 
 `AVSYNC_BUILD_NETWORK=ON` adds the desktop-only Windows sender or the Linux

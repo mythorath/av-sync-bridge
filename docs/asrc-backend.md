@@ -32,9 +32,10 @@ call and does not itself allocate, lock, perform I/O, or retain the caller's
 spans. The library copies required sample history into its own state. The
 wrapper's input availability is capped at 9,600 frames, output capacity at 3,840
 frames. At stereo F32 those are 76,800 and 30,720 bytes; these caps do **not** bound
-library state or the whole process. The future worker still needs a per-dispatch
-budget (design: eight calls and 3,840 generated frames), deadlines and scheduling
-measurements. A frame count cap is not a hard real-time wall-clock guarantee.
+library state or the whole process. The separate [offline worker](audio-correction.md)
+now enforces an eight-call/3,840-frame dispatch budget and queue deadlines.
+Complete scheduling measurements remain open. A frame count cap is not a hard
+real-time wall-clock guarantee.
 
 Buffer lengths are float counts and must be even. Input/output must not overlap;
 oversized, malformed or nonfinite input is rejected before changing state. A
@@ -94,11 +95,11 @@ mathematical end of that ramp. This is why a 480-frame call and a 3,840-frame ca
 with the same command are **not** a fixed-duration, chunk-invariant slew.
 [Pinned stereo implementation](https://github.com/libsndfile/libsamplerate/blob/0.2.2/src/src_sinc.c#L546-L627).
 
-The backend intentionally does not implement the proposed 100 ppm/output-second
-controller. That future controller must retain unfinished-quantum state and
-advance only by generated output frames, including partial/no-progress calls;
-its schedule and phase error require independent fixtures. Passing a new target
-once per arriving packet is not such a controller.
+The backend intentionally does not implement a rate controller. The separate
+[offline worker](audio-correction.md) uses fixed complete 480-frame output calls,
+a 99 ppm/output-second command limit, and faults on a partial backend quantum.
+Its schedule/phase fixtures do not measure instantaneous reached ratio. Passing
+a new target once per arriving packet is not such a controller.
 
 ## Unit validation and limits
 
