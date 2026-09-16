@@ -4,6 +4,18 @@ There is no production release yet. A checked item means the named milestone is
 implemented and tested as described, not that physical A/V synchronization is
 proven. Record evidence separately in validation reports.
 
+## Current work order: supervised integration first
+
+The operator has explicitly chosen to proceed with reversible normal-OBS
+desktop/video integration and physical calibration before the remaining recovery
+qualification. See [supervised sessions](supervised-session.md): manual start,
+an explicit lifetime of at most 12 hours, one attempt, and stop on known failure.
+This does not complete any unchecked release gate. Recorded cross-host restart,
+controller-death reconciliation, queued-network-stale rejection, reboot/autostart
+and representative-load qualification remain outstanding. Microphone work stays
+separate and deferred. No normal-profile live result is asserted by this work-order
+change.
+
 ## Milestone 1 — synthetic timing foundation
 
 - [x] Portable timestamp arithmetic, rational cadence and bounded queue policies.
@@ -88,7 +100,7 @@ isolated real-capture development, not production deployment.
   Recovery includes a measured silence gap; whole-process/reboot recovery and
   loaded physical calibration remain open. See [recovery scope](desktop-recovery.md).
 - [ ] Loaded clock/recovery repeatability, source-timestamp uncertainty and
-  complete resource qualification before a production or OBS correction path.
+  complete resource qualification before claiming production readiness.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
 gates. No live microphone path, RTX, reliable continuous combined A/V handoff,
@@ -110,6 +122,8 @@ delivery, stop and revise that boundary. Do not disguise failure with a new offs
 
 ## Milestone 3 — production readiness
 
+- [ ] Reversible supervised normal-OBS integration and complete physical timing
+  confirmation; this is the current priority, not unattended deployment.
 - [ ] Three unchanged unique-event runs: median offset <= one frame and every
   marker <= two frames at 60 fps on the **production physical end-to-end** path.
   Three isolated physical runs passed these limits; the normal-profile production

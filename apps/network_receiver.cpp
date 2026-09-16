@@ -63,12 +63,14 @@ struct Options {
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
     bool expect_media{}, expect_anchors{}, correct_desktop{}, recover_desktop_ipc{};
-    bool control_stdin{}, replace_desktop_ipc{};
+    bool control_stdin{}, replace_desktop_ipc{}, session_mode{};
     std::optional<std::uint64_t> expected_sender_session;
 };
 void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
                  " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
+                 " --session-seconds 1..43200 replaces --seconds for explicit supervised use; pinned stdin control required.\n"
+                 "Session mode has no automatic recovery; clock-pause/recovery fixture flags are rejected.\n"
                  " [--expect-sender-session N] (pin an explicit nonzero sender identity; requires anchors)\n"
                  " [--control-stdin] (pinned process agreement, 5-second KEEPALIVE/STOP pipe lease)\n"
                  " [--replace-desktop-ipc] (requires pinned control mode; retires validated previous IPC v2)\n"
@@ -907,6 +909,7 @@ int main(int argc,char** argv) {
     if (argc==1 || (argc==2 && std::string_view(argv[1])=="--help")) { help(); return 0; }
     try {
         Options options;
+        bool duration_seen = false;
         for (int i=1;i<argc;++i) {
             const std::string_view arg(argv[i]);
             if(arg=="--expect-media") { options.expect_media=true; continue; }
@@ -926,7 +929,12 @@ int main(int argc,char** argv) {
             else if(arg=="--clock-port") options.clock_port=number(value,1024,65535);
             else if(arg=="--rtp-port") options.rtp_port=number(value,1024,65535);
             else if(arg=="--rtcp-port") options.rtcp_port=number(value,1024,65535);
-            else if(arg=="--seconds") options.seconds=number(value,1,180);
+            else if(arg=="--seconds" || arg=="--session-seconds") {
+                require(!duration_seen,"Duration options are mutually exclusive and cannot repeat");
+                duration_seen=true;
+                options.session_mode=arg=="--session-seconds";
+                options.seconds=number(value,1,options.session_mode ? 43200 : 180);
+            }
             else if(arg=="--expect-sender-session") {
                 require(!options.expected_sender_session, "Duplicate expected sender session");
                 options.expected_sender_session=identity(value);
@@ -942,6 +950,10 @@ int main(int argc,char** argv) {
                 "Pinned sender identity requires original-anchor mode");
         require(!options.control_stdin || options.expected_sender_session,
                 "Control stdin requires an explicit pinned sender identity");
+        require(!options.session_mode || options.control_stdin,
+                "Supervised sessions require pinned stdin control");
+        require(!options.session_mode || (!options.recover_desktop_ipc && !options.clock_pause_after && !options.clock_pause_seconds),
+                "Supervised sessions cannot use recovery or clock-pause fixture options");
         require(!options.replace_desktop_ipc || (options.control_stdin && !options.desktop_ipc.empty()),
                 "IPC replacement requires explicit desktop output and pinned stdin control");
         gst_init(nullptr,nullptr);

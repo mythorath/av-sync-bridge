@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Finite, desktop-only process agreement fixture. Not an audio health monitor."""
+"""Finite desktop process control, with explicit supervised-session opt-in.
+
+Default diagnostics remain bounded to 180 seconds. Sessions permit at most
+twelve hours and exactly one process pair; they do not enable automatic recovery
+or turn process agreement into audio-health evidence.
+"""
 
 from __future__ import annotations
 
@@ -201,14 +206,20 @@ class Config:
     receiver_scope: str = "direct"
     retire_argv: tuple[str, ...] | None = None
     retire_timeout: float = 8.0
+    session_mode: bool = False
 
     @classmethod
     def from_dict(cls, value: Any) -> "Config":
         allowed = {"receiver_argv", "sender_argv", "total_seconds", "max_attempts",
                    "ready_timeout", "ack_timeout", "stop_grace", "require_native_summaries", "receiver_scope",
-                   "retire_argv", "retire_timeout"}
+                   "retire_argv", "retire_timeout", "session_mode"}
         if not isinstance(value, dict) or set(value) - allowed:
             raise PairError("invalid_config_keys")
+        session_mode = value.get("session_mode", False)
+        if type(session_mode) is not bool:
+            raise PairError("invalid_session_mode")
+        duration_flag = "--session-seconds" if session_mode else "--seconds"
+        other_duration_flag = "--seconds" if session_mode else "--session-seconds"
         for role in ("receiver", "sender"):
             argv = value.get(role + "_argv")
             if (not isinstance(argv, list) or not 1 <= len(argv) <= 128 or
@@ -223,7 +234,14 @@ class Config:
             for arg in argv:
                 if ("{" in arg or "}" in arg) and arg not in placeholders:
                     raise PairError("non_exact_placeholder")
-            required = {"--seconds": "{seconds}",
+            if any(arg == other_duration_flag or arg.startswith(other_duration_flag + "=") or
+                   arg.startswith(duration_flag + "=") for arg in argv):
+                raise PairError("duration_mode_mismatch")
+            if session_mode and role == "receiver" and any(
+                    arg.split("=", 1)[0] in ("--recover-desktop-ipc", "--clock-pause-after", "--clock-pause-seconds")
+                    for arg in argv):
+                raise PairError("session_recovery_disabled")
+            required = {duration_flag: "{seconds}",
                         "--expect-sender-session" if role == "receiver" else
                         "--sender-session": "{sender_session}"}
             if role == "sender":
@@ -236,17 +254,19 @@ class Config:
                 raise PairError("control_stdin_required")
             for flag, token in required.items():
                 if (argv.count(flag) != 1 or argv.index(flag) + 1 >= len(argv) or
-                    argv[argv.index(flag) + 1] != token):
+                    argv[argv.index(flag) + 1] != token or argv.count(token) != 1):
                     raise PairError("required_flag_placeholder")
-        for key, low, high in (("total_seconds", 1, 180), ("ready_timeout", .1, 30),
+        for key, low, high in (("total_seconds", 1, 43200 if session_mode else 180), ("ready_timeout", .1, 30),
                                ("ack_timeout", .1, 30), ("stop_grace", .05, 2), ("retire_timeout", .1, 10)):
             setting = value.get(key, getattr(cls, key))
             if (type(setting) not in (int, float) or not math.isfinite(setting) or
                 not low <= setting <= high):
                 raise PairError("invalid_config_bound")
-        attempts = value.get("max_attempts", 3)
+        attempts = value.get("max_attempts", 1 if session_mode else 3)
         if type(attempts) is not int or not 1 <= attempts <= 3:
             raise PairError("invalid_attempt_bound")
+        if session_mode and attempts != 1:
+            raise PairError("session_requires_one_attempt")
         if type(value.get("require_native_summaries", False)) is not bool:
             raise PairError("invalid_summary_requirement")
         scope = value.get("receiver_scope", "direct")
@@ -256,6 +276,8 @@ class Config:
         if program in ("ssh", "ssh.exe") and scope != "remote":
             raise PairError("ssh_requires_remote_scope")
         retire = value.get("retire_argv")
+        if session_mode and scope == "remote" and retire is None:
+            raise PairError("session_remote_retirement_required")
         if retire is not None:
             if (scope != "remote" or not isinstance(retire, list) or not 1 <= len(retire) <= 128 or
                     any(not isinstance(arg, str) or not arg or len(arg) > 4096 or
@@ -273,6 +295,7 @@ class Config:
             raise PairError("retire_timeout_requires_query")
         result = cls(**{**value, "receiver_argv": tuple(value["receiver_argv"]),
                         "sender_argv": tuple(value["sender_argv"]),
+                        "max_attempts": attempts,
                         "retire_argv": tuple(retire) if retire is not None else None})
         # Reserve cooperative cleanup + kill/reap time INSIDE the finite budget.
         if result.total_seconds <= result.stop_grace + .6 + (result.retire_timeout + .5 if retire is not None else 0):
@@ -750,7 +773,8 @@ class Supervisor:
                             # needs an independent irreversible cancellation fence.
                             self.pending_retirement = (run_id, session)
                             self.result.remote_retirement_unverified = True
-                        seconds = max(1, min(180, math.ceil(final_deadline - time.monotonic())))
+                        seconds = max(1, min(43200 if self.config.session_mode else 180,
+                                             math.ceil(final_deadline - time.monotonic())))
                         receiver = Child("receiver", self.config.argv("receiver", session, None, seconds, run_id))
                         self.children.append(receiver)
                         clock = self._wait_handshake(receiver, "receiver_ready", session, None,

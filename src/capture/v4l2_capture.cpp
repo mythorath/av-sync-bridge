@@ -333,6 +333,20 @@ void V4l2Capture::run(std::chrono::seconds duration, const FrameCallback &callba
 {
     if (duration < std::chrono::seconds(1) || duration > std::chrono::seconds(180) || !callback)
         throw std::invalid_argument("capture duration must be 1..180 seconds with a callback");
+    run_impl(duration, callback, stop_requested);
+}
+
+void V4l2Capture::run_supervised(std::chrono::seconds duration, const FrameCallback &callback,
+                                const StopRequested &stop_requested)
+{
+    if (duration < std::chrono::seconds(1) || duration > std::chrono::seconds(43200) || !callback || !stop_requested)
+        throw std::invalid_argument("supervised capture must be 1..43200 seconds with frame and stop callbacks");
+    run_impl(duration, callback, stop_requested);
+}
+
+void V4l2Capture::run_impl(std::chrono::seconds duration, const FrameCallback &callback,
+                         const StopRequested &stop_requested)
+{
     if (impl_->used) throw std::logic_error("one capture object represents only one generation");
     impl_->used = true;
     impl_->run_start_ns = monotonic_now();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Explicit video-only capture -> bounded memory IPC. No OBS/network/audio access.
 #include "avsync/ipc.hpp"
+#include "avsync/process_control.hpp"
 #include "avsync/timing.hpp"
 #include "avsync/v4l2_capture.hpp"
 #include "avsync/video_handoff.hpp"
@@ -29,6 +30,7 @@
 namespace {
 volatile std::sig_atomic_t interrupted = 0;
 void stop(int) { interrupted = 1; }
+struct Cancelled {};
 void require(bool value, const char* error) { if (!value) throw std::runtime_error(error); }
 unsigned number(const char* value, unsigned low, unsigned high) {
     const std::string_view text(value); unsigned result{};
@@ -40,6 +42,9 @@ unsigned number(const char* value, unsigned low, unsigned high) {
 void help() {
     std::cout << "avsync-video-bridge --capture --device /dev/videoN --runtime-dir NEW_TMPFS_DIRECTORY\n"
                  " --seconds 1..180 [--delay-ms 0..2000] [--verify-delivery] [--trace-markers]\n"
+                 " --session-seconds 1..43200 replaces --seconds for explicit supervised use; --control-stdin required.\n"
+                 "Stdin pipe: AVSYNC_KEEPALIVE / AVSYNC_STOP, EOF or five-second lease expiry stops capture.\n"
+                 "Session mode rejects finite marker traces; no automatic recovery or restart certification.\n"
                  "Current NV12 format only; device must be released by its existing owner.\n"
                  "Video pixels are buffered in a private temporary memory-backed IPC file.\n"
                  "The new directory and its IPC files are removed on normal/error exit.\n"
@@ -47,7 +52,11 @@ void help() {
                  "Optional verification reads delayed IPC pixels in memory, not a video display.\n"
                  "Optional marker tracing emits bounded sparse cyan scores after capture stops.\n";
 }
-struct Options { std::string device, directory; unsigned seconds{}, delay_ms{2000}; bool capture{}, verify{}, trace_markers{}; };
+struct Options {
+    std::string device, directory;
+    unsigned seconds{}, delay_ms{2000};
+    bool capture{}, verify{}, trace_markers{}, control_stdin{}, session_mode{};
+};
 Options parse(int argc, char** argv) {
     Options o; unsigned seen{};
     for (int i=1;i<argc;++i) {
@@ -55,17 +64,21 @@ Options parse(int argc, char** argv) {
         if (arg=="--capture" && !o.capture) { o.capture=true; continue; }
         if (arg=="--verify-delivery" && !o.verify) { o.verify=true; continue; }
         if (arg=="--trace-markers" && !o.trace_markers) { o.trace_markers=true; continue; }
+        if (arg=="--control-stdin" && !o.control_stdin) { o.control_stdin=true; continue; }
         require(i+1<argc,"missing option value"); const auto* value=argv[++i];
         unsigned bit{};
         if (arg=="--device") { bit=1; o.device=value; }
         else if (arg=="--runtime-dir") { bit=2; o.directory=value; }
         else if (arg=="--seconds") { bit=4; o.seconds=number(value,1,180); }
+        else if (arg=="--session-seconds") { bit=4; o.seconds=number(value,1,43200); o.session_mode=true; }
         else if (arg=="--delay-ms") { bit=8; o.delay_ms=number(value,0,2000); }
         else throw std::runtime_error("unknown or repeated argument");
         require(!(seen&bit),"repeated argument"); seen|=bit;
     }
     require(o.capture && !o.device.empty() && !o.directory.empty() && o.seconds,
             "explicit capture, device, new runtime directory and duration required");
+    require(!o.session_mode || o.control_stdin,"supervised sessions require stdin control");
+    require(!o.session_mode || !o.trace_markers,"supervised sessions cannot use finite marker tracing");
     return o;
 }
 
@@ -145,11 +158,12 @@ struct Stats {
 };
 
 int run(const Options& options) {
+    avsync::process::StdinControl control(options.control_stdin);
     RuntimeDirectory runtime;
     std::unique_ptr<avsync::ipc::Writer> writer;
     std::unique_ptr<avsync::ipc::Reader> reader;
     std::unique_ptr<avsync::V4l2Capture> capture;
-    std::atomic<bool> done{false}, failed{false};
+    std::atomic<bool> done{false}, failed{false}, cancelled{false};
     std::unique_ptr<avsync::Nv12VideoHandoff> handoff;
     std::unique_ptr<avsync::Nv12MarkerTrace> marker_trace;
     std::vector<Ledger> ledger;
@@ -159,7 +173,14 @@ int run(const Options& options) {
     Stats stats;
     std::uint64_t mapping_bytes{};
     std::string error;
+    const auto check_control = [&] {
+        if (control.poll()!=avsync::process::ControlState::active) {
+            cancelled.store(true);
+            throw Cancelled{};
+        }
+    };
     try {
+        check_control(); // Buffered STOP/EOF must precede even opening the device.
         capture=std::make_unique<avsync::V4l2Capture>(options.device);
         const auto format=capture->format();
         require(format.frame_interval_numerator && format.frame_interval_denominator,
@@ -188,12 +209,13 @@ int run(const Options& options) {
         }
         ledger.resize(reader ? config.video_capacity : 0);
         received_pixels.resize(reader ? avsync::ipc::video_bytes(config) : 0);
+        check_control(); // Ring prefaulting must not outlive the control lease.
         worker=std::thread([&] {
             try {
                 std::int64_t last_presentation=0, next_heartbeat=0;
                 std::uint64_t last_sequence=0,last_digest=0;
                 bool pending_was_busy=false;
-                while (!failed.load()) {
+                while (!failed.load() && !cancelled.load()) {
                     const auto now=avsync::ipc::monotonic_ns();
                     using Publication=avsync::VideoPublicationResult;
                     const auto publication=avsync::try_publish_oldest_video(*handoff,now,delay_ns,
@@ -259,19 +281,31 @@ int run(const Options& options) {
         std::cout << "AVSYNC_VIDEO_READY width=" << config.width << " height=" << config.height
                   << " delay_ms=" << options.delay_ms << " video_only=true\n" << std::flush;
         try {
-            capture->run(std::chrono::seconds(options.seconds),[&](const avsync::V4l2FrameView& frame) {
+            const auto frame_callback = [&](const avsync::V4l2FrameView& frame) {
                 const auto result=handoff->try_copy(frame.pixels,frame.capture_ns);
                 if (result==avsync::VideoHandoffStatus::full) ++stats.handoff_full;
                 else require(result==avsync::VideoHandoffStatus::ok,"invalid capture handoff");
                 if (marker_trace)
                     (void)marker_trace->append(frame.pixels,frame.capture_ns,frame.sequence,
                         result==avsync::VideoHandoffStatus::ok);
-            },[&] { return interrupted!=0 || failed.load(); });
+            };
+            const auto stop_requested = [&] {
+                if (control.poll()!=avsync::process::ControlState::active) cancelled.store(true);
+                return interrupted!=0 || failed.load() || cancelled.load();
+            };
+            if (options.session_mode)
+                capture->run_supervised(std::chrono::seconds(options.seconds),frame_callback,stop_requested);
+            else capture->run(std::chrono::seconds(options.seconds),frame_callback,stop_requested);
         } catch (...) { failed.store(true); throw; }
+        if (control.poll()!=avsync::process::ControlState::active) cancelled.store(true);
         done.store(true);
         worker.join();
         require(!failed.load(),"video worker failed");
-        require(stats.published>=2 && (!options.verify || stats.verified>=2),"insufficient captured/delayed frames");
+        if (!cancelled.load())
+            require(stats.published>=2 && (!options.verify || stats.verified>=2),"insufficient captured/delayed frames");
+    } catch (const Cancelled&) {
+        done.store(true);
+        if (worker.joinable()) worker.join();
     } catch (const std::exception& caught) {
         error=caught.what(); failed.store(true); done.store(true);
         if (worker.joinable()) worker.join();
@@ -280,6 +314,8 @@ int run(const Options& options) {
     reader.reset(); writer.reset();
     const bool cleaned=runtime.cleanup();
     const auto capture_stats=capture ? capture->stats() : avsync::V4l2CaptureStats{};
+    const bool controlled=control.state()!=avsync::process::ControlState::active &&
+        error.empty() && cleaned && !failed.load() && !stats.failures;
     const bool clean=error.empty() && cleaned && !capture_stats.driver_error_buffers &&
         !capture_stats.missing_sequences && !capture_stats.interrupted && !stats.handoff_full &&
         stats.published==capture_stats.accepted && !stats.stale_before_publish && !stats.failures &&
@@ -287,7 +323,8 @@ int run(const Options& options) {
             marker_trace->points().size()==capture_stats.accepted)) &&
         (!options.verify || stats.received==stats.published);
     std::cout << "{\"schema\":1,\"video_only\":true,\"obs_used\":false,\"status\":\""
-              << (clean ? (options.verify ? "bounded_video_verified" : "video_buffered_unverified") : "degraded_or_failed")
+              << (controlled ? avsync::process::state_name(control.state()) :
+                  clean ? (options.verify ? "bounded_video_verified" : "video_buffered_unverified") : "degraded_or_failed")
               << "\",\"verification_requested\":" << (options.verify ? "true" : "false") << ",\"runtime_cleaned\":"
               << (cleaned ? "true" : "false") << ",\"mapping_bytes\":" << mapping_bytes
               << ",\"delay_ms\":" << options.delay_ms << ",\"captured\":" << capture_stats.accepted
@@ -324,6 +361,7 @@ int run(const Options& options) {
     }
     std::cout << "}\n";
     if (!error.empty()) std::cerr << error << '\n'; // All local error text is generic.
+    if (controlled) return control.state()==avsync::process::ControlState::stopped ? 0 : 1;
     return clean ? 0 : 3;
 }
 }

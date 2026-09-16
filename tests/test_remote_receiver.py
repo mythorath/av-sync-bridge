@@ -28,6 +28,7 @@ SESSION = "18446744073709551615"
 BOOT = "12345678-1234-1234-1234-123456789abc"
 OTHER_BOOT = "abcdef12-1234-1234-1234-123456789abc"
 ARGV = ("/private/receiver", "--expect-sender-session", "{sender_session}", "--seconds", "{seconds}", "--control-stdin")
+SESSION_ARGV = tuple("--session-seconds" if arg == "--seconds" else arg for arg in ARGV)
 
 
 class MemoryStore:
@@ -136,6 +137,97 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(store.data["intent.json"]["boot_id"], BOOT)
         with self.assertRaisesRegex(remote.RemoteError, "already_reserved"):
             remote.prepare_intent(store, ARGV, 15, BOOT, time.monotonic() + 1)
+
+    def test_session_argv_requires_matching_explicit_mode(self):
+        self.assertEqual(remote.validate_argv(list(SESSION_ARGV), session_mode=True), SESSION_ARGV)
+        for argv, mode in ((SESSION_ARGV, False), (ARGV, True), (SESSION_ARGV, 1),
+                           ((*SESSION_ARGV, "--seconds", "{seconds}"), True),
+                           ((*SESSION_ARGV, "--seconds=180"), True),
+                           ((*SESSION_ARGV, "--session-seconds=43200"), True),
+                           ((*SESSION_ARGV, "--session-seconds", "{seconds}"), True),
+                           ((*SESSION_ARGV, "--recover-desktop-ipc"), True),
+                           ((*SESSION_ARGV, "--clock-pause-after", "5"), True),
+                           ((*SESSION_ARGV, "--clock-pause-seconds=2"), True)):
+            with self.subTest(argv=argv, mode=mode), self.assertRaises(remote.RemoteError):
+                remote.validate_argv(list(argv), session_mode=mode)
+
+    def test_session_intent_preserves_schema_and_authorizes_exact_duration(self):
+        store = MemoryStore()
+        value = remote.prepare_intent(store, SESSION_ARGV, 43200, BOOT, time.monotonic() + 1, session_mode=True)
+        self.assertEqual(set(value), set(intent().data["intent.json"]))
+        self.assertEqual(value["seconds"], 43200)
+        self.assertEqual(remote.validate_intent(value, RUN, SESSION), value)
+        self.assertIn("--property=RuntimeMaxSec=43205", remote.start_argv(Path("/private/state"), value))
+        def execute(argv):
+            self.assertTrue(store.locked_now)
+            self.assertIn("receipt.json", store.data)
+            self.assertEqual(argv, ["/private/receiver", "--expect-sender-session", SESSION,
+                                    "--session-seconds", "43200", "--control-stdin"])
+            raise Executed()
+        with self.assertRaises(Executed):
+            remote.authorize_gate(store, Backend(), BOOT, time.monotonic() + 1, execute)
+        self.assertEqual(self.retire(store)["proof"], "fenced_empty_cgroup")
+
+    def test_session_limits_do_not_expand_legacy_diagnostics(self):
+        for argv, seconds, mode in ((ARGV, 181, False), (SESSION_ARGV, 43201, True),
+                                    (SESSION_ARGV, 0, True), (SESSION_ARGV, True, True),
+                                    (SESSION_ARGV, 181, False), (ARGV, 181, True)):
+            store = MemoryStore()
+            with self.subTest(argv=argv, seconds=seconds, mode=mode), self.assertRaises(remote.RemoteError):
+                remote.prepare_intent(store, argv, seconds, BOOT, time.monotonic() + 1, session_mode=mode)
+            self.assertEqual(store.data, {})
+        legacy = intent().data["intent.json"]
+        self.assertEqual(remote.validate_intent(legacy, RUN, SESSION), legacy)
+        for updates in ({"seconds": 181}, {"seconds": True},
+                        {"receiver_argv": list(SESSION_ARGV), "seconds": 43201},
+                        {"receiver_argv": [*SESSION_ARGV, "--seconds", "{seconds}"]},
+                        {"session_mode": True}):
+            with self.subTest(updates=updates), self.assertRaises(remote.RemoteError):
+                remote.validate_intent({**legacy, **updates}, RUN, SESSION)
+
+    def test_session_gate_requires_matching_finite_runtime_policy(self):
+        store = MemoryStore()
+        value = remote.prepare_intent(store, SESSION_ARGV, 43200, BOOT, time.monotonic() + 1, session_mode=True)
+        backend = remote.Systemd()
+        cgroup = "/user.slice/" + remote.unit_name(RUN)
+        info = mock.Mock(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=2)
+        for runtime, valid in (("12h 5s", True), ("20s", False), ("infinity", False)):
+            state = show(MainPID=str(os.getpid()), RuntimeMaxUSec=runtime)
+            with self.subTest(runtime=runtime), mock.patch.dict(os.environ, INVOCATION_ID=INVOCATION), \
+                    mock.patch("builtins.open", mock.mock_open(read_data=("0::" + cgroup + "\n").encode())), \
+                    mock.patch.object(backend, "show", return_value=state), mock.patch.object(os, "stat", return_value=info):
+                if valid:
+                    result = backend.gate_identity(value, time.monotonic() + 1)
+                    self.assertEqual(result["invocation_id"], INVOCATION)
+                    self.assertEqual(result["cgroup"], cgroup)
+                else:
+                    with self.assertRaises(remote.RemoteError):
+                        backend.gate_identity(value, time.monotonic() + 1)
+
+    def test_session_cancellation_still_fences_delayed_gate(self):
+        store = MemoryStore()
+        remote.prepare_intent(store, SESSION_ARGV, 43200, BOOT, time.monotonic() + 1, session_mode=True)
+        self.assertEqual(self.retire(store)["proof"], "fenced_never_started")
+        with self.assertRaisesRegex(remote.RemoteError, "cancelled"):
+            remote.authorize_gate(store, Backend(), BOOT, time.monotonic() + 1, lambda argv: self.fail("executed"))
+
+    def test_start_cli_selects_mode_without_opening_state(self):
+        base = ["remote_receiver.py", "start", "--state-dir", "/private/state", "--run-id", RUN,
+                "--expect-sender-session", SESSION, "--config", "/private/receiver.json", "--control-stdin"]
+        for flag, seconds, mode in (("--seconds", 180, False), ("--session-seconds", 43200, True)):
+            with self.subTest(flag=flag), mock.patch.object(sys, "platform", "linux"), \
+                    mock.patch.object(sys, "argv", base + [flag, str(seconds)]), \
+                    mock.patch.object(remote, "load_config", return_value=SESSION_ARGV if mode else ARGV) as load, \
+                    mock.patch.object(remote, "start", return_value=0) as start:
+                self.assertEqual(remote.main(), 0)
+                load.assert_called_once_with(Path("/private/receiver.json"), session_mode=mode)
+                self.assertEqual(start.call_args.args[2], seconds)
+                self.assertEqual(start.call_args.kwargs, {"session_mode": mode})
+        for tail in ([], ["--seconds", "180", "--session-seconds", "43200"]):
+            with self.subTest(tail=tail), mock.patch.object(sys, "argv", base + tail), \
+                    mock.patch.object(remote, "load_config") as load, redirect_stderr(io.StringIO()):
+                self.assertEqual(remote.main(), 2)
+                load.assert_not_called()
 
     def test_retire_before_start_irreversibly_reserves_run(self):
         store, backend = MemoryStore(), Backend()

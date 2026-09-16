@@ -13,8 +13,8 @@ have been tested; see [transport results and limits](docs/network-validation.md)
 An optional [physical video capture and memory buffer](docs/video-buffer.md) now
 preserves NV12 frames and their driver timestamps in a bounded two-second ring;
 see [physical video results and remaining faults](docs/video-validation.md).
-These paths are now connected for [isolated combined physical tests](docs/physical-combined-validation.md),
-not normal OBS operation. Following clock-freshness, video-publication and
+These paths have been measured in [isolated combined physical tests](docs/physical-combined-validation.md).
+Following clock-freshness, video-publication and
 reference-scheduling fixes, three unchanged-setting physical timing passes
 succeeded. Production integration, loaded stability and whole-process/reboot
 recovery remain unqualified. See the [current checkpoint](docs/checkpoint-2026-09-16.md).
@@ -33,6 +33,13 @@ does not qualify automatic production or reboot recovery.
 A separate [generated network-audio fixture](docs/network-recording-validation.md)
 now records exact nonuniform tone identities and original timing through isolated
 receiver replacement. Its local-loopback audio evidence is not physical A/V sync.
+The current operator-directed work is [supervised normal-OBS integration
+and physical calibration](docs/supervised-session.md), ahead of the remaining
+recovery qualification. The first complete normal-profile 4K60 reference matched
+all six markers but failed one per-event timing limit; video pacing remains open.
+Sessions are explicitly started, bounded to at most
+12 hours and one attempt; known failures stop instead of automatically restarting.
+This change of work order is not a production, autostart or reboot-recovery claim.
 
 ## Intended use
 
@@ -107,8 +114,9 @@ An [instrumented browser reference](docs/browser-reference.md) generates the sam
 six-event pattern and reports its own scheduling uncertainty. Its report is not
 a substitute for measuring the physical capture and encoded output.
 
-Do not install untested components into your normal OBS profile. Use an isolated
-configuration with synthetic sources first. Never publish real device identifiers,
+Keep development fixtures isolated. Any normal-OBS evaluation requires explicit
+maintenance, a private backup/rollback and the [supervised-session limits](docs/supervised-session.md).
+Never publish real device identifiers,
 credentials, recordings or private scene collections in bug reports.
 
 ## License

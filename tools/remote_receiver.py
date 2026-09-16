@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Finite Linux user-service receiver containment; no installed startup service."""
+"""Finite Linux receiver containment; explicit sessions, no installed startup.
+
+Diagnostics retain their 180-second cap. A --session-seconds start explicitly
+permits up to twelve hours with the unchanged native stdin lease and independent
+retirement fence. The immutable intent's unique native duration flag records
+which mode was authorized; old diagnostic intents keep their exact schema.
+"""
 
 from __future__ import annotations
 
@@ -76,13 +82,23 @@ def boot_id() -> str:
     return value
 
 
-def validate_argv(value: Any) -> tuple[str, ...]:
+def validate_argv(value: Any, *, session_mode: bool = False) -> tuple[str, ...]:
     if (not isinstance(value, list) or not 1 <= len(value) <= 96
             or any(not isinstance(arg, str) or not arg or len(arg) > 2048
                    or any(ord(ch) < 32 for ch in arg) for arg in value)
             or not value[0].startswith("/")):
         raise RemoteError("invalid_receiver_argv")
-    for flag, placeholder in (("--expect-sender-session", "{sender_session}"), ("--seconds", "{seconds}")):
+    if type(session_mode) is not bool:
+        raise RemoteError("invalid_session_mode")
+    duration_flag = "--session-seconds" if session_mode else "--seconds"
+    other_flag = "--seconds" if session_mode else "--session-seconds"
+    if any(arg == other_flag or arg.startswith(other_flag + "=") or
+           arg.startswith(duration_flag + "=") for arg in value):
+        raise RemoteError("duration_mode_mismatch")
+    if session_mode and any(arg.split("=", 1)[0] in
+            ("--recover-desktop-ipc", "--clock-pause-after", "--clock-pause-seconds") for arg in value):
+        raise RemoteError("session_recovery_disabled")
+    for flag, placeholder in (("--expect-sender-session", "{sender_session}"), (duration_flag, "{seconds}")):
         if value.count(flag) != 1 or value.index(flag) + 1 >= len(value) or value[value.index(flag) + 1] != placeholder:
             raise RemoteError("invalid_receiver_argv")
         if value.count(placeholder) != 1:
@@ -100,9 +116,15 @@ def validate_intent(value: Any, run_id: str, session: str) -> dict:
             or value["schema"] != 1 or value["run_id"] != run_id or value["sender_session"] != session
             or value["unit"] != unit_name(run_id) or not isinstance(value["boot_id"], str)
             or not BOOT.fullmatch(value["boot_id"]) or type(value["seconds"]) is not int
-            or not 1 <= value["seconds"] <= 180):
+            or not isinstance(value["receiver_argv"], list)):
         raise RemoteError("invalid_intent")
-    validate_argv(value["receiver_argv"])
+    # Derive only from the exact, subsequently validated native flag. This keeps
+    # pre-session schema-1 intents valid and makes mode auditable without a
+    # second mutable or potentially contradictory mode field.
+    session_mode = "--session-seconds" in value["receiver_argv"]
+    validate_argv(value["receiver_argv"], session_mode=session_mode)
+    if not 1 <= value["seconds"] <= (43200 if session_mode else 180):
+        raise RemoteError("invalid_intent")
     return value
 
 
@@ -229,7 +251,7 @@ class Attempt:
             os.close(fd)
 
 
-def load_config(path: Path) -> tuple[str, ...]:
+def load_config(path: Path, *, session_mode: bool = False) -> tuple[str, ...]:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
@@ -240,15 +262,17 @@ def load_config(path: Path) -> tuple[str, ...]:
             raw = decode_json(handle.read(MAX_STATE + 1))
         if not isinstance(raw, dict) or set(raw) != {"receiver_argv"}:
             raise RemoteError("invalid_configuration")
-        return validate_argv(raw["receiver_argv"])
+        return validate_argv(raw["receiver_argv"], session_mode=session_mode)
     finally:
         os.close(fd)
 
 
-def prepare_intent(store, argv: tuple[str, ...], seconds: int, boot: str, deadline: float) -> dict:
-    if type(seconds) is not int or not 1 <= seconds <= 180 or not BOOT.fullmatch(boot):
+def prepare_intent(store, argv: tuple[str, ...], seconds: int, boot: str, deadline: float,
+                   *, session_mode: bool = False) -> dict:
+    if (type(session_mode) is not bool or type(seconds) is not int
+            or not 1 <= seconds <= (43200 if session_mode else 180) or not BOOT.fullmatch(boot)):
         raise RemoteError("invalid_start")
-    validate_argv(list(argv))
+    validate_argv(list(argv), session_mode=session_mode)
     with store.locked(deadline):
         cancel = store.read("cancel.json")
         if cancel is not None:
@@ -493,8 +517,8 @@ def start_argv(state_dir: Path, intent: dict) -> list[str]:
             "--expect-sender-session", intent["sender_session"]]
 
 
-def start(store, argv, seconds: int) -> int:
-    intent = prepare_intent(store, argv, seconds, boot_id(), time.monotonic() + 5)
+def start(store, argv, seconds: int, *, session_mode: bool = False) -> int:
+    intent = prepare_intent(store, argv, seconds, boot_id(), time.monotonic() + 5, session_mode=session_mode)
     args = start_argv(store.path, intent)
     # Replace the SSH-owned helper; do not leave an extra launcher child behind.
     # The native control pipes pass through systemd-run unchanged. Suppress its
@@ -529,7 +553,9 @@ def main() -> int:
             command.add_argument("--expect-sender-session", required=True)
             if name == "start":
                 command.add_argument("--config", type=Path, required=True)
-                command.add_argument("--seconds", type=int, required=True)
+                duration = command.add_mutually_exclusive_group(required=True)
+                duration.add_argument("--seconds", type=int)
+                duration.add_argument("--session-seconds", type=int)
                 command.add_argument("--control-stdin", action="store_true", required=True)
             elif name == "retire":
                 command.add_argument("--challenge", required=True)
@@ -539,7 +565,9 @@ def main() -> int:
         identity(args.run_id, args.expect_sender_session)
         store = Attempt(args.state_dir, args.run_id, args.expect_sender_session)
         if args.command == "start":
-            return start(store, load_config(args.config), args.seconds)
+            session_mode = args.session_seconds is not None
+            seconds = args.session_seconds if session_mode else args.seconds
+            return start(store, load_config(args.config, session_mode=session_mode), seconds, session_mode=session_mode)
         if args.command == "gate":
             authorize_gate(store, Systemd(), boot_id(), time.monotonic() + 5,
                            lambda argv: os.execv(argv[0], argv))

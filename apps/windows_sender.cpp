@@ -89,7 +89,7 @@ struct Arguments {
     std::string host;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{};
     std::uint64_t clock_epoch{}, sender_session{};
-    bool control_stdin{};
+    bool control_stdin{}, session_mode{};
 };
 
 bool unsigned_value(std::string_view text, unsigned &value)
@@ -127,6 +127,7 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
         else if (arg == "--rtp-port") { bit = 4; number = &result.rtp_port; }
         else if (arg == "--rtcp-port") { bit = 8; number = &result.rtcp_port; }
         else if (arg == "--seconds") { bit = 16; number = &result.seconds; }
+        else if (arg == "--session-seconds") { bit = 16; number = &result.seconds; result.session_mode = true; }
         else if (arg == "--clock-epoch") bit = 32;
         else if (arg == "--sender-session") bit = 64;
         else return std::nullopt;
@@ -142,7 +143,8 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
         } else result.host = value;
     }
     if (!loopback || (seen & 63) != 63 || (result.control_stdin && !result.sender_session) ||
-        !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 180)
+        !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > (result.session_mode ? 43200u : 180u) ||
+        (result.session_mode && !result.control_stdin))
         return std::nullopt;
     const auto port = [](unsigned p) { return p >= 1 && p <= 65535; };
     if (!port(result.clock_port) || !port(result.rtp_port) || !port(result.rtcp_port) ||
@@ -863,7 +865,7 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
     if (s.last_rejection) write_rejection(*s.last_rejection);
     else std::cout << "null";
     if (error_stage) std::cout << ",\"error_stage\":\"" << error_stage << "\",\"error_code\":" << error_code;
-    std::cout << "}\n";
+    std::cout << "}\n" << std::flush;
 }
 
 int run(const Arguments &args)
@@ -937,6 +939,9 @@ int run(const Arguments &args)
         std::optional<std::int64_t> last_mapped;
         bool clock_was_usable = true;
         auto reset_pipeline = [&] {
+            // A supervised session stops at a timing fault. It does not
+            // silently replace a media generation or promise recovery.
+            require(!args.session_mode || Steady::now() >= deadline, "session_requires_new_process");
             if (pipeline) {
                 pipeline.reset();
                 ++stats.resets;
@@ -1067,8 +1072,10 @@ void help()
 {
     std::cout << "avsync-windows-sender --loopback --host IPV4 --clock-port N --rtp-port N --rtcp-port N --seconds N --clock-epoch N\n"
                  " [--sender-session N] [--control-stdin] (pinned finite process agreement/5-second stdin lease)\n"
+                 " --session-seconds 1..43200 replaces --seconds only for an explicit supervised session; stdin control required.\n"
                  "Experimental desktop-only WASAPI -> explicit stereo mix -> 48 kHz L24 RTP.\n"
-                 "All options required; seconds is an overall deadline from 1 to 180.\n"
+                 "Diagnostic --seconds remains an overall deadline from 1 to 180; duration flags are mutually exclusive.\n"
+                 "Supervised sessions stop on generation faults; no automatic recovery or restart certification.\n"
                  "A numeric unicast IPv4 destination and three distinct ports are required.\n"
                  "Help/no arguments opens no audio endpoint and sends no network traffic.\n"
                  "The explicit run captures desktop PCM and sends it unencrypted to that host.\n"
@@ -1086,7 +1093,7 @@ int main(int argc, char **argv)
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) { help(); return 0; }
     const auto args = parse_arguments(argc, argv);
     if (!args) {
-        std::cout << "{\"schema\":1,\"status\":\"error\",\"error_stage\":\"arguments\"}\n";
+        std::cout << "{\"schema\":1,\"status\":\"error\",\"error_stage\":\"arguments\"}\n" << std::flush;
         return 2;
     }
     return run(*args);

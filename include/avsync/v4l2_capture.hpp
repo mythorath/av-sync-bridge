@@ -76,8 +76,14 @@ public:
     [[nodiscard]] const V4l2CaptureStats &stats() const noexcept;
     void run(std::chrono::seconds duration, const FrameCallback &callback,
              const StopRequested &stop_requested = {});
+    // Explicit finite supervised use; caller must provide its live stop/lease
+    // predicate. Same single generation, capture buffers and original timestamps.
+    void run_supervised(std::chrono::seconds duration, const FrameCallback &callback,
+                        const StopRequested &stop_requested);
 
 private:
+    void run_impl(std::chrono::seconds duration, const FrameCallback &callback,
+                  const StopRequested &stop_requested);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

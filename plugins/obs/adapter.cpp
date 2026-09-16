@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Experimental synthetic-only bridge. No capture or network code belongs here.
+// Experimental IPC bridge. No capture or network code belongs here.
 #include <obs/obs-module.h>
 #include <obs/graphics/graphics.h>
 #include <obs/util/bmem.h>
@@ -24,7 +24,7 @@ OBS_DECLARE_MODULE()
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "Experimental shared-clock synthetic video and separate PCM inputs";
+    return "Experimental shared-clock bridge video and separate desktop/microphone PCM inputs";
 }
 
 namespace {
@@ -101,7 +101,7 @@ void source_defaults(obs_data_t *settings)
 obs_properties_t *source_properties(void *)
 {
     auto *properties = obs_properties_create();
-    obs_properties_add_path(properties, "ipc_path", "Synthetic bridge IPC file",
+    obs_properties_add_path(properties, "ipc_path", "Experimental bridge IPC file",
                             OBS_PATH_FILE, "IPC files (*.ipc);;All files (*)", nullptr);
     return properties;
 }
@@ -254,7 +254,7 @@ private:
                             frame_ = {};
                             frame_changed_ = false;
                         } // Old mapping and allocation are destroyed on this worker.
-                        blog(LOG_INFO, "[avsync] Synthetic video IPC connected (%ux%u)", config.width, config.height);
+                        blog(LOG_INFO, "[avsync] Experimental bridge video IPC connected (%ux%u)", config.width, config.height);
                     }
                 } catch (const std::exception &e) {
                     blog(LOG_ERROR, "[avsync] Video IPC worker: %s", e.what());
@@ -531,7 +531,7 @@ private:
                         last_skipped = 0;
                         reader = std::move(candidate);
                         ++stats_.reconnects;
-                        blog(LOG_INFO, "[avsync] Synthetic PCM %u connected; handoff lead=%lld ms",
+                        blog(LOG_INFO, "[avsync] Experimental bridge PCM %u connected; handoff lead=%lld ms",
                              stream_, static_cast<long long>(lead / 1'000'000));
                     }
                     next_retry = bounded_add(now, 250'000'000);
@@ -593,9 +593,9 @@ private:
     std::uint64_t cursor_{0};
 };
 
-const char *video_name(void *) { return "AV Sync Prototype - Synthetic Video"; }
-const char *desktop_name(void *) { return "AV Sync Prototype - Synthetic Desktop Audio"; }
-const char *mic_name(void *) { return "AV Sync Prototype - Synthetic Microphone"; }
+const char *video_name(void *) { return "AV Sync Bridge - Video (Experimental)"; }
+const char *desktop_name(void *) { return "AV Sync Bridge - Desktop Audio (Experimental)"; }
+const char *mic_name(void *) { return "AV Sync Bridge - Microphone (Experimental)"; }
 
 void *video_create(obs_data_t *settings, obs_source_t *)
 {
@@ -664,6 +664,6 @@ bool obs_module_load(void)
     microphone.create = mic_create;
     microphone.icon_type = OBS_ICON_TYPE_AUDIO_INPUT;
     obs_register_source(&microphone);
-    blog(LOG_INFO, "[avsync] Experimental synthetic-only OBS adapter loaded");
+    blog(LOG_INFO, "[avsync] Experimental shared-clock bridge OBS adapter loaded");
     return true;
 }

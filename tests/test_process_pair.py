@@ -51,7 +51,9 @@ def fake_child() -> int:
     parser.add_argument("--expect-sender-session")
     parser.add_argument("--sender-session")
     parser.add_argument("--clock-epoch")
-    parser.add_argument("--seconds")
+    duration = parser.add_mutually_exclusive_group(required=True)
+    duration.add_argument("--seconds")
+    duration.add_argument("--session-seconds")
     parser.add_argument("--run-id")
     parser.add_argument("--control-stdin", action="store_true")
     parser.add_argument("--loopback", action="store_true")
@@ -68,6 +70,7 @@ def fake_child() -> int:
         with log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"event": event, "pid": os.getpid(), "session": session,
                                      "clock": clock, "count": count, "run_id": args.run_id,
+                                     "session_seconds": args.session_seconds,
                                      "at_ns": time.monotonic_ns()}) + "\n")
 
     record("start")
@@ -254,6 +257,14 @@ def retirement_config(state: Path, mode: str = "healthy", proof_mode: str = "val
     return result
 
 
+def session_config(base: dict, **changes) -> dict:
+    result = {**base, "session_mode": True, "max_attempts": 1, **changes}
+    for role in ("receiver", "sender"):
+        result[role + "_argv"] = ["--session-seconds" if arg == "--seconds" else arg
+                                  for arg in result[role + "_argv"]]
+    return result
+
+
 def events(state: Path, role: str) -> list[dict]:
     path = state / (role + ".log")
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
@@ -315,6 +326,44 @@ class ProtocolTests(unittest.TestCase):
         for value in variants:
             with self.subTest(value=value), self.assertRaises(pair.PairError):
                 pair.Config.from_dict(value)
+
+    def test_session_mode_is_explicit_bounded_and_one_attempt(self):
+        raw = session_config(raw_config(Path("fixture")), total_seconds=43200)
+        config = pair.Config.from_dict(raw)
+        self.assertTrue(config.session_mode)
+        self.assertEqual(config.total_seconds, 43200)
+        self.assertEqual(config.max_attempts, 1)
+        for role in ("receiver", "sender"):
+            argv = config.argv(role, "123", "456", 43200)
+            self.assertNotIn("--seconds", argv)
+            self.assertEqual(argv[argv.index("--session-seconds") + 1], "43200")
+        del raw["max_attempts"]
+        self.assertEqual(pair.Config.from_dict(raw).max_attempts, 1)
+        self.assertFalse(pair.Config.from_dict(raw_config(Path("fixture"))).session_mode)
+
+    def test_session_mode_rejects_implicit_mixed_or_recovering_configuration(self):
+        base = session_config(raw_config(Path("fixture")))
+        variants = [{**base, "session_mode": value} for value in (False, None, 1, "true")]
+        variants += [{**base, "max_attempts": value} for value in (2, 3, True)]
+        variants += [{**base, "total_seconds": value} for value in (43201, 0, float("inf"), True)]
+        for role in ("receiver", "sender"):
+            variants.append({**base, role + "_argv": raw_config(Path("fixture"))[role + "_argv"]})
+            for extra in (["--seconds", "{seconds}"], ["--seconds=180"], ["--session-seconds=43200"],
+                          ["--session-seconds", "{seconds}"], ["{seconds}"]):
+                variants.append({**base, role + "_argv": base[role + "_argv"] + extra})
+        for extra in (["--recover-desktop-ipc"], ["--clock-pause-after", "5"], ["--clock-pause-seconds=2"]):
+            variants.append({**base, "receiver_argv": base["receiver_argv"] + extra})
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(pair.PairError):
+                pair.Config.from_dict(value)
+
+    def test_remote_session_requires_independent_retirement(self):
+        base = session_config(raw_config(Path("fixture")), receiver_scope="remote")
+        with self.assertRaisesRegex(pair.PairError, "session_remote_retirement_required"):
+            pair.Config.from_dict(base)
+        config = pair.Config.from_dict(session_config(retirement_config(Path("fixture")), total_seconds=43200))
+        self.assertIsNotNone(config.retire_argv)
+        self.assertEqual(config.max_attempts, 1)
 
     def test_known_ssh_requires_explicit_remote_scope(self):
         for executable in ("ssh", "ssh.exe", "/usr/bin/ssh", "C:\\Windows\\System32\\OpenSSH\\ssh.exe"):
@@ -579,6 +628,8 @@ class ProcessTests(unittest.TestCase):
         state = Path(directory.name)
         raw = (raw_config(state, mode, **changes) if proof_mode is None else
                retirement_config(state, mode, proof_mode, **changes))
+        if changes.get("session_mode") is True:
+            raw = session_config(raw, max_attempts=changes.get("max_attempts", 1))
         config = pair.Config.from_dict(raw)
         class FaultBarrierSupervisor(pair.Supervisor):
             """Inject a real child crash only after both acknowledgments.
@@ -630,6 +681,27 @@ class ProcessTests(unittest.TestCase):
             log = events(state, role)
             self.assertEqual(log[-1]["event"], "stop")
             self.assertTrue(any(event["event"] == "keepalive" for event in log))
+
+    def test_session_uses_session_native_flag_and_cooperative_stop(self):
+        result, state = self.run_fixture(session_mode=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.attempts, 1)
+        for role in ("receiver", "sender"):
+            self.assertTrue(all(event["session_seconds"] is not None for event in events(state, role)))
+            self.assertEqual(events(state, role)[-1]["event"], "stop")
+
+    def test_session_fault_never_retries_even_with_verified_retirement(self):
+        # The acknowledged-pair fault barrier ends immediately; no hours-long
+        # wait is performed. Verify the native child budget is not capped at180.
+        result, state = self.run_fixture("receiver_dies_once", proof_mode="valid", session_mode=True,
+                                         total_seconds=43200)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(len(result.remote_retirement_checks), 1)
+        self.assertTrue(result.remote_retirement_checks[0]["verified"])
+        for role in ("receiver", "sender"):
+            self.assertEqual(len([event for event in events(state, role) if event["event"] == "start"]), 1)
+            self.assertTrue(180 < int(events(state, role)[0]["session_seconds"]) <= 43200)
 
     def test_required_large_native_summaries_are_collected_during_stop(self):
         result, _ = self.run_fixture("native_large", require_native_summaries=True)

@@ -241,19 +241,85 @@ Final validation for this follow-up passed 285 Python tests on each host
 tests. The new sender's Linux ASAN/UBSAN build and two offline help/control tests
 also passed; this is not a sanitizer-backed active-network recording claim.
 
+## Follow-up: supervised normal-OBS integration in progress
+
+The operator authorized a reversible normal-profile integration for physical
+video and Windows desktop audio, leaving the existing microphone unchanged and
+muted. A private closed-OBS backup and rollback state were retained. Only the
+two intended source implementations/settings were replaced; source names,
+identities, scene references and existing controls were preserved. The previous
+video delay filter was removed to avoid applying the delay twice. The explicit
+session retains 1,975 ms video, 2,000 ms desktop audio and 40 ms handoff lead.
+
+The private manual launcher starts hidden, duplicate-guarded processes for a
+finite session, with no automatic pair replacement. A silent real Windows render
+stream keeps the chosen loopback endpoint producing capture packets when other
+applications are idle; it does not invent capture timestamps. Initial OBS IPC
+counters advanced without reported fill, trim, late, invalid or starvation
+events. Picture was verified through the integrated source. These checks are
+not a physical timing or perceptual audio-quality pass.
+
+The first normal-profile 4K60 recording was retained but is **invalid for
+calibration**: the policy-v2 browser reference aborted just after its first
+marker. Its initial display interval was 8.3 ms, giving a 14.45 ms adaptive gap
+limit; a 16.6 ms gap failed that unchanged limit. Audio mapping remained stable,
+with a maximum mapping step of 0.155 ms. No delay adjustment is justified by
+this incomplete reference. The recording stopped cleanly; OBS reported 24
+skipped output frames out of 6,328 and a rendering-skip delta of 34 out of 6,387.
+This is not a zero-loss 4K60 or sustained-load qualification.
+
+The unchanged repeat completed all six policy-v2 reference markers. Its maximum
+browser frame gap was 9.3 ms and maximum audio mapping step was 0.180 ms. The
+independent analyzer matched all six unique tones and flashes in the actual
+4K60 normal-OBS recording, without cycle alignment or timeline rebasing. Audio
+minus video offsets were -26.333, -9.667, +6.333, -9.333, -43.333 and -9.667 ms.
+The median (-9.667 ms) passed the 16.667 ms bound, but event five failed the
+33.333 ms per-event bound: **the complete recording failed the timing gate**.
+No event was discarded and no delay or acceptance threshold was changed.
+
+Audio interval errors were at most 0.334 ms; video interval errors reached
+34 ms, and the fifth flash was only 166 ms in the recording. All encoded video
+timestamps around that onset were present at nominal frame intervals; this
+does not identify whether an earlier capture, handoff, rendering or duplication
+stage delayed the picture. OBS reported 27 skipped output frames out of 6,335
+and a rendering-skip delta of 33 out of 6,385 for this second recording.
+
+Read-only code review identified two unproven pacing risks: the IPC reader and
+writer hold the same mutex during full-frame copies, and a busy nonblocking OBS
+read keeps the previous picture until a later tick; texture upload also runs on
+the render thread. Instrument those boundaries before choosing an optimization.
+Do not infer a constant offset correction from an isolated late picture event.
+The normal launcher was invoked again and retained the existing session identity
+without starting another pair. This is a duplicate-start check, not a clean
+stop/restart, reboot or recovery qualification. The live session remains running;
+microphone routing and mute were unchanged.
+
+Final offline validation passed 296 Python tests on Windows (12 skips), all 23
+Windows native CTests, and the four selected Linux receiver/video help and
+pre-cancelled supervised-argument CTests. These are software/control checks, not
+a substitute for the failed physical timing gate above.
+
 ## Continue here
 
-1. Extend the covered loopback recorded network restart and remote containment
-   checks to cross-host recordings and the remaining sender/receiver/controller
-   failure matrix. Add a receiver publication witness before claiming queued
-   network-stale rejection. Full coordinator death recovery needs durable pending-attempt
-   reconciliation; this finite in-process retry path does not implement it.
-2. Run the isolated real desktop/video restart matrix and representative load.
-   Preserve interruption and timing failures; no offset retuning between repeats.
-3. Only then perform a reversible normal-source/startup migration and physical
-   calibration on that final path. Keep scene identities, controls and mute state.
-4. Verify sustained 4K60 cadence, color/range and resource headroom. Mic remains a
-   separate later task.
+The operator has now explicitly changed the work order: supervised normal-OBS
+integration and physical calibration come next; further recovery qualification
+is deferred. This is a prioritization decision, not new live evidence or a waiver
+of release gates. See [supervised-session scope](supervised-session.md).
+
+1. Continue the reversible, manually started desktop/video integration with its
+   private backup/rollback and unchanged source identities, controls and mute.
+   Keep the explicit session bound of at most 12 hours, `max_attempts: 1`, and
+   stop on known failure; do not certify automatic startup/recovery.
+2. Diagnose the remaining 4K video pacing variation, then repeat the complete
+   physical reference with the fixed timing gates. Preserve incomplete/failed
+   attempts and distinguish them from the earlier isolated low-resolution
+   physical passes and generated audio-only recordings.
+3. Leave recorded cross-host restart, the remaining sender/receiver/controller
+   failure matrix, durable controller-death reconciliation, and already-queued
+   network-media rejection explicitly outstanding. The latter still needs an
+   independent receiver-publication witness.
+4. Later qualify machine reboot, unattended startup, representative load and
+   sustained 4K60 cadence/color/resource headroom. Mic remains a separate later task.
 
 Read [process-pair control](process-pair-control.md), [IPC](ipc.md),
 [same-sender recovery](desktop-recovery.md), and [the roadmap](roadmap.md).
