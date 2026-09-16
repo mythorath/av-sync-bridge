@@ -59,6 +59,11 @@ isolated real-capture development, not production deployment.
   desktop-native interruption trial reported qualified successor media counters;
   none of these qualify recorded media recovery, whole-controller death or reboot. See
   [remote containment scope](remote-receiver-control.md).
+- [x] Explicit generated RTP/L24/RTCP sender with original-anchor manifests and
+  isolated OBS desktop recording across a loopback receiver replacement. All
+  markers and absolute mixer timing passed the tested baseline/restart; physical
+  video, cross-host recorded recovery and queued-network-stale replay remain open.
+  See [generated network recording](network-recording-validation.md).
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 - [x] Offline desktop feed-forward worker: provisional rate acquisition, fixed-quantum
   command slew, owned bounded queues, original-anchor origin and explicit reset.

@@ -30,6 +30,9 @@ Optional [remote receiver containment](docs/remote-receiver-control.md) now fenc
 late launches and requires independent retirement proof before retrying after
 SSH loss. Generated real-manager and two-host control checks have passed; this
 does not qualify automatic production or reboot recovery.
+A separate [generated network-audio fixture](docs/network-recording-validation.md)
+now records exact nonuniform tone identities and original timing through isolated
+receiver replacement. Its local-loopback audio evidence is not physical A/V sync.
 
 ## Intended use
 

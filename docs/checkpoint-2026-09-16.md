@@ -203,11 +203,50 @@ post-transport output corruption, sender cleanup failure and cancellation races.
 No C++ or installed plugin was changed in this follow-up. The real-systemd check
 is deliberately opt-in and is not part of ordinary test discovery or hosted CI.
 
+## Follow-up: recorded generated network audio
+
+An explicit optional generated sender now exercises the real original-anchor
+RTP/L24/RTCP path without WASAPI or playback. Its nonuniform marker manifest
+contains each first sample's once-mapped original capture date, distinct A/B
+frequencies and fixed sample positions. Generated counters are kept distinct
+from hardware capture. Clock loss, bad anchors and queue faults fail visibly.
+
+The [audio-only recording gate](network-recording-validation.md) inspects every
+strong region in the encoded desktop track and requires a continuous raw mixer
+trace. A local-loopback baseline contained A1–A6, with raw onset error
+-0.359..+0.313 ms. A separate uninterrupted 75.029-second OBS recording spanned
+retirement/replacement of the actual native receiver and contained exactly
+A1–A3 then B1–B6, with raw error -0.646..+0.432 ms. Encoded complete-timeline
+error was below 1.068 ms. The fixed two-second delay and 40 ms OBS handoff lead
+were unchanged. The predecessor was interrupted after A3 presentation but before
+A4 capture; this is **not** retirement of already-queued network media.
+
+The initial private recorder attempt failed before audio startup because of a
+wrong plugin-directory selection and exposed a missing process-session flag in
+cleanup integration. The failed artifacts were retained, the exact leftover test
+display was identity-checked and terminated, and both launcher issues were fixed.
+Neither timing offsets nor measurement gates were relaxed. These tests use an
+isolated blank picture and generated desktop audio only; no physical video or
+microphone and no normal OBS profile is involved.
+
+The reusable public loopback runner also passed a fresh baseline and restart.
+Their raw marker errors were below 0.437 ms and 0.513 ms respectively; the restart
+contained all nine expected identities in one recording, with no per-generation
+timing reset. Native sender/available receiver summaries and independent
+retirement proofs qualified. Twenty-six mocked runner cases cover cleanup,
+failed-proof refusal, bounded logs, explicit isolation and failure-report retention.
+
+Final validation for this follow-up passed 285 Python tests on each host
+(12 Windows skips, 6 Linux skips), 22 Windows native tests and 37 Linux native
+tests. The new sender's Linux ASAN/UBSAN build and two offline help/control tests
+also passed; this is not a sanitizer-backed active-network recording claim.
+
 ## Continue here
 
-1. Extend the covered local generated restart recordings and remote containment
-   checks to recorded network media and the remaining sender/receiver/controller
-   failure matrix. Full coordinator death recovery needs durable pending-attempt
+1. Extend the covered loopback recorded network restart and remote containment
+   checks to cross-host recordings and the remaining sender/receiver/controller
+   failure matrix. Add a receiver publication witness before claiming queued
+   network-stale rejection. Full coordinator death recovery needs durable pending-attempt
    reconciliation; this finite in-process retry path does not implement it.
 2. Run the isolated real desktop/video restart matrix and representative load.
    Preserve interruption and timing failures; no offset retuning between repeats.
