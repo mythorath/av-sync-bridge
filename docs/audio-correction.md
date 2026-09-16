@@ -6,6 +6,8 @@ Status: **partial controller milestone, not connected to live transport or OBS**
 backend. It accepts ordered stereo PCM with the original record belonging to
 that packet. This is a reusable library and generated-only fixture, not a
 background service or production replacement.
+It now includes a [model-based runtime phase guard](audio-phase-guard.md), limited
+to the audited libsamplerate 0.2.2 implementation and independently tested offline.
 
 ## Contract
 
@@ -43,8 +45,8 @@ capacity. A partial backend result faults the generation instead of silently
 retargeting a partial ramp. The larger input offer was tested on libsamplerate
 0.2.2 at the tested rates; it is not a guarantee about every future backend. The
 99 ppm/s **command** bound is not a measurement of instantaneous reached ratio.
-Interpolation and exact sample provenance still need an independent
-changing-ratio waveform oracle.
+The phase model has an independent linear-waveform check; complete changing-ratio
+signal-quality and physical source-provenance gates remain open.
 
 The reconstructed capture grid is not an OBS presentation timestamp or proof of
 per-sample source provenance. Backend input consumption includes private filter
@@ -111,4 +113,5 @@ invalid PCM, missing input, stale time, health loss, copy-in ownership, reset
 with pending audio and reset to exact silence. These generated-media safeguards
 are not network loss recovery tests.
 
-See [measured results and remaining gates](audio-correction-validation.md).
+See the [initial worker results](audio-correction-validation.md) and the newer
+[phase-guard results and remaining gates](audio-phase-validation.md).

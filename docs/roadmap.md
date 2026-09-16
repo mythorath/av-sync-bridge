@@ -49,8 +49,10 @@ isolated real-capture development, not production deployment.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
 - [x] Offline desktop feed-forward worker: stable-rate acquisition, fixed-quantum
   command slew, owned bounded queues, original-anchor origin and explicit reset.
-- [ ] Runtime phase-error monitor and independently validated variable-ratio
-  waveform/resource behavior before activating that worker on live PCM.
+- [x] Model-based runtime phase guard, pinned backend audit, independent linear-PCM
+  phase check and fault/no-false-alarm fixtures with generated media.
+- [ ] Complete variable-ratio sound-quality/resource gates and source-timestamp
+  uncertainty validation before activating that worker on live PCM.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
 gates. No live microphone/correction path, RTX, combined real A/V OBS handoff,

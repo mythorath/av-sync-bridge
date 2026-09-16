@@ -2,18 +2,22 @@
 #pragma once
 #include "avsync/asrc.hpp"
 #include "avsync/audio_wire.hpp"
+#include "avsync/audio_phase.hpp"
 #include <array>
 #include <span>
 
 namespace avsync {
 enum class CorrectionState { priming, running, faulted };
-enum class CorrectionFault { none, metadata, pcm, rate, overflow, stale, health, backend, timeline };
+enum class CorrectionFault { none, metadata, pcm, rate, overflow, stale, health, backend, timeline, phase };
 enum class CorrectionPush { accepted, priming_discard, wrong_epoch, rejected };
 struct CorrectionDiagnostics {
     std::uint64_t received_frames{}, priming_discarded_frames{}, consumed_frames{}, produced_frames{}, delivered_frames{};
     std::uint64_t estimator_windows{}, backend_calls{}, no_progress_dispatches{};
     std::size_t peak_input_frames{}, peak_output_frames{};
     double maximum_command_step_ppm{};
+    std::uint64_t phase_checks{}, phase_waits{};
+    std::size_t peak_phase_anchors{};
+    Nanoseconds maximum_predicted_phase_ns{};
 };
 struct CorrectedAudio {
     SessionToken epoch;
@@ -73,6 +77,9 @@ private:
     std::uint64_t clock_epoch_;
     wire::AudioReceiverValidator validator_;
     AsrcStereo backend_;
+    SincPhaseModel phase_model_;
+    AudioPhaseLedger phase_ledger_;
+    std::array<PredictedSourcePosition, quantum> phase_positions_{};
     CorrectionState state_{CorrectionState::priming};
     CorrectionFault fault_{CorrectionFault::none};
     CorrectionDiagnostics diagnostics_;

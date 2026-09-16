@@ -72,9 +72,10 @@ now preserves those records independently of nominal RTP time, with strict
 sample-position and generation checks. An [offline correction worker](docs/audio-correction.md)
 now combines validated PCM, original-clock estimates and bounded resampling;
 see its [generated-media results and open gates](docs/audio-correction-validation.md).
-Runtime phase monitoring, live adaptive correction and combined physical A/V
-delivery remain separate gates; continuous nominal timestamps alone cannot
-satisfy them.
+A [model-based phase safeguard](docs/audio-phase-guard.md) now checks that worker
+against original capture anchors before releasing output. It passes separate
+generated-waveform and fault checks, not live A/V validation. Sound-quality/load
+gates, live adaptive correction and combined physical A/V delivery remain open.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

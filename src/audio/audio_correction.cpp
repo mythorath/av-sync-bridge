@@ -9,6 +9,8 @@ namespace avsync {
 AudioCorrectionWorker::AudioCorrectionWorker(SessionToken epoch, std::uint64_t clock_epoch)
     : epoch_(epoch), clock_epoch_(clock_epoch), validator_(clock_epoch) {
     if (!epoch.valid()) throw std::invalid_argument("invalid correction epoch");
+    if (!SincPhaseModel::supports(AsrcStereo::backend_version()))
+        throw std::runtime_error("correction phase model requires audited libsamplerate 0.2.2");
 }
 void AudioCorrectionWorker::fail(CorrectionFault reason) noexcept {
     if (state_ == CorrectionState::faulted) return;
@@ -19,6 +21,9 @@ void AudioCorrectionWorker::fail(CorrectionFault reason) noexcept {
     std::fill(scratch_input_.begin(), scratch_input_.end(), 0);
     std::fill(scratch_output_.begin(), scratch_output_.end(), 0);
     (void)backend_.reset(); // No EOS drain; failed worker cannot expose media.
+    phase_ledger_.clear();
+    phase_model_ = {};
+    std::fill(phase_positions_.begin(), phase_positions_.end(), PredictedSourcePosition{});
 }
 bool AudioCorrectionWorker::check_health(Nanoseconds now, bool healthy) noexcept {
     if (state_ == CorrectionState::faulted) return false;
@@ -61,6 +66,7 @@ bool AudioCorrectionWorker::start(const wire::AudioRecord& record) noexcept {
     if (!origin_ || !backend_.reset(target_)) return false;
     timeline_.emplace(*origin_, 48'000);
     origin_wire_ = record.packet_wire_start; command_ = target_; last_progress_ = last_now_;
+    if (!phase_model_.reset(origin_wire_, target_)) return false;
     state_ = CorrectionState::running;
     return true;
 }
@@ -98,6 +104,14 @@ CorrectionPush AudioCorrectionWorker::push(const wire::AudioRecord& record, std:
     if (state_ == CorrectionState::priming) {
         diagnostics_.priming_discarded_frames += frames; return CorrectionPush::priming_discard;
     }
+    if (!phase_ledger_.size() || !result.repeated) {
+        const auto anchor = nominal_wire_position(record.device_position, record.device_origin, 0, record.source_rate);
+        if (!anchor || phase_ledger_.add({anchor->whole, static_cast<double>(anchor->remainder)/anchor->denominator},
+            record.capture_ns, phase_model_.next()) != PhaseStatus::ready) {
+            fail(CorrectionFault::phase); return CorrectionPush::rejected;
+        }
+        diagnostics_.peak_phase_anchors = std::max(diagnostics_.peak_phase_anchors, phase_ledger_.size());
+    }
     if (frames > input_capacity - input_size_) { fail(CorrectionFault::overflow); return CorrectionPush::rejected; }
     for (std::size_t i = 0; i < frames; ++i) {
         const auto at = (input_head_ + input_size_ + i) % input_capacity;
@@ -118,6 +132,15 @@ std::size_t AudioCorrectionWorker::dispatch(Nanoseconds now, bool healthy) noexc
             scratch_input_[2 * i] = input_[2 * at]; scratch_input_[2 * i + 1] = input_[2 * at + 1];
         }
         const double next = command_ + std::clamp(target_ - command_, -command_step_ppm, command_step_ppm);
+        auto prediction = phase_model_;
+        if (!prediction.advance(next, phase_positions_)) { fail(CorrectionFault::phase); return 0; }
+        const auto phase = phase_ledger_.assess(phase_positions_, *origin_, diagnostics_.produced_frames);
+        if (phase.status == PhaseStatus::waiting) {
+            if (diagnostics_.phase_waits != std::numeric_limits<std::uint64_t>::max()) ++diagnostics_.phase_waits;
+            break; // Await an ORIGINAL bracketing anchor, without touching DSP.
+        }
+        diagnostics_.maximum_predicted_phase_ns = std::max(diagnostics_.maximum_predicted_phase_ns, phase.maximum_absolute_ns);
+        if (phase.status != PhaseStatus::ready) { fail(CorrectionFault::phase); return 0; }
         const auto result = backend_.process(scratch_input_, scratch_output_, next);
         ++diagnostics_.backend_calls;
         if (result.status != AsrcStatus::progress || result.output_frames_generated != quantum ||
@@ -132,6 +155,8 @@ std::size_t AudioCorrectionWorker::dispatch(Nanoseconds now, bool healthy) noexc
         }
         diagnostics_.maximum_command_step_ppm = std::max(diagnostics_.maximum_command_step_ppm, std::abs(next - command_));
         command_ = next;
+        phase_model_ = prediction;
+        diagnostics_.phase_checks += quantum;
         input_head_ = (input_head_ + result.input_frames_used) % input_capacity;
         input_size_ -= result.input_frames_used;
         diagnostics_.consumed_frames += result.input_frames_used;
@@ -172,6 +197,8 @@ bool AudioCorrectionWorker::reset(SessionToken next) noexcept {
     epoch_ = next; validator_ = wire::AudioReceiverValidator(clock_epoch_);
     state_ = CorrectionState::priming; fault_ = CorrectionFault::none; diagnostics_ = {};
     acquisition_count_ = 0; target_ = command_ = 0; origin_.reset(); last_now_.reset(); last_progress_.reset(); timeline_.reset();
+    phase_ledger_.clear(); phase_model_ = {};
+    std::fill(phase_positions_.begin(), phase_positions_.end(), PredictedSourcePosition{});
     origin_wire_ = output_index_ = input_head_ = input_size_ = output_head_ = output_size_ = 0;
     std::fill(input_.begin(), input_.end(), 0); std::fill(output_.begin(), output_.end(), 0);
     std::fill(scratch_input_.begin(), scratch_input_.end(), 0); std::fill(scratch_output_.begin(), scratch_output_.end(), 0);

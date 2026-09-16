@@ -1,6 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # Offline correction-worker validation — 2026-09-15
 
+Historical checkpoint `7c76172`. The later [phase-guard report](audio-phase-validation.md)
+adds runtime consistency checks; the measurements and open gates below describe
+the original worker checkpoint, not a claim that the later monitor is absent.
+
 ## Scope and verdict
 
 The [bounded desktop worker](audio-correction.md) now combines original-record

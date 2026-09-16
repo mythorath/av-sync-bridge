@@ -22,6 +22,7 @@ struct Feed {
     double ppm{100};
     avsync::SessionToken token{epoch};
     avsync::Nanoseconds now{};
+    avsync::Nanoseconds timestamp_bias{};
     std::array<float,360> pcm{};
     avsync::wire::AudioRecord record() const {
         avsync::wire::AudioRecord r;
@@ -30,6 +31,7 @@ struct Feed {
         r.anchor_sequence = frame / 960; r.device_position = r.device_origin + r.anchor_sequence * 3840;
         r.capture_ns = 1'000'000'000 + static_cast<avsync::Nanoseconds>(std::floor(
             r.anchor_sequence * 960 * 1e9L / (48000.L * (1 + ppm / 1e6L))));
+        r.capture_ns += timestamp_bias;
         r.qpc_100ns = static_cast<std::uint64_t>(r.capture_ns / 100); r.calibration_revision = 1;
         return r;
     }
@@ -168,6 +170,34 @@ void backpressure_and_ownership() {
     CHECK(w->dispatch(f.now+201'000'000,true)==0);
     CHECK(w->fault()==avsync::CorrectionFault::stale);
 }
+void phase_faults() {
+    auto w=std::make_unique<avsync::AudioCorrectionWorker>(epoch,clock_epoch); Feed f;
+    prime(*w,f);
+    const auto held=f.record();
+    for (unsigned i=0;i<18;++i) {
+        auto r=held; r.packet_wire_start=f.frame; f.now+=3'750'000;
+        CHECK(w->push(r,ssrc,static_cast<std::uint32_t>(zero+f.frame),f.pcm,f.now,true)==avsync::CorrectionPush::accepted);
+        f.frame+=180;
+        CHECK(w->dispatch(f.now,true)==0);
+    }
+    CHECK(w->diagnostics().phase_waits>0 && w->diagnostics().backend_calls==0);
+    CHECK(w->diagnostics().produced_frames==0 && w->state()==avsync::CorrectionState::running);
+    CHECK(w->reset({3,2})); f={}; f.token={3,2}; prime(*w,f);
+    const auto next_anchor=(f.frame/960+1)*960;
+    std::array<float,960> out{};
+    while (w->state()==avsync::CorrectionState::running && f.frame<next_anchor+12000) {
+        if (f.frame>=next_anchor) f.timestamp_bias=11'000'000;
+        (void)f.push(*w); (void)w->dispatch(f.now,true);
+        while (w->pull(out,f.now,true)) {}
+    }
+    CHECK(w->fault()==avsync::CorrectionFault::phase);
+    CHECK(w->diagnostics().maximum_predicted_phase_ns>10'000'000);
+    CHECK(w->pending_input()==0 && w->pending_output()==0);
+    CHECK(!w->pull(out,f.now,true) && w->dispatch(f.now,true)==0);
+    CHECK(f.push(*w)==avsync::CorrectionPush::rejected);
+    CHECK(w->reset({3,3})); f={}; f.token={3,3}; prime(*w,f);
+    CHECK(w->diagnostics().maximum_predicted_phase_ns==0 && w->diagnostics().phase_checks==0);
+}
 }
 int main() {
     try {
@@ -176,6 +206,7 @@ int main() {
         (void)run(true,true); // Input partition changes the post-prime origin.
         faults();
         backpressure_and_ownership();
+        phase_faults();
         std::cout << checks << " correction worker checks passed; generated PCM only\n"; return 0;
     } catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

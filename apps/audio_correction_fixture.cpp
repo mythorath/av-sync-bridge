@@ -16,7 +16,7 @@ struct Options {
     std::string scenario{"constant"};
     double ppm{};
     unsigned seconds{12}, pull_frames{480};
-    bool varied{}, incorrect_anchors{};
+    bool varied{}, incorrect_anchors{}, expect_phase_fault{};
 };
 // Independent analytic clock: integrate dt/dx = 1/(1 + ppm(x)/1e6),
 // where x is nominal device time. No estimator/worker output enters this model.
@@ -28,6 +28,11 @@ struct Clock {
         return b == 0 ? x / a : std::log1p(b * x / a) / b;
     }
     long double at(long double x) const {
+        if (scenario == "cycle") {
+            const Clock step{"step",0};
+            const auto cycles=std::floor(x/45);
+            return cycles*step.at(45)+step.at(x-cycles*45);
+        }
         if (scenario == "constant") return segment(x, ppm);
         if (scenario == "step") {
             if (x <= 8) return x;
@@ -48,6 +53,7 @@ Options parse(int argc, char** argv) {
         const std::string arg=argv[i];
         if (arg=="--varied-packets") { o.varied=true; continue; }
         if (arg=="--incorrect-anchors") { o.incorrect_anchors=true; continue; }
+        if (arg=="--expect-phase-fault") { o.expect_phase_fault=true; continue; }
         require(i+1<argc,"missing option value"); const std::string value=argv[++i];
         std::size_t used{};
         if (arg=="--scenario") o.scenario=value;
@@ -60,13 +66,15 @@ Options parse(int argc, char** argv) {
             else o.pull_frames=static_cast<unsigned>(number);
         } else throw std::runtime_error("unknown option");
     }
-    require(o.scenario=="constant" || o.scenario=="step" || o.scenario=="ramp","unknown scenario");
+    require(o.scenario=="constant" || o.scenario=="step" || o.scenario=="ramp" || o.scenario=="cycle","unknown scenario");
     require(std::isfinite(o.ppm) && std::abs(o.ppm)<=499,"ppm must be in [-499,499]");
     require(o.seconds>=8 && o.seconds<=600 && o.pull_frames>=1,"invalid duration or output partition");
     require(o.scenario!="step" || o.seconds>=45,"step requires at least 45 seconds");
     require(o.scenario!="ramp" || o.seconds>=125,"ramp requires at least 125 seconds");
     require(!o.incorrect_anchors || (o.scenario=="constant" && o.ppm==-499 && o.seconds==60),
             "negative control requires constant -499 ppm and exactly 60 seconds");
+    require((o.scenario=="cycle")==o.expect_phase_fault && (!o.expect_phase_fault || o.seconds>=300),
+            "cycle requires --expect-phase-fault and at least 300 seconds");
     return o;
 }
 int run(const Options& o) {
@@ -104,6 +112,18 @@ int run(const Options& o) {
     std::size_t detected{};
     float event_peak{};
     long double event_time{};
+    const auto check_fault=[&]() {
+        require(o.expect_phase_fault && w->fault()==avsync::CorrectionFault::phase &&
+                w->diagnostics().maximum_predicted_phase_ns>avsync::AudioPhaseLedger::phase_limit_ns,
+                "unexpected worker fault");
+        require(w->pending_input()==0 && w->pending_output()==0 && !w->pull(out,now,true),
+                "fault exposed queued output");
+        require(w->dispatch(now,true)==0,"fault resumed old history");
+        std::cout<<"{\"scenario\":\"cycle\",\"expected_phase_fault\":true,\"fault_at_seconds\":"
+            <<static_cast<double>(truth.sample(wire))<<",\"maximum_predicted_phase_ns\":"
+            <<w->diagnostics().maximum_predicted_phase_ns<<",\"delivered_frames\":"<<delivered
+            <<",\"queued_after_fault\":0,\"accepted\":true}\n";
+    };
     while (wire<static_cast<std::uint64_t>(o.seconds)*48000) {
         const auto count=static_cast<unsigned>(std::min<std::uint64_t>(
             o.varied ? partitions[packet%partitions.size()] : 180,
@@ -126,14 +146,14 @@ int run(const Options& o) {
             }
             pcm[2*i]=static_cast<float>(value); pcm[2*i+1]=0;
         }
-        require(w->push(r,ssrc,static_cast<std::uint32_t>(zero+wire),std::span(pcm).first(count*2),now,true)
-            !=avsync::CorrectionPush::rejected,"worker rejected generated media");
+        const auto pushed=w->push(r,ssrc,static_cast<std::uint32_t>(zero+wire),std::span(pcm).first(count*2),now,true);
+        if (pushed==avsync::CorrectionPush::rejected) { check_fault(); return 0; }
         const auto before=w->command_ppm();
         const auto calls=w->diagnostics().backend_calls;
         const auto begin=std::chrono::steady_clock::now();
         const auto produced=w->dispatch(now,true);
         const auto end=std::chrono::steady_clock::now();
-        require(w->state()!=avsync::CorrectionState::faulted,"worker dispatch faulted");
+        if (w->state()==avsync::CorrectionState::faulted) { check_fault(); return 0; }
         const auto executed=w->diagnostics().backend_calls-calls;
         if (executed) call_us.push_back(std::chrono::duration<double,std::micro>(end-begin).count());
         else require(w->command_ppm()==before,"no-progress call changed command");
@@ -160,6 +180,7 @@ int run(const Options& o) {
         }
         wire+=count; ++packet;
     }
+    require(!o.expect_phase_fault,"expected runtime phase fault did not occur");
     require(w->state()==avsync::CorrectionState::running && delivered>48000,"insufficient output");
     require(detected==markers.size() && event_peak==0,"missing or unfinished marker");
     long double worst{};
@@ -185,7 +206,10 @@ int run(const Options& o) {
         <<",\"dispatch_p99_us\":"<<call_us[(call_us.size()-1)*99/100]<<",\"dispatch_max_us\":"<<call_us.back()
         <<",\"worker_object_bytes\":"<<sizeof(*w)<<",\"marker_errors_ms\":[";
     for (std::size_t i=0;i<markers.size();++i) std::cout<<(i?",":"")<<static_cast<double>((peak_times[i]-markers[i])*1000);
-    std::cout<<"],\"accepted\":"<<(accepted?"true":"false")<<"}\n";
+    std::cout<<"],\"maximum_predicted_phase_ns\":"<<d.maximum_predicted_phase_ns
+        <<",\"phase_checks\":"<<d.phase_checks<<",\"phase_waits\":"<<d.phase_waits
+        <<",\"peak_phase_anchors\":"<<d.peak_phase_anchors
+        <<",\"accepted\":"<<(accepted?"true":"false")<<"}\n";
     // Explicit negative-control mode succeeds only for a measured phase failure,
     // not for crashes, missing markers or some unrelated runtime exception.
     return o.incorrect_anchors ? (worst>5 ? 0:1) : (accepted ? 0:1);
@@ -194,8 +218,8 @@ int run(const Options& o) {
 int main(int argc,char** argv) {
     if (argc==2 && std::string(argv[1])=="--help") {
         std::cout<<"Offline generated PCM only; no devices, network, files or OBS.\n"
-            <<"--scenario constant|step|ramp --ppm [-499,499] --seconds [8,600]\n"
-            <<"--varied-packets --pull-frames [1,3840] --incorrect-anchors\n"; return 0;
+            <<"--scenario constant|step|ramp|cycle --ppm [-499,499] --seconds [8,600]\n"
+            <<"--varied-packets --pull-frames [1,3840] --incorrect-anchors --expect-phase-fault\n"; return 0;
     }
     try { return run(parse(argc,argv)); }
     catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }

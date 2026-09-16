@@ -7,8 +7,9 @@ and [generated-signal fixture](asrc-validation.md) are now implemented separatel
 The [original-anchor wire diagnostic](audio-anchor-transport-validation.md) now
 preserves that timing separately from nominal RTP progression. A bounded
 [offline feed-forward worker](audio-correction.md) implements acquisition,
-fixed-quantum command control and failure/reset handling, but not the required
-runtime phase monitor or live integration. There is still no hardware/OBS
+fixed-quantum command control and failure/reset handling. A separate
+[model-based phase guard](audio-phase-guard.md) now monitors that offline worker;
+live integration and full uncertainty/quality/resource gates remain open. There is still no hardware/OBS
 synchronization claim. The [old conversion diagnostic](conversion-timing.md)
 measured the gate-zero failure predicted below; live activation stays off.
 The contracts in [network-clock.md](network-clock.md),
@@ -95,8 +96,8 @@ observability fixture, and timestamp-free nominal converter are now implemented
 and tested separately. The bounded [original-anchor transport diagnostic](audio-anchor-transport-validation.md)
 also preserves original metadata and its exact nominal sample association.
 Live correction remains disabled: the owned-PCM correction worker now has an
-offline fixture. Runtime phase monitoring, changing-ratio signal-quality/resource
-gates and connection to a presentation schedule still require measurements.
+offline fixture and model-based phase guard. Changing-ratio signal-quality/resource
+gates, source-timestamp uncertainty and presentation scheduling still need measurements.
 No silent timestamp rewrite is approved.
 
 ## Receiver placement and one correction owner
@@ -246,6 +247,6 @@ Use separate counters for received/consumed/produced frames, priming discards,
 late drops, reset reason, ratio saturation, no-progress calls and stale anchors.
 Log aggregate timing/peak/resource diagnostics, not endpoint identities or PCM.
 The [offline worker/harness report](audio-correction-validation.md) now records
-the implemented subset. Runtime phase monitoring, variable-ratio quality and
-resource measurements are the next gates; they must not change startup services,
+the initial subset; [phase-guard evidence](audio-phase-validation.md) extends it.
+Variable-ratio quality, uncertainty and resource measurements are next; they must not change startup services,
 normal OBS sources, mute macros, or the current production audio route.

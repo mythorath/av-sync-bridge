@@ -101,6 +101,10 @@ python3 tools/run_audio_correction_suite.py \
 ```
 
 See the [worker contract](audio-correction.md) and [controller results](audio-correction-validation.md).
+The correction worker now requires the audited libsamplerate **0.2.2** runtime;
+other versions need a new phase-model audit, not a silent bypass. The optional
+`avsync-asrc-phase-probe --seconds 600` checks model/waveform agreement offline.
+See [phase safeguard and limits](audio-phase-guard.md).
 
 ## Optional network diagnostics
 
