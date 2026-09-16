@@ -5,6 +5,10 @@
 #include <stdexcept>
 
 namespace avsync {
+bool desktop_fault_recoverable(CorrectionFault fault,CorrectionStaleReason stale) noexcept {
+    return fault==CorrectionFault::health || (fault==CorrectionFault::stale &&
+        (stale==CorrectionStaleReason::no_progress || stale==CorrectionStaleReason::anchor_age));
+}
 bool correction_diagnostic_pass(std::span<const DiagnosticAudioSession> sessions,bool queue_failed,
         std::optional<Nanoseconds> pause) noexcept {
     if (queue_failed || sessions.size()!=(pause ? 2u:1u)) return false;
@@ -31,10 +35,14 @@ bool decode_l24(std::span<const std::byte> payload,DiagnosticAudioPacket& packet
     }
     return true;
 }
-AudioCorrectionDiagnostic::AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output)
-    : destination_(output),clock_epoch_(clock_epoch),admission_(clock_epoch) {
+AudioCorrectionDiagnostic::AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output,
+        DesktopRecovery recovery)
+    : destination_(output),recovery_(recovery),clock_epoch_(clock_epoch),admission_(clock_epoch) {
     if ((destination_.consume!=nullptr)!=(destination_.revoke!=nullptr))
         throw std::invalid_argument("output requires consume and revoke hooks");
+    if (recovery_!=DesktopRecovery::disabled &&
+        (recovery_!=DesktopRecovery::same_sender_session || !destination_.consume || !destination_.begin_generation))
+        throw std::invalid_argument("same-session recovery requires complete output generation hooks");
 }
 bool AudioCorrectionDiagnostic::submit(const DiagnosticAudioPacket& packet) noexcept {
     if (failed_.load()) return false;
@@ -46,19 +54,44 @@ bool AudioCorrectionDiagnostic::submit(const DiagnosticAudioPacket& packet) noex
     queue_[(head_+size_)%capacity]=packet; ++size_;
     queue_peak_=std::max(queue_peak_,size_); return true;
 }
+bool AudioCorrectionDiagnostic::retired_generation(SessionToken epoch) const noexcept {
+    return epoch.valid() && epoch.session==admitted_session_.load(std::memory_order_acquire) &&
+        epoch.generation<=retired_generation_.load(std::memory_order_acquire);
+}
+bool AudioCorrectionDiagnostic::retire_stale_transport(SessionToken epoch) noexcept {
+    if (recovery_!=DesktopRecovery::same_sender_session || !epoch.valid() ||
+        epoch.session!=admitted_session_.load(std::memory_order_acquire) ||
+        epoch.generation>admitted_generation_.load(std::memory_order_acquire)) return false;
+    auto retired=retired_generation_.load(std::memory_order_relaxed);
+    while (retired<epoch.generation && !retired_generation_.compare_exchange_weak(
+        retired,epoch.generation,std::memory_order_release,std::memory_order_relaxed)) {}
+    return true;
+}
+void AudioCorrectionDiagnostic::apply_retirement(Nanoseconds now) noexcept {
+    if (worker_ && worker_->state()!=CorrectionState::faulted &&
+        retired_generation(sessions_[session_count_-1].epoch)) {
+        (void)worker_->dispatch(now,false); snapshot();
+    }
+}
 void AudioCorrectionDiagnostic::snapshot() noexcept {
     if (!worker_) return;
     auto& s=sessions_[session_count_-1];
     s.correction=worker_->diagnostics(); s.state=worker_->state(); s.fault=worker_->fault();
     if (s.state==CorrectionState::faulted && destination_.revoke) {
-        destination_.revoke(destination_.context); failed_.store(true);
+        if (!output_revoked_) { destination_.revoke(destination_.context); output_revoked_=true; }
+        const bool recoverable=recovery_==DesktopRecovery::same_sender_session &&
+            desktop_fault_recoverable(s.fault,s.correction.stale_reason);
+        if (recoverable) (void)retire_stale_transport(s.epoch);
+        awaiting_generation_=recoverable && !failed_.load();
+        if (!recoverable) failed_.store(true);
     }
     if (s.state==CorrectionState::faulted && !s.first_fault_ns) s.first_fault_ns=last_tick_;
     s.command_ppm=worker_->command_ppm(); s.target_ppm=worker_->target_ppm();
 }
 void AudioCorrectionDiagnostic::fail(Nanoseconds now) noexcept {
     failed_.store(true);
-    if (destination_.revoke) destination_.revoke(destination_.context);
+    awaiting_generation_=false;
+    if (destination_.revoke && !output_revoked_) { destination_.revoke(destination_.context); output_revoked_=true; }
     if (worker_) (void)worker_->dispatch(now,false);
     { std::lock_guard lock(mutex_); queue_={}; size_=head_=0; }
     snapshot();
@@ -66,9 +99,10 @@ void AudioCorrectionDiagnostic::fail(Nanoseconds now) noexcept {
 void AudioCorrectionDiagnostic::tick(Nanoseconds now,bool provider_healthy) {
     if (failed_.load() || now<0 || (last_tick_ && now<*last_tick_)) { fail(now); return; }
     last_tick_=now;
+    apply_retirement(now);
     // Clock-provider failure closes the old generation immediately, even with
     // no incoming packets. A new authorized generation must re-prime later.
-    if (worker_ && !provider_healthy) (void)worker_->dispatch(now,false);
+    if (worker_ && !provider_healthy) { (void)worker_->dispatch(now,false); snapshot(); }
     for (std::size_t count=0;count<capacity;++count) {
         DiagnosticAudioPacket packet;
         {
@@ -76,16 +110,40 @@ void AudioCorrectionDiagnostic::tick(Nanoseconds now,bool provider_healthy) {
             if (!size_ || queue_[head_].arrival_ns>now) break;
             packet=queue_[head_]; queue_[head_]={}; head_=(head_+1)%capacity; --size_;
         }
+        if (retired_generation(packet.record.epoch)) { ++retired_packets_; continue; }
         const auto age=checked_sub(now,packet.arrival_ns);
         if (!age || *age>maximum_queue_age_ns) { fail(now); return; }
-        if (!admission_.admit(packet.record,packet.ssrc)) continue;
+        const auto active=admission_.active_epoch();
+        if (recovery_==DesktopRecovery::same_sender_session && active &&
+            packet.record.epoch.session!=active->session) { fail(now); return; }
+        if (active && packet.record.epoch.session==active->session &&
+            packet.record.epoch.generation<active->generation) { ++retired_packets_; continue; }
+        if (!admission_.admit(packet.record,packet.ssrc)) {
+            if (recovery_==DesktopRecovery::same_sender_session) { fail(now); return; }
+            continue;
+        }
         if (!worker_ || sessions_[session_count_-1].epoch!=packet.record.epoch) {
-            if (worker_ && destination_.revoke) { fail(now); return; }
+            if (worker_ && destination_.revoke) {
+                if (recovery_==DesktopRecovery::disabled) { fail(now); return; }
+                // A valid successor may arrive before the old watchdog fires.
+                // Retire all old DSP/IPC before preparing the new generation.
+                if (worker_->state()!=CorrectionState::faulted) (void)worker_->dispatch(now,false);
+            }
             snapshot();
+            if (failed_.load()) return;
             if (session_count_==sessions_.size()) { fail(now); return; }
+            if (destination_.begin_generation && !destination_.begin_generation(destination_.context,packet.record.epoch)) {
+                fail(now); return;
+            }
+            output_revoked_=false; awaiting_generation_=false;
             worker_=std::make_unique<AudioCorrectionWorker>(packet.record.epoch,clock_epoch_);
             auto& s=sessions_[session_count_++]; s.epoch=packet.record.epoch; s.ssrc=packet.ssrc;
+            admitted_session_.store(packet.record.epoch.session,std::memory_order_release);
+            admitted_generation_.store(packet.record.epoch.generation,std::memory_order_release);
             last_report_=-1;
+        }
+        if (worker_->state()==CorrectionState::faulted && recovery_==DesktopRecovery::same_sender_session) {
+            ++retired_packets_; continue; // Never revive a failed generation with new arrivals.
         }
         auto& s=sessions_[session_count_-1]; ++s.packets;
         last_report_=std::max(last_report_,packet.last_report_ns);
@@ -96,8 +154,11 @@ void AudioCorrectionDiagnostic::tick(Nanoseconds now,bool provider_healthy) {
         const auto pushed=worker_->push(packet.record,packet.ssrc,packet.timestamp,
             std::span(packet.pcm).first(packet.frames*2),now,healthy);
         (void)pushed; // State/fault snapshot retains rejection; no auto-revival.
+        snapshot();
+        if (failed_.load()) return;
     }
     if (!worker_) return;
+    apply_retirement(now);
     const bool sr_fresh=last_report_>=0 && last_report_<=now && now-last_report_<=2'000'000'000;
     const bool healthy=provider_healthy && (worker_->state()==CorrectionState::priming || sr_fresh);
     const auto before=worker_->diagnostics().backend_calls;

@@ -60,11 +60,20 @@ isolated real-capture development, not production deployment.
   See [startup/handoff scope and next steps](startup-handoff-validation.md).
 - [x] Actual Windows desktop audio through the native source to a short encoded
   recording in isolated libOBS; no physical video, real mic or normal-profile migration.
+- [x] Separate physical video/desktop IPC inputs and full-frame fitting in the
+  isolated recorder; first real combined recordings and strict six-event analysis.
+  Later source-policy-v2 testing passed three unchanged-setting physical timing
+  runs. This does not qualify the production or reliability gates; see
+  [retained failures, passes and follow-up](physical-combined-validation.md).
+- [x] Opt-in same-sender clock-loss recovery with retired-generation fencing,
+  fresh IPC replacement, and one physical planned-pause/OBS reconnection test.
+  Recovery includes a measured silence gap; whole-process/reboot recovery and
+  loaded physical calibration remain open. See [recovery scope](desktop-recovery.md).
 - [ ] Loaded clock/recovery repeatability, source-timestamp uncertainty and
   complete resource qualification before a production or OBS correction path.
 
 Completed subsets above do not complete the broader capture or clock-uncertainty
-gates. No live microphone path, RTX, combined real A/V OBS handoff,
+gates. No live microphone path, RTX, reliable continuous combined A/V handoff,
 or production startup migration is included yet. See [network validation](network-validation.md)
 and [physical video validation](video-validation.md) for actual scope and faults.
 The [ASRC design](asrc-design.md) first requires original device-clock anchors to
@@ -84,8 +93,9 @@ delivery, stop and revise that boundary. Do not disguise failure with a new offs
 ## Milestone 3 — production readiness
 
 - [ ] Three unchanged unique-event runs: median offset <= one frame and every
-  marker <= two frames at 60 fps on the **physical end-to-end** path (the synthetic
-  subset passes; this production gate is still open).
+  marker <= two frames at 60 fps on the **production physical end-to-end** path.
+  Three isolated physical runs passed these limits; the normal-profile production
+  migration and its repeat verification are still open.
 - [ ] Thirty-minute representative load: no growing drift, unbounded memory,
   popping or unexplained late concealment.
 - [ ] Source, sender, service, OBS and both-machine restart matrix.

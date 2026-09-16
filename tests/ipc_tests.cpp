@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "avsync/ipc.hpp"
+#include "avsync/video_publication.hpp"
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -21,6 +23,7 @@
 #ifdef AVSYNC_IPC_TEST_HOOKS
 namespace avsync::ipc::testing {
 [[noreturn]] void abandon_mutex(const char*, int, int);
+[[noreturn]] void briefly_hold_mutex(const char*, int, int);
 bool set_sequence(const char*, unsigned, std::uint64_t);
 }
 #endif
@@ -281,6 +284,54 @@ void restart_and_security(TempDir& dir) {
 }
 
 #ifdef AVSYNC_IPC_TEST_HOOKS
+void video_publication_retry(TempDir& dir) {
+    using P=avsync::VideoPublicationResult;
+    const auto c=small(); const auto path=dir.file("video-retry");
+    Writer writer(path,c); Reader reader(path);
+    require(writer.valid() && reader.valid(),"video retry IPC fixture");
+    avsync::Nv12VideoHandoff handoff(c.width,c.height,c.width);
+    std::vector<std::byte> source(video_bytes(c),std::byte{0x19});
+    const auto captured=monotonic_ns(); constexpr std::int64_t delay=100'000'000;
+    require(handoff.try_copy(source,captured)==avsync::VideoHandoffStatus::ok,"first retry frame owned");
+    const auto* first=handoff.peek();
+    const auto publish=[&](std::span<const std::uint8_t> pixels,std::int64_t capture,std::int64_t presentation) {
+        const auto result=writer.try_publish_video(pixels,capture,presentation);
+        if (result==WriteResult::ok) return P::published;
+        return result==WriteResult::busy ? P::busy : P::failed;
+    };
+    int notice[2],release[2]; require(pipe(notice)==0 && pipe(release)==0,"video retry pipes");
+    const auto child=fork(); require(child>=0,"video retry fork");
+    if (!child) {
+        close(notice[0]); close(release[1]);
+        testing::briefly_hold_mutex(path.c_str(),notice[1],release[0]);
+    }
+    close(notice[1]); close(release[0]); char marker{};
+    const bool notified=read(notice[0],&marker,1)==1; close(notice[0]);
+    const auto first_attempt=avsync::try_publish_oldest_video(handoff,captured,delay,publish);
+    std::fill(source.begin(),source.end(),std::byte{0x29});
+    const auto second_copy=handoff.try_copy(source,captured+16'666'667);
+    const auto second_attempt=avsync::try_publish_oldest_video(handoff,captured+1'000'000,delay,publish);
+    const bool still_owned=handoff.peek()==first && first->capture_ns==captured && first->pixels.front()==0x19;
+    const auto full=handoff.try_copy(source,captured+33'333'334);
+    // Release/reap the helper before asserting, including on regression failure.
+    const bool released=write(release[1],&marker,1)==1; close(release[1]);
+    int status{}; const auto reaped=waitpid(child,&status,0);
+    require(notified && released && reaped==child && WIFEXITED(status) && WEXITSTATUS(status)==0,"video retry lock helper");
+    require(first_attempt==P::busy && second_attempt==P::busy && still_owned,"busy retains exact video frame");
+    require(second_copy==avsync::VideoHandoffStatus::ok && full==avsync::VideoHandoffStatus::full,"bounded retry capture queue");
+    std::fill(source.begin(),source.end(),std::byte{0x39});
+    require(avsync::try_publish_oldest_video(handoff,captured+20'000'000,delay,publish)==P::published,"retry publishes first frame");
+    require(avsync::try_publish_oldest_video(handoff,captured+21'000'000,delay,publish)==P::published,"retry preserves second frame");
+    require(!handoff.peek(),"retry drains owned queue");
+    std::vector<std::uint8_t> output(video_bytes(c)); FrameInfo info;
+    require(reader.read_latest_due_video(captured+delay,output,info)==ReadResult::ok &&
+        info.sequence==1 && info.capture_ns==captured && info.presentation_ns==captured+delay &&
+        std::all_of(output.begin(),output.end(),[](auto value){ return value==0x19; }),"first retried payload and timestamps exact");
+    require(reader.read_latest_due_video(captured+delay+16'666'667,output,info)==ReadResult::ok &&
+        info.sequence==2 && info.capture_ns==captured+16'666'667 && info.presentation_ns==captured+delay+16'666'667 &&
+        std::all_of(output.begin(),output.end(),[](auto value){ return value==0x29; }),"second retried payload and timestamps exact");
+}
+
 void owner_death_and_wrap(TempDir& dir) {
     auto c = small(); auto path = dir.file("death"); Writer writer(path, c); require(writer.valid(), "death writer"); Reader reader(path);
     int notification[2]; require(pipe(notification) == 0, "notification pipe");
@@ -324,6 +375,7 @@ int main() {
         TempDir dir; reserved_allocation_and_cleanup(dir); scheduling_and_bounds(dir);
         bounded_audio_handoff(dir); handoff_restart_phase(dir); restart_and_security(dir);
 #ifdef AVSYNC_IPC_TEST_HOOKS
+        video_publication_retry(dir);
         owner_death_and_wrap(dir);
 #else
         std::cout << "SKIP robust owner-death/wrap injection: AVSYNC_IPC_TEST_HOOKS not compiled\n";

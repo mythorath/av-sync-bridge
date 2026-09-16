@@ -4,6 +4,8 @@
 #include "avsync/timing.hpp"
 #include "avsync/v4l2_capture.hpp"
 #include "avsync/video_handoff.hpp"
+#include "avsync/video_marker_trace.hpp"
+#include "avsync/video_publication.hpp"
 #include <linux/magic.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -37,25 +39,27 @@ unsigned number(const char* value, unsigned low, unsigned high) {
 }
 void help() {
     std::cout << "avsync-video-bridge --capture --device /dev/videoN --runtime-dir NEW_TMPFS_DIRECTORY\n"
-                 " --seconds 1..120 [--delay-ms 0..2000] [--verify-delivery]\n"
+                 " --seconds 1..180 [--delay-ms 0..2000] [--verify-delivery] [--trace-markers]\n"
                  "Current NV12 format only; device must be released by its existing owner.\n"
                  "Video pixels are buffered in a private temporary memory-backed IPC file.\n"
                  "The new directory and its IPC files are removed on normal/error exit.\n"
                  "No OBS, audio, network, format changes or startup registration.\n"
-                 "Optional verification reads delayed IPC pixels in memory, not a video display.\n";
+                 "Optional verification reads delayed IPC pixels in memory, not a video display.\n"
+                 "Optional marker tracing emits bounded sparse cyan scores after capture stops.\n";
 }
-struct Options { std::string device, directory; unsigned seconds{}, delay_ms{2000}; bool capture{}, verify{}; };
+struct Options { std::string device, directory; unsigned seconds{}, delay_ms{2000}; bool capture{}, verify{}, trace_markers{}; };
 Options parse(int argc, char** argv) {
     Options o; unsigned seen{};
     for (int i=1;i<argc;++i) {
         const std::string_view arg(argv[i]);
         if (arg=="--capture" && !o.capture) { o.capture=true; continue; }
         if (arg=="--verify-delivery" && !o.verify) { o.verify=true; continue; }
+        if (arg=="--trace-markers" && !o.trace_markers) { o.trace_markers=true; continue; }
         require(i+1<argc,"missing option value"); const auto* value=argv[++i];
         unsigned bit{};
         if (arg=="--device") { bit=1; o.device=value; }
         else if (arg=="--runtime-dir") { bit=2; o.directory=value; }
-        else if (arg=="--seconds") { bit=4; o.seconds=number(value,1,120); }
+        else if (arg=="--seconds") { bit=4; o.seconds=number(value,1,180); }
         else if (arg=="--delay-ms") { bit=8; o.delay_ms=number(value,0,2000); }
         else throw std::runtime_error("unknown or repeated argument");
         require(!(seen&bit),"repeated argument"); seen|=bit;
@@ -134,7 +138,7 @@ std::uint64_t fingerprint(std::span<const std::uint8_t> pixels) {
 }
 struct Ledger { std::uint64_t sequence{}, digest{}; std::int64_t capture{}, presentation{}; };
 struct Stats {
-    std::uint64_t published{}, publication_busy{}, handoff_full{}, stale_before_publish{};
+    std::uint64_t published{}, publication_busy{}, publication_retried{}, handoff_full{}, stale_before_publish{};
     std::uint64_t received{}, reader_busy{}, skipped{}, digest_changes{}, verified{}, failures{};
     std::int64_t min_delivery_age{std::numeric_limits<std::int64_t>::max()}, max_delivery_age{};
     std::int64_t max_publish_ns{}, max_read_ns{};
@@ -147,6 +151,7 @@ int run(const Options& options) {
     std::unique_ptr<avsync::V4l2Capture> capture;
     std::atomic<bool> done{false}, failed{false};
     std::unique_ptr<avsync::Nv12VideoHandoff> handoff;
+    std::unique_ptr<avsync::Nv12MarkerTrace> marker_trace;
     std::vector<Ledger> ledger;
     std::vector<std::uint8_t> received_pixels;
     const auto delay_ns=std::int64_t(options.delay_ms)*1000000;
@@ -169,6 +174,8 @@ int run(const Options& options) {
         std::string config_error;
         require(avsync::ipc::validate_config(config,config_error),"video dimensions/delay exceed the 2 GiB IPC budget");
         handoff=std::make_unique<avsync::Nv12VideoHandoff>(format.width,format.height,format.stride);
+        if (options.trace_markers)
+            marker_trace=std::make_unique<avsync::Nv12MarkerTrace>(format.width,format.height,format.stride,delay_ns);
         runtime.create(options.directory);
         const auto ipc_path=runtime.path+"/media.ipc";
         writer=std::make_unique<avsync::ipc::Writer>(ipc_path,config,
@@ -185,26 +192,32 @@ int run(const Options& options) {
             try {
                 std::int64_t last_presentation=0, next_heartbeat=0;
                 std::uint64_t last_sequence=0,last_digest=0;
+                bool pending_was_busy=false;
                 while (!failed.load()) {
                     const auto now=avsync::ipc::monotonic_ns();
-                    if (const auto* packet=handoff->peek()) {
-                        const auto presentation=avsync::checked_add(packet->capture_ns,delay_ns);
-                        require(presentation.has_value(),"presentation timestamp overflow");
-                        // Never fill the long ring with a delayed worker backlog.
-                        if (now>packet->capture_ns && now-packet->capture_ns>200000000) ++stats.stale_before_publish;
-                        else {
+                    using Publication=avsync::VideoPublicationResult;
+                    const auto publication=avsync::try_publish_oldest_video(*handoff,now,delay_ns,
+                        [&](std::span<const std::uint8_t> pixels, std::int64_t captured, std::int64_t presentation) {
                             const auto before=avsync::ipc::monotonic_ns();
-                            const auto result=writer->try_publish_video(packet->pixels,packet->capture_ns,*presentation);
+                            const auto result=writer->try_publish_video(pixels,captured,presentation);
                             stats.max_publish_ns=std::max(stats.max_publish_ns,avsync::ipc::monotonic_ns()-before);
-                            if (result==avsync::ipc::WriteResult::busy) ++stats.publication_busy;
-                            else {
-                                require(result==avsync::ipc::WriteResult::ok,"IPC publication failed");
-                                ++stats.published; last_presentation=*presentation;
-                                if (reader) ledger[stats.published%ledger.size()]={stats.published,fingerprint(packet->pixels),
-                                                                                packet->capture_ns,*presentation};
-                            }
-                        }
-                        require(handoff->release(),"handoff ownership failed");
+                            if (result==avsync::ipc::WriteResult::busy) return Publication::busy;
+                            if (result!=avsync::ipc::WriteResult::ok) return Publication::failed;
+                            const auto sequence=stats.published+1;
+                            last_presentation=presentation;
+                            if (reader) ledger[sequence%ledger.size()]={sequence,fingerprint(pixels),captured,presentation};
+                            return Publication::published;
+                        });
+                    if (publication==Publication::busy) {
+                        ++stats.publication_busy; pending_was_busy=true;
+                    } else if (publication==Publication::published) {
+                        ++stats.published;
+                        if (pending_was_busy) ++stats.publication_retried;
+                        pending_was_busy=false;
+                    } else if (publication==Publication::stale) {
+                        ++stats.stale_before_publish; pending_was_busy=false;
+                    } else {
+                        require(publication==Publication::empty,"IPC publication or handoff failed");
                     }
                     if (now>=next_heartbeat) {
                         const auto result=writer->try_heartbeat();
@@ -250,6 +263,9 @@ int run(const Options& options) {
                 const auto result=handoff->try_copy(frame.pixels,frame.capture_ns);
                 if (result==avsync::VideoHandoffStatus::full) ++stats.handoff_full;
                 else require(result==avsync::VideoHandoffStatus::ok,"invalid capture handoff");
+                if (marker_trace)
+                    (void)marker_trace->append(frame.pixels,frame.capture_ns,frame.sequence,
+                        result==avsync::VideoHandoffStatus::ok);
             },[&] { return interrupted!=0 || failed.load(); });
         } catch (...) { failed.store(true); throw; }
         done.store(true);
@@ -266,7 +282,9 @@ int run(const Options& options) {
     const auto capture_stats=capture ? capture->stats() : avsync::V4l2CaptureStats{};
     const bool clean=error.empty() && cleaned && !capture_stats.driver_error_buffers &&
         !capture_stats.missing_sequences && !capture_stats.interrupted && !stats.handoff_full &&
-        !stats.publication_busy && !stats.stale_before_publish && !stats.failures &&
+        stats.published==capture_stats.accepted && !stats.stale_before_publish && !stats.failures &&
+        (!options.trace_markers || (marker_trace && !marker_trace->invalid() && !marker_trace->overflow() &&
+            marker_trace->points().size()==capture_stats.accepted)) &&
         (!options.verify || stats.received==stats.published);
     std::cout << "{\"schema\":1,\"video_only\":true,\"obs_used\":false,\"status\":\""
               << (clean ? (options.verify ? "bounded_video_verified" : "video_buffered_unverified") : "degraded_or_failed")
@@ -279,7 +297,8 @@ int run(const Options& options) {
               << ",\"max_capture_interval_ms\":" << capture_stats.maximum_interval_ns/1e6
               << ",\"max_capture_interval_end_elapsed_ms\":" << capture_stats.maximum_interval_end_elapsed_ns/1e6
               << ",\"published\":" << stats.published << ",\"handoff_full\":" << stats.handoff_full
-              << ",\"publication_busy\":" << stats.publication_busy << ",\"stale_before_publish\":" << stats.stale_before_publish
+              << ",\"publication_busy\":" << stats.publication_busy << ",\"publication_retried\":" << stats.publication_retried
+              << ",\"stale_before_publish\":" << stats.stale_before_publish
               << ",\"received\":" << stats.received << ",\"verified\":" << stats.verified
               << ",\"reader_busy\":" << stats.reader_busy << ",\"reader_skipped\":" << stats.skipped
               << ",\"sampled_digest_changes\":" << stats.digest_changes
@@ -287,7 +306,23 @@ int run(const Options& options) {
               << ",\"max_delivery_age_ms\":" << stats.max_delivery_age/1e6
               << ",\"max_capture_copy_ms\":" << capture_stats.maximum_callback_ns/1e6
               << ",\"max_publish_ms\":" << stats.max_publish_ns/1e6
-              << ",\"max_read_ms\":" << stats.max_read_ns/1e6 << "}\n";
+              << ",\"max_read_ms\":" << stats.max_read_ns/1e6;
+    if (options.trace_markers) {
+        std::cout << ",\"marker_trace_overflow\":" << (marker_trace && marker_trace->overflow() ? "true" : "false")
+                  << ",\"marker_trace_invalid\":" << (!marker_trace || marker_trace->invalid() ? "true" : "false")
+                  << ",\"marker_trace_sampled_pixels\":" << avsync::Nv12MarkerTrace::sampled_pixels
+                  << ",\"marker_trace_sequence_kind\":\"v4l2\",\"marker_trace\":[";
+        bool first=true;
+        if (marker_trace) for (const auto& point : marker_trace->points()) {
+            if (!first) std::cout << ',';
+            first=false;
+            std::cout << "{\"capture_ns\":" << point.capture_ns << ",\"presentation_ns\":" << point.presentation_ns
+                      << ",\"sequence\":" << point.sequence << ",\"cyan_samples\":" << point.cyan_samples
+                      << ",\"handoff_accepted\":" << (point.handoff_accepted ? "true" : "false") << '}';
+        }
+        std::cout << ']';
+    }
+    std::cout << "}\n";
     if (!error.empty()) std::cerr << error << '\n'; // All local error text is generic.
     return clean ? 0 : 3;
 }

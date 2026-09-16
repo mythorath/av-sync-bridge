@@ -331,8 +331,8 @@ const V4l2CaptureStats &V4l2Capture::stats() const noexcept { return impl_->stat
 void V4l2Capture::run(std::chrono::seconds duration, const FrameCallback &callback,
                      const StopRequested &stop_requested)
 {
-    if (duration < std::chrono::seconds(1) || duration > std::chrono::seconds(120) || !callback)
-        throw std::invalid_argument("capture duration must be 1..120 seconds with a callback");
+    if (duration < std::chrono::seconds(1) || duration > std::chrono::seconds(180) || !callback)
+        throw std::invalid_argument("capture duration must be 1..180 seconds with a callback");
     if (impl_->used) throw std::logic_error("one capture object represents only one generation");
     impl_->used = true;
     impl_->run_start_ns = monotonic_now();

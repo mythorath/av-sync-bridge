@@ -9,7 +9,7 @@ avsync-windows-sender --help
 avsync-windows-sender --loopback --host IPV4 --clock-port CLOCK_PORT --rtp-port RTP_PORT --rtcp-port RTCP_PORT --clock-epoch RECEIVER_EPOCH --seconds 15
 ```
 
-Replace the uppercase placeholders with the explicitly selected destination and three distinct ports. All run options are mandatory. `--seconds` is an overall observation deadline of 1–120 seconds, including clock acquisition and any pipeline rebuilds; retries do not extend it. Help, no arguments, and invalid arguments open no endpoint and send no network traffic. Only numeric unicast IPv4 destinations are accepted in this version.
+Replace the uppercase placeholders with the explicitly selected destination and three distinct ports. All run options are mandatory. `--seconds` is an overall observation deadline of 1–180 seconds, including clock acquisition and any pipeline rebuilds; retries do not extend it. The bounded three-minute maximum allows a manually started reference inside a longer isolated recording; it does not extend any clock-health or stale-media limit. Help, no arguments, and invalid arguments open no endpoint and send no network traffic. Only numeric unicast IPv4 destinations are accepted in this version.
 
 Start the diagnostic receiver first with `--expect-anchors` and copy its fresh
 decimal `clock_epoch` from the READY line into `--clock-epoch`. A receiver restart
@@ -114,6 +114,13 @@ up to eight edge snapshots contain a fixed reason, elapsed time, observation
 age, RTT, calibration rate and mapped-packet count, plus the total loss count.
 Final `clock_reason=no statistics` therefore no longer erases the earlier cause.
 These snapshots contain no PCM or endpoint identities.
+They also retain the last accepted observation's local receive time, optional
+upstream average RTT and scheduled timeout, and the last/maximum interval
+between accepted observations since qualification reset. Missing optional
+upstream fields remain absent, not zero. These describe accepted statistics,
+not every clock packet: they cannot distinguish missing replies from replies
+discarded by upstream filtering. The same fields describe the final monitor
+state when available; the loss-edge copy survives a subsequent monitor reset.
 
 The sender explicitly sets and reads back a 250 ms maximum polling/retry timeout
 on the underlying network clock, not the wrapper's unrelated inherited timeout.

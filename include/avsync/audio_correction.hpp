@@ -9,6 +9,7 @@
 namespace avsync {
 enum class CorrectionState { priming, running, faulted };
 enum class CorrectionFault { none, metadata, pcm, rate, overflow, stale, health, backend, timeline, phase };
+enum class CorrectionStaleReason { none, no_progress, anchor_age, input_queue, output_queue };
 enum class CorrectionPush { accepted, priming_discard, wrong_epoch, rejected };
 struct CorrectionDiagnostics {
     std::uint64_t received_frames{}, priming_discarded_frames{}, consumed_frames{}, produced_frames{}, delivered_frames{};
@@ -19,6 +20,10 @@ struct CorrectionDiagnostics {
     std::uint64_t phase_checks{}, phase_waits{};
     std::size_t peak_phase_anchors{};
     Nanoseconds maximum_predicted_phase_ns{};
+    // First stale gate, captured before fail() erases private DSP/queue state.
+    // Missing age means checked subtraction failed, not an age of zero.
+    CorrectionStaleReason stale_reason{CorrectionStaleReason::none};
+    std::optional<Nanoseconds> stale_age_ns;
 };
 struct CorrectedAudio {
     SessionToken epoch;

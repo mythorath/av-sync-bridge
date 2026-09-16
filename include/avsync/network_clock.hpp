@@ -95,6 +95,8 @@ struct ClockStatistics {
     Nanoseconds rtt_ns = 0;
     Nanoseconds discontinuity_ns = 0;
     bool algorithm_synchronized = false;
+    // Optional upstream diagnostics; absent/malformed fields never weaken gates.
+    std::optional<Nanoseconds> rtt_average_ns, scheduled_timeout_ns;
 };
 
 struct ClockHealth {
@@ -105,6 +107,9 @@ struct ClockHealth {
     std::optional<Nanoseconds> observation_age_ns;
     std::optional<Nanoseconds> rtt_ns;
     std::optional<double> rate_error_ppm;
+    std::optional<Nanoseconds> observation_received_ns, rtt_average_ns, scheduled_timeout_ns;
+    std::optional<Nanoseconds> last_observation_gap_ns;
+    Nanoseconds maximum_observation_gap_ns = 0;
 };
 
 // Single-owner state. Drain the client's GstBus regularly and pass ELEMENT
@@ -123,6 +128,8 @@ private:
     ClockHealthPolicy policy_;
     std::optional<ClockStatistics> last_;
     std::uint64_t observations_ = 0;
+    std::optional<Nanoseconds> last_gap_ns_;
+    Nanoseconds maximum_gap_ns_ = 0;
 };
 
 } // namespace avsync::net

@@ -38,10 +38,17 @@ struct DiagnosticAudioOutput {
     void* context{};
     bool (*consume)(void*,const CorrectedAudio&,std::span<const float>,Nanoseconds) noexcept{};
     void (*revoke)(void*) noexcept{};
+    // Optional owner-thread hook. A retired output must be replaced before a
+    // new authorized generation primes; never called from the network callback.
+    bool (*begin_generation)(void*,SessionToken) noexcept{};
 };
+enum class DesktopRecovery { disabled, same_sender_session };
+[[nodiscard]] bool desktop_fault_recoverable(CorrectionFault,CorrectionStaleReason) noexcept;
 // Finite desktop-only diagnostic bridge. Defaults to inspect/discard. Explicit
 // output hooks run on the ordinary tick owner, NEVER the network/OBS callback.
-// An output-enabled instance fails closed on ANY generation fault; no recovery.
+// Default output mode stops on any fault. Explicit same-session recovery retires
+// stale/unhealthy generations and waits for a new admitted SSRC/generation.
+// Metadata/PCM/phase/rate/queue/output errors remain terminal in either mode.
 // submit(): network callback, short mutex-protected fixed-size copy, no DSP.
 // tick(): ordinary single owner, no mutex held during DSP/analysis. At most
 // 64 input packets and eight DSP quanta per tick; optional synchronous output
@@ -51,24 +58,37 @@ class AudioCorrectionDiagnostic {
 public:
     static constexpr std::size_t capacity=64;
     static constexpr Nanoseconds maximum_queue_age_ns=100'000'000;
-    explicit AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output={});
+    explicit AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output={},
+        DesktopRecovery recovery=DesktopRecovery::disabled);
     [[nodiscard]] bool submit(const DiagnosticAudioPacket& packet) noexcept;
+    // Callback-safe retirement fence, only for a transport-validated expiry.
+    // Does not touch DSP/IPC: the owner revokes before its next dispatch. Rejects
+    // foreign or not-yet-admitted generations. Ordinary metadata is not expiry.
+    [[nodiscard]] bool retire_stale_transport(SessionToken) noexcept;
+    [[nodiscard]] bool retired_generation(SessionToken) const noexcept;
     void tick(Nanoseconds now,bool provider_healthy);
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
     [[nodiscard]] std::size_t queue_peak() const noexcept { return queue_peak_; }
+    [[nodiscard]] bool awaiting_generation() const noexcept { return awaiting_generation_; }
+    [[nodiscard]] std::uint64_t retired_packets() const noexcept { return retired_packets_; }
     [[nodiscard]] std::span<const DiagnosticAudioSession> sessions() const noexcept {
         return std::span(sessions_).first(session_count_);
     }
 private:
     void snapshot() noexcept;
     void fail(Nanoseconds now) noexcept;
+    void apply_retirement(Nanoseconds now) noexcept;
     DiagnosticAudioOutput destination_;
+    DesktopRecovery recovery_;
+    bool output_revoked_{},awaiting_generation_{};
+    std::uint64_t retired_packets_{};
     std::uint64_t clock_epoch_;
     wire::AudioStreamAdmission admission_;
     std::mutex mutex_;
     std::array<DiagnosticAudioPacket,capacity> queue_{};
     std::size_t head_{},size_{},queue_peak_{};
     std::atomic<bool> failed_{};
+    std::atomic<std::uint64_t> admitted_session_{},admitted_generation_{},retired_generation_{};
     std::unique_ptr<AudioCorrectionWorker> worker_;
     std::array<DiagnosticAudioSession,8> sessions_{};
     std::size_t session_count_{};

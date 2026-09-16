@@ -63,6 +63,10 @@ public:
     // Call for absent/duplicate/malformed target extension or invalid PCM on
     // this ordered branch; do not simply drop metadata and continue its audio.
     [[nodiscard]] AudioValidationResult reject_missing() noexcept;
+    // Classify an otherwise fully consistent packet as expiry-only WITHOUT
+    // accepting it or advancing this validator. Used solely to retire a stream.
+    [[nodiscard]] bool timing_only_stale(const AudioRecord&,std::uint32_t ssrc,
+        std::uint32_t timestamp,std::uint32_t frames,Nanoseconds now) const noexcept;
     [[nodiscard]] bool faulted() const noexcept { return faulted_; }
     [[nodiscard]] bool admitted() const noexcept { return latest_.has_value(); }
     [[nodiscard]] const std::optional<AudioRecord>& latest_record() const noexcept { return latest_; }

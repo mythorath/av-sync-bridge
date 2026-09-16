@@ -105,6 +105,10 @@ void test_health()
     CHECK(healthy.observation_age_ns == 100'000'000);
     CHECK(healthy.rtt_ns == 100'000);
     CHECK(healthy.rate_error_ppm == 0);
+    CHECK(healthy.observation_received_ns == 400'000'000);
+    CHECK(healthy.last_observation_gap_ns == 100'000'000);
+    CHECK(healthy.maximum_observation_gap_ns == 100'000'000);
+    CHECK(!healthy.rtt_average_ns && !healthy.scheduled_timeout_ns);
     CHECK(!observe(monitor, 400'000'000));
     CHECK(!observe(monitor, 399'999'999));
     CHECK(!observe(monitor, GST_CLOCK_TIME_NONE));
@@ -138,6 +142,26 @@ void test_health()
     monitor.reset();
     CHECK(!monitor.health(true, identity, 1'000'000'001).usable);
     CHECK(monitor.health(true, identity, 1'000'000'001).observations == 0);
+    CHECK(!monitor.health(true, identity, 1'000'000'001).last_observation_gap_ns);
+    CHECK(monitor.health(true, identity, 1'000'000'001).maximum_observation_gap_ns == 0);
+    auto* diagnostic = statistics(1'100'000'000);
+    gst_structure_set(gst_message_writable_structure(diagnostic),
+        "rtt-average", G_TYPE_UINT64, guint64{123'456},
+        "timeout", G_TYPE_UINT64, guint64{250'000'000}, nullptr);
+    CHECK(monitor.observe(diagnostic)); gst_message_unref(diagnostic);
+    const auto detail = monitor.health(true, identity, 1'100'000'001);
+    CHECK(detail.rtt_average_ns == 123'456 && detail.scheduled_timeout_ns == 250'000'000);
+    CHECK(!detail.last_observation_gap_ns);
+    CHECK(observe(monitor, 1'800'000'000));
+    CHECK(monitor.health(true, identity, 1'800'000'001).maximum_observation_gap_ns == 700'000'000);
+    // Optional diagnostic overflow is unavailable, never a substituted zero or gate bypass.
+    diagnostic = statistics(1'900'000'000);
+    gst_structure_set(gst_message_writable_structure(diagnostic),
+        "rtt-average", G_TYPE_UINT64, GST_CLOCK_TIME_NONE,
+        "timeout", G_TYPE_UINT64, GST_CLOCK_TIME_NONE, nullptr);
+    CHECK(monitor.observe(diagnostic)); gst_message_unref(diagnostic);
+    CHECK(!monitor.health(true, identity, 1'900'000'001).rtt_average_ns);
+    CHECK(!monitor.health(true, identity, 1'900'000'001).scheduled_timeout_ns);
     CHECK(!monitor.health(static_cast<GstClock*>(nullptr)).usable);
     for (unsigned kind = 0; kind < 6; ++kind) {
         ClockHealthPolicy policy;

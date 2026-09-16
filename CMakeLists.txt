@@ -108,6 +108,14 @@ if(AVSYNC_BUILD_NETWORK)
     endif()
     if(BUILD_TESTING)
       add_test(NAME avsync-windows-sender-help COMMAND avsync-windows-sender --help)
+      foreach(invalid_seconds 0 181)
+        add_test(NAME avsync-windows-sender-reject-seconds-${invalid_seconds}
+          COMMAND ${CMAKE_COMMAND} -DEXECUTABLE=$<TARGET_FILE:avsync-windows-sender>
+          -DTEST_KIND=sender -DCASE_SECONDS=${invalid_seconds}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rejected_duration.cmake)
+        set_tests_properties(avsync-windows-sender-reject-seconds-${invalid_seconds}
+          PROPERTIES TIMEOUT 5)
+      endforeach()
     endif()
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(avsync-network-receiver apps/network_receiver.cpp)
@@ -239,6 +247,14 @@ if(AVSYNC_BUILD_V4L2)
     target_compile_options(avsync-video-bridge PRIVATE -Wall -Wextra -Wpedantic)
     if(BUILD_TESTING)
       add_test(NAME avsync-video-bridge-help COMMAND avsync-video-bridge --help)
+      foreach(invalid_seconds 0 181)
+        add_test(NAME avsync-video-bridge-reject-seconds-${invalid_seconds}
+          COMMAND ${CMAKE_COMMAND} -DEXECUTABLE=$<TARGET_FILE:avsync-video-bridge>
+          -DTEST_KIND=video -DCASE_SECONDS=${invalid_seconds}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rejected_duration.cmake)
+        set_tests_properties(avsync-video-bridge-reject-seconds-${invalid_seconds}
+          PROPERTIES TIMEOUT 5)
+      endforeach()
     endif()
   endif()
   if(BUILD_TESTING)

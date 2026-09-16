@@ -53,13 +53,14 @@ struct Options {
     std::string bind, peer, desktop_ipc;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
-    bool expect_media{}, expect_anchors{}, correct_desktop{};
+    bool expect_media{}, expect_anchors{}, correct_desktop{}, recover_desktop_ipc{};
 };
 void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
                  " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
                  " [--correct-desktop] (optional ASRC build; inspect/discard PCM, NEVER playback/OBS)\n"
                  " [--desktop-ipc NEW_PRIVATE_FILE] (explicit IPC+ASRC build; 2-second desktop buffer, no OBS changes)\n"
+                 " [--recover-desktop-ipc] (opt in to at most 8 generations from the SAME sender session)\n"
                  " [--clock-pause-after SECONDS --clock-pause-seconds 1..10] (test fixture only)\n"
                  "Explicit private-link diagnostic listener and shared monotonic clock provider.\n"
                  "PT96/L24/48kHz/stereo; accepts only the supplied peer's media packets.\n"
@@ -134,6 +135,8 @@ public:
                 (options.clock_pause_after && options.clock_pause_seconds &&
                  options.clock_pause_after + options.clock_pause_seconds < options.seconds),
                 "Clock pause needs both options and must finish before the diagnostic deadline");
+        require(!options_.recover_desktop_ipc || !options_.desktop_ipc.empty(),
+                "Desktop recovery requires explicit desktop IPC output");
         do { clock_epoch_ = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!clock_epoch_);
         admission_.emplace(clock_epoch_);
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
@@ -142,15 +145,32 @@ public:
         if (!options_.desktop_ipc.empty()) {
             require(!std::filesystem::exists(options_.desktop_ipc),"Desktop IPC requires a new private file");
             handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,2'000'000'000);
-            destination={handoff_.get(),[](void* p,const avsync::CorrectedAudio& block,
+            destination={this,[](void* p,const avsync::CorrectedAudio& block,
                     std::span<const float> pcm,avsync::Nanoseconds now) noexcept {
-                return static_cast<avsync::CorrectedAudioHandoff*>(p)->consume(block,pcm,now);
-            },[](void* p) noexcept { static_cast<avsync::CorrectedAudioHandoff*>(p)->revoke(); }};
+                auto* self=static_cast<Receiver*>(p);
+                return self->handoff_ && self->handoff_->consume(block,pcm,now);
+            },[](void* p) noexcept {
+                auto* self=static_cast<Receiver*>(p); if (self->handoff_) self->handoff_->revoke();
+            },[](void* p,avsync::SessionToken) noexcept {
+                auto* self=static_cast<Receiver*>(p);
+                if (self->handoff_ && self->handoff_->valid()) return true;
+                try {
+                    if (self->handoff_) {
+                        self->retired_ipc_frames_+=self->handoff_->published_frames();
+                        self->retired_ipc_busy_+=self->handoff_->busy_retries();
+                        self->retired_ipc_peak_=std::max(self->retired_ipc_peak_,self->handoff_->queue_peak());
+                        self->handoff_.reset();
+                    }
+                    self->handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(self->options_.desktop_ipc,2'000'000'000);
+                    ++self->ipc_recreations_; return true;
+                } catch (...) { return false; }
+            }};
         }
 #else
         require(options_.desktop_ipc.empty(),"Desktop IPC requires an explicit IPC+ASRC build");
 #endif
-        if (options_.correct_desktop) correction_=std::make_unique<avsync::AudioCorrectionDiagnostic>(clock_epoch_,destination);
+        if (options_.correct_desktop) correction_=std::make_unique<avsync::AudioCorrectionDiagnostic>(clock_epoch_,destination,
+            options_.recover_desktop_ipc ? avsync::DesktopRecovery::same_sender_session:avsync::DesktopRecovery::disabled);
 #else
         require(!options_.correct_desktop,"Desktop correction requires an explicit optional ASRC build");
 #endif
@@ -233,7 +253,7 @@ public:
             }
 #endif
 #ifdef AVSYNC_HAS_AUDIO_HANDOFF
-            if (handoff_ && !handoff_->heartbeat(monotonic_now())) { error=true; break; }
+            if (handoff_ && !correction_->awaiting_generation() && !handoff_->heartbeat(monotonic_now())) { error=true; break; }
 #endif
             auto* message = gst_bus_timed_pop_filtered(bus, (options_.correct_desktop ? 2:100)*GST_MSECOND,
                 static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
@@ -380,12 +400,16 @@ public:
                 active_last_estimate_within_limit ? "true" : "false")
             << ",\"historical_original_anchor_qualification\":" << (historical_qualified ? "true" : "false")
             << ",\"qualification_semantics\":\"historical_active_generation_windows_not_present_lock\"";
-        bool bad_correction=false;
+        bool bad_correction=false,recovered_with_gap=false,awaiting_generation=false;
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
         if (correction_) {
             std::cout<<",\"correction_queue_peak_packets\":"<<correction_->queue_peak()<<",\"correction_sessions\":[";
             const auto sessions=correction_->sessions();
             bad_correction=!avsync::correction_diagnostic_pass(sessions,correction_->failed(),clock_pause_ns);
+            awaiting_generation=options_.recover_desktop_ipc && correction_->awaiting_generation();
+            recovered_with_gap=options_.recover_desktop_ipc && !correction_->failed() && sessions.size()>1 &&
+                sessions.back().state==avsync::CorrectionState::running &&
+                sessions.back().fault==avsync::CorrectionFault::none && sessions.back().delivered_frames>=48000;
             for (std::size_t i=0;i<sessions.size();++i) {
                 const auto& s=sessions[i]; const auto& d=s.correction;
                 if (i) std::cout<<',';
@@ -398,6 +422,10 @@ public:
                     <<",\"acquisition_spread_ppm\":"<<d.acquisition_spread_ppm
                     <<",\"maximum_predicted_phase_ns\":"<<d.maximum_predicted_phase_ns
                     <<",\"maximum_output_age_ns\":"<<s.maximum_output_age_ns
+                    <<",\"stale_reason\":"<<static_cast<unsigned>(d.stale_reason)
+                    <<",\"stale_age_ns\":";
+                json_optional(d.stale_age_ns);
+                std::cout
                     <<",\"peak_input_frames\":"<<d.peak_input_frames<<",\"peak_output_frames\":"<<d.peak_output_frames
                     <<",\"maximum_dispatch_quanta\":"<<s.dispatch_calls_max
                     <<",\"first_capture_ns\":"<<s.first_capture_ns<<",\"last_capture_ns\":"<<s.last_capture_ns
@@ -408,17 +436,25 @@ public:
             }
             std::cout<<"],\"correction_state_codes\":{\"priming\":0,\"running\":1,\"faulted\":2}"
                 <<",\"correction_fault_codes\":{\"none\":0,\"metadata\":1,\"pcm\":2,\"rate\":3,\"overflow\":4,\"stale\":5,\"health\":6,\"backend\":7,\"timeline\":8,\"phase\":9}"
+                <<",\"correction_stale_reason_codes\":{\"none\":0,\"no_progress\":1,\"anchor_age\":2,\"input_queue\":3,\"output_queue\":4}"
                 <<",\"corrected_pcm_destination\":\""<<(options_.desktop_ipc.empty()?
                     "in_memory_statistics_then_discard":"private_desktop_ipc_2_seconds")<<"\""
                 <<",\"correction_diagnostic_pass\":"<<(bad_correction?"false":"true");
+            std::cout<<",\"same_session_recovery_enabled\":"<<(options_.recover_desktop_ipc?"true":"false")
+                <<",\"awaiting_media_generation\":"<<(correction_->awaiting_generation()?"true":"false")
+                <<",\"retired_correction_packets\":"<<correction_->retired_packets();
 #ifdef AVSYNC_HAS_AUDIO_HANDOFF
-            if (handoff_) std::cout<<",\"ipc_published_frames\":"<<handoff_->published_frames()
-                <<",\"ipc_busy_retries\":"<<handoff_->busy_retries()<<",\"ipc_retry_queue_peak_blocks\":"<<handoff_->queue_peak()
+            if (handoff_) std::cout<<",\"ipc_published_frames\":"<<retired_ipc_frames_+handoff_->published_frames()
+                <<",\"ipc_busy_retries\":"<<retired_ipc_busy_+handoff_->busy_retries()
+                <<",\"ipc_retry_queue_peak_blocks\":"<<std::max(retired_ipc_peak_,handoff_->queue_peak())
+                <<",\"ipc_recreations\":"<<ipc_recreations_
                 <<",\"ipc_failure\":\""<<handoff_->failure_reason()<<"\"";
 #endif
         }
 #endif
         std::cout << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" :
+            awaiting_generation ? "awaiting_media_generation" :
+            recovered_with_gap && !bad_anchors && !invalid ? "recovered_with_gap" :
             bad_correction ? "correction_unqualified" : bad_anchors ? "original_anchors_unqualified" :
             !buffers ? "waiting_media" : !timed ? "priming_reference" : invalid ? "invalid_timing" :
             options_.expect_anchors ? "original_anchors_observed" : "timestamps_observed") << "\"}\n";
@@ -596,6 +632,9 @@ private:
             std::uint32_t ssrc{}, timestamp{}, payload_frames{};
             const auto record = avsync::net::read_audio_anchor(buffer, ssrc, timestamp, payload_frames);
             const auto now = gst_util_get_timestamp();
+            if (b.owner->options_.recover_desktop_ipc && record && b.owner->retired_record(*record)) {
+                ++b.original_retired; gst_sample_unref(sample); return GST_FLOW_OK;
+            }
             if (b.original_callbacks++ == 0 && record) {
                 b.first_callback_wire_start = record->packet_wire_start;
                 b.first_callback_anchor_sequence = record->anchor_sequence;
@@ -605,14 +644,29 @@ private:
                 b.last_original_status = static_cast<unsigned>(rejected.status);
                 remember_original_failure(b, rejected.status, record, now);
                 ++b.original_invalid;
+                if (b.owner->options_.recover_desktop_ipc) b.owner->fatal_.store(true);
                 gst_sample_unref(sample); return GST_FLOW_OK;
             }
+            const bool expiry_only=b.owner->options_.recover_desktop_ipc && b.validator->timing_only_stale(
+                *record,ssrc,timestamp,payload_frames,static_cast<avsync::Nanoseconds>(now));
             const auto validation = b.validator->observe(*record, ssrc, timestamp, payload_frames,
                 static_cast<std::int64_t>(now));
             b.last_original_status = static_cast<unsigned>(validation.status);
             if (!validation.accepted) {
                 remember_original_failure(b, validation.status, record, now);
-                ++b.original_invalid; gst_sample_unref(sample); return GST_FLOW_OK;
+                bool retired=b.owner->options_.recover_desktop_ipc && b.owner->retired_record(*record);
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+                if (!retired && expiry_only && b.owner->correction_)
+                    retired=b.owner->correction_->retire_stale_transport(record->epoch);
+#else
+                (void)expiry_only;
+#endif
+                if (retired) ++b.original_retired;
+                else {
+                    ++b.original_invalid;
+                    if (b.owner->options_.recover_desktop_ipc) b.owner->fatal_.store(true);
+                }
+                gst_sample_unref(sample); return GST_FLOW_OK;
             }
             bool admitted{};
             try {
@@ -622,7 +676,11 @@ private:
                 b.owner->fatal_.store(true);
                 gst_sample_unref(sample); return GST_FLOW_ERROR;
             }
-            if (!admitted) { ++b.original_retired; gst_sample_unref(sample); return GST_FLOW_OK; }
+            if (!admitted) {
+                ++b.original_retired;
+                if (b.owner->options_.recover_desktop_ipc && !b.owner->retired_record(*record)) b.owner->fatal_.store(true);
+                gst_sample_unref(sample); return GST_FLOW_OK;
+            }
             ++b.original_packets;
             b.original_frames += payload_frames;
             if (validation.repeated) ++b.original_repeats;
@@ -631,7 +689,14 @@ private:
                 b.last_original_ppm = validation.estimate->source_rate_error_ppm;
                 b.last_original_estimate_within_limit = validation.estimate->within_correction_limit;
                 if (b.last_original_estimate_within_limit) ++b.original_usable_measurements;
-                else ++b.original_out_of_range;
+                else {
+                    ++b.original_out_of_range;
+                    // Latch before queuing: a later retirement request must not
+                    // overtake and discard a still-pending terminal rate fault.
+                    if (b.owner->options_.recover_desktop_ipc) {
+                        b.owner->fatal_.store(true); gst_sample_unref(sample); return GST_FLOW_OK;
+                    }
+                }
             }
             if (!b.first_original) b.first_original = record;
             b.last_original = record;
@@ -694,6 +759,18 @@ private:
         gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
+    bool retired_record(const avsync::wire::AudioRecord& record) noexcept {
+        try {
+            std::lock_guard lock(admission_mutex_);
+            const auto active=admission_->active_epoch();
+            if (active && record.epoch.session==active->session && record.epoch.generation<active->generation) return true;
+#ifdef AVSYNC_HAS_AUDIO_CORRECTION
+            return options_.recover_desktop_ipc && correction_ && correction_->retired_generation(record.epoch);
+#else
+            return false;
+#endif
+        } catch (...) { fatal_.store(true); return false; }
+    }
     Options options_;
     Inet peer_;
     GstElement *pipeline_{}, *rtpbin_{};
@@ -717,6 +794,8 @@ private:
     std::optional<unsigned> first_jitter_drop_seqnum_, first_jitter_drop_reason_;
 #ifdef AVSYNC_HAS_AUDIO_HANDOFF
     std::unique_ptr<avsync::CorrectedAudioHandoff> handoff_;
+    std::uint64_t retired_ipc_frames_{},retired_ipc_busy_{},ipc_recreations_{};
+    std::size_t retired_ipc_peak_{};
 #endif
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
     std::unique_ptr<avsync::AudioCorrectionDiagnostic> correction_;
@@ -732,6 +811,7 @@ int main(int argc,char** argv) {
             if(arg=="--expect-media") { options.expect_media=true; continue; }
             if(arg=="--expect-anchors") { options.expect_anchors=true; continue; }
             if(arg=="--correct-desktop") { options.correct_desktop=true; options.expect_anchors=true; continue; }
+            if(arg=="--recover-desktop-ipc") { options.recover_desktop_ipc=true; continue; }
             require(i+1<argc,"Missing option value");
             const auto* value=argv[++i];
             if(arg=="--bind") options.bind=value;

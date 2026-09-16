@@ -31,23 +31,29 @@ bool AudioCorrectionWorker::check_health(Nanoseconds now, bool healthy) noexcept
         fail(CorrectionFault::health); return false;
     }
     last_now_ = now;
+    const auto stale = [this](CorrectionStaleReason reason, std::optional<Nanoseconds> age) {
+        diagnostics_.stale_reason = reason; diagnostics_.stale_age_ns = age;
+        fail(CorrectionFault::stale); return false;
+    };
     // A drained public queue does not mean the backend has no private history.
     // An explicit no-progress watchdog forbids resuming that history after a stall.
     if (last_progress_) {
         const auto age = checked_sub(now, *last_progress_);
-        if (!age || *age > queue_lifetime_ns) { fail(CorrectionFault::stale); return false; }
+        if (!age || *age > queue_lifetime_ns) return stale(CorrectionStaleReason::no_progress, age);
     }
     if (const auto& record = validator_.latest_record()) {
         const auto age = checked_sub(now, record->capture_ns);
         if (!age || *age > 250'000'000 || *age < -100'000'000) {
-            fail(CorrectionFault::stale); return false;
+            return stale(CorrectionStaleReason::anchor_age, age);
         }
     }
-    for (const auto arrival : {input_size_ ? input_arrivals_[input_head_] : now,
-                               output_size_ ? output_arrivals_[output_head_] : now}) {
+    const std::array arrivals{input_size_ ? input_arrivals_[input_head_] : now,
+                              output_size_ ? output_arrivals_[output_head_] : now};
+    for (std::size_t i = 0; i < arrivals.size(); ++i) {
+        const auto arrival = arrivals[i];
         const auto age = checked_sub(now, arrival);
         if (!age || *age < 0 || *age > queue_lifetime_ns) {
-            fail(CorrectionFault::stale); return false;
+            return stale(i == 0 ? CorrectionStaleReason::input_queue : CorrectionStaleReason::output_queue, age);
         }
     }
     return true;

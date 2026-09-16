@@ -197,7 +197,14 @@ bool ClockHealthMonitor::observe(GstMessage* message) noexcept
         !gst_structure_get_boolean(data, "synchronised", &algorithm_synced)) return false;
     const auto receive_ns = signed_time(receive), rtt_ns = signed_time(rtt);
     if (!receive_ns || !rtt_ns || (last_ && *receive_ns <= last_->local_receive_ns)) return false;
-    last_ = ClockStatistics{*receive_ns, *rtt_ns, discontinuity, algorithm_synced != FALSE};
+    if (last_) {
+        last_gap_ns_ = checked_sub(*receive_ns, last_->local_receive_ns);
+        if (last_gap_ns_) maximum_gap_ns_ = std::max(maximum_gap_ns_, *last_gap_ns_);
+    }
+    last_ = ClockStatistics{*receive_ns, *rtt_ns, discontinuity, algorithm_synced != FALSE, {}, {}};
+    guint64 value = 0;
+    if (gst_structure_get_uint64(data, "rtt-average", &value)) last_->rtt_average_ns = signed_time(value);
+    if (gst_structure_get_uint64(data, "timeout", &value)) last_->scheduled_timeout_ns = signed_time(value);
     if (observations_ != std::numeric_limits<std::uint64_t>::max()) ++observations_;
     return true;
 }
@@ -215,6 +222,13 @@ ClockHealth ClockHealthMonitor::health(bool synchronized, const std::optional<Ca
     ClockHealth result;
     result.synchronized = synchronized;
     result.observations = observations_;
+    result.last_observation_gap_ns = last_gap_ns_;
+    result.maximum_observation_gap_ns = maximum_gap_ns_;
+    if (last_) {
+        result.observation_received_ns = last_->local_receive_ns;
+        result.rtt_average_ns = last_->rtt_average_ns;
+        result.scheduled_timeout_ns = last_->scheduled_timeout_ns;
+    }
     if (!synchronized || !calibration || !valid_calibration(*calibration)) {
         result.reason = "clock is not synchronized or calibration is invalid";
         return result;
@@ -247,5 +261,6 @@ void ClockHealthMonitor::reset() noexcept
 {
     last_.reset();
     observations_ = 0;
+    last_gap_ns_.reset(); maximum_gap_ns_ = 0;
 }
 } // namespace avsync::net

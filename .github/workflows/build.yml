@@ -32,6 +32,8 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure --timeout 30
       - name: Measurement helper tests
         run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Reference scheduling tests (no browser or playback)
+        run: node --test tests/reference_timeline.test.mjs
   sanitizers:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

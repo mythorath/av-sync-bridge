@@ -125,6 +125,18 @@ unexpected discontinuities and incompatible device-frame progression. A WASAPI
 timestamp-error packet cannot be rescued by stamping it with the arrival time.
 This helper does not perform reconnects, own a session token, or implement ASRC.
 
+For clock-loss diagnosis, remember that GStreamer's statistics bus is not a
+packet-receipt heartbeat. In the pinned 1.28.6 implementation, the configured
+RTT limit, twice-median filter and twice-average filter run before statistics
+are posted. Rejected observations schedule a separate fixed 250 ms retry;
+lowering the internal adaptive timeout does not alter that rejection path.
+An absence of accepted statistics therefore does not alone prove the provider
+or network stopped. Preserve a private, finite `GST_DEBUG=netclock:6` trace to
+distinguish missing replies from the exact rejection branch before changing
+polling or safety limits. Debug traces can include peer addresses and belong
+outside the public repository. This diagnostic does not relax health gates.
+[Pinned upstream filtering and statistics](https://github.com/GStreamer/gstreamer/blob/1.28.6/subprojects/gstreamer/libs/gst/net/gstnetclientclock.c#L387-L598).
+
 ## Nominal RTP time and original capture anchors
 
 The wire format is RTP payload type 96, `L24`, 48 kHz, two channels. After nominal

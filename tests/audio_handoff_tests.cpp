@@ -92,6 +92,25 @@ int main() {
                 check(reader.read_next_due_audio(0,t+2'000'000'000,out,info)==R::ok && out[0]==0 && out[1]>0);
             }
         }
+        // A controller can replace a revoked mapping at the SAME trusted path.
+        // Old readers never see the new generation without explicit reconnect,
+        // and no future-dated PCM from the retired mapping is replayed.
+        auto generation_one=std::make_unique<avsync::CorrectedAudioHandoff>(temp.path,100'000'000);
+        check(reader.reconnect()); const auto old_generation=reader.generation();
+        const auto t=avsync::ipc::monotonic_ns();
+        pcm.fill(.25F); block={{5,1},0,t,960};
+        check(generation_one->consume(block,pcm,t+20'000'000));
+        generation_one->revoke();
+        check(reader.read_next_due_audio(0,t+100'000'000,out,info)==R::disconnected);
+        auto generation_two=std::make_unique<avsync::CorrectedAudioHandoff>(temp.path,100'000'000);
+        pcm.fill(-.5F); block={{5,2},0,t+300'000'000,960};
+        check(generation_two->consume(block,pcm,t+320'000'000));
+        check(reader.read_next_due_audio(0,t+400'000'000,out,info)==R::disconnected);
+        check(reader.reconnect() && reader.generation()!=old_generation);
+        check(reader.read_next_due_audio(0,t+399'999'999,out,info)==R::empty);
+        check(reader.read_next_due_audio(0,t+400'000'000,out,info)==R::ok);
+        check(info.sequence==1 && info.capture_ns==t+300'000'000 && info.presentation_ns==t+400'000'000);
+        for (const auto sample:out) check(sample==-.5F);
         std::cout<<"PASS desktop IPC: exact PCM/timestamps, due scheduling, split quanta, fault/epoch revocation\n";
     } catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

@@ -49,6 +49,30 @@ timestamping. Fixed path calibration and repeated nonuniform-marker measurements
 remain necessary; buffering cannot recover unknown variable delay before the
 reported timestamp.
 
+### Read-only UVC timing-header observation
+
+On the physical test device (Elgato 4K X, kernel 7.0.0-31-generic), two driver
+statistics snapshots advanced from 783 to 3,611 frames. All counted frames had
+initial PTS and SCR headers, but the reported device SCR.SOF range remained
+0..0. Hardware timestamps were disabled, with the monotonic software clock and
+automatic quirks selection. No capture settings or module parameters were
+changed for this read-only observation.
+
+Header presence is stronger evidence than guessing that timing data is absent,
+but it does not establish timestamp correctness. The upstream v7.0 clock
+conversion requires useful PTS/STC/SOF observations and a sufficient SOF span;
+constant device SOF cannot normally supply it. Its `INVALID_DEVICE_SOF` quirk
+substitutes host SOF for some devices, but suitability here and distribution
+patch differences are untested. Do not enable hardware timestamps or a global
+quirk blindly. See the [versioned driver implementation](https://github.com/torvalds/linux/blob/v7.0/drivers/media/usb/uvc/uvc_video.c).
+
+A bounded next diagnostic can pair the existing UVC metadata node with video
+by sequence while leaving timestamp policy unchanged, then inspect raw PTS/STC
+progression, wrap behavior and host-SOF correlation offline. A metadata node's
+existence alone does not establish useful data, and a reconstructed device
+clock would still not prove correspondence to HDMI content generation. See the
+[UVC metadata contract](https://docs.kernel.org/userspace-api/media/v4l/metafmt-uvc.html).
+
 ## Chronology without rebasing
 
 `VideoTimingTracker` is scoped to one progressive capture generation. The driver

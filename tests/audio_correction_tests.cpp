@@ -169,6 +169,19 @@ void backpressure_and_ownership() {
     // the no-progress deadline (the latest anchor is less than 250ms old).
     CHECK(w->dispatch(f.now+201'000'000,true)==0);
     CHECK(w->fault()==avsync::CorrectionFault::stale);
+    CHECK(w->diagnostics().stale_reason==avsync::CorrectionStaleReason::no_progress);
+    CHECK(w->diagnostics().stale_age_ns==201'000'000);
+    CHECK(w->dispatch(f.now+250'000'000,true)==0);
+    CHECK(w->diagnostics().stale_age_ns==201'000'000); // Preserve the first gate.
+    CHECK(w->reset({3,6}));
+    CHECK(w->diagnostics().stale_reason==avsync::CorrectionStaleReason::none);
+    CHECK(!w->diagnostics().stale_age_ns);
+    f={}; f.token={3,6};
+    CHECK(f.push(*w)==avsync::CorrectionPush::priming_discard);
+    CHECK(w->dispatch(1'250'000'001,true)==0);
+    CHECK(w->fault()==avsync::CorrectionFault::stale);
+    CHECK(w->diagnostics().stale_reason==avsync::CorrectionStaleReason::anchor_age);
+    CHECK(w->diagnostics().stale_age_ns==250'000'001);
 }
 void phase_faults() {
     auto w=std::make_unique<avsync::AudioCorrectionWorker>(epoch,clock_epoch); Feed f;

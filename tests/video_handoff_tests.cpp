@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "avsync/video_handoff.hpp"
+#include "avsync/video_publication.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -195,6 +196,110 @@ void test_borrow_blocks_producer_reuse()
     CHECK(handoff.release());
 }
 
+void test_publication_retry_preserves_owned_frame()
+{
+    using R = avsync::VideoPublicationResult;
+    Handoff handoff(2, 2, 2);
+    std::vector<std::byte> source(6, std::byte{0x19});
+    constexpr std::int64_t capture = 1'000'000'000;
+    constexpr std::int64_t delay = 2'000'000'000;
+    CHECK(handoff.try_copy(source, capture) == S::ok);
+    const auto* first = handoff.peek();
+    const auto* storage = first->pixels.data();
+    unsigned attempts = 0;
+    const auto publish = [&](std::span<const std::uint8_t> pixels,
+                             std::int64_t captured, std::int64_t presentation) {
+        ++attempts;
+        CHECK(pixels.data() == storage && pixels.size() == 6);
+        CHECK(captured == capture && presentation == capture + delay);
+        for (const auto value : pixels) CHECK(value == 0x19);
+        return attempts <= 3 ? R::busy : R::published;
+    };
+    CHECK(avsync::try_publish_oldest_video(handoff, capture, delay, publish) == R::busy);
+    // The callback's source can be overwritten; the queued capture is owned.
+    for (auto& value : source) value = std::byte{0x29};
+    CHECK(handoff.try_copy(source, capture + 16'666'667) == S::ok);
+    for (unsigned attempt = 1; attempt <= 2; ++attempt) {
+        CHECK(avsync::try_publish_oldest_video(handoff, capture + attempt * 1'000'000, delay, publish) == R::busy);
+        CHECK(handoff.peek() == first && first->pixels.data() == storage);
+        CHECK(handoff.try_copy(source, capture + 33'333'334) == S::full);
+    }
+    CHECK(attempts == 3); // One bounded attempt, not a spin loop, per worker call.
+    CHECK(avsync::try_publish_oldest_video(handoff, capture + 3'000'000, delay, publish) == R::published);
+    CHECK(attempts == 4 && handoff.peek() != first);
+    CHECK(handoff.peek()->capture_ns == capture + 16'666'667);
+    CHECK(handoff.peek()->pixels == std::vector<std::uint8_t>(6, 0x29));
+    CHECK(handoff.try_copy(source, capture + 33'333'334) == S::ok);
+    CHECK(handoff.release() && handoff.release());
+    CHECK(avsync::try_publish_oldest_video(handoff, capture + 4'000'000, delay, publish) == R::empty);
+    CHECK(attempts == 4);
+}
+
+void test_publication_deadline_and_failures()
+{
+    using R = avsync::VideoPublicationResult;
+    Handoff handoff(2, 2, 2);
+    std::vector<std::byte> source(6, std::byte{0x39});
+    constexpr std::int64_t capture = 1'000'000'000;
+    constexpr std::int64_t delay = 2'000'000'000;
+    unsigned attempts = 0;
+    auto write_result = R::busy;
+    const auto publish = [&](std::span<const std::uint8_t>, std::int64_t captured, std::int64_t presentation) {
+        ++attempts;
+        CHECK(captured == capture && presentation == capture + delay);
+        return write_result;
+    };
+    CHECK(handoff.try_copy(source, capture) == S::ok);
+    const auto* first = handoff.peek();
+    CHECK(avsync::try_publish_oldest_video(handoff, capture, delay, publish) == R::busy);
+    CHECK(avsync::try_publish_oldest_video(handoff, capture + 200'000'000, delay, publish) == R::busy);
+    CHECK(handoff.peek() == first && attempts == 2);
+    // Deadline is measured from capture, not refreshed by the previous retry.
+    CHECK(avsync::try_publish_oldest_video(handoff, capture + 200'000'001, delay, publish) == R::stale);
+    CHECK(handoff.peek() == nullptr && attempts == 2);
+    CHECK(handoff.try_copy(source, capture) == S::ok);
+    write_result = R::published;
+    CHECK(avsync::try_publish_oldest_video(handoff, capture + 200'000'000, delay, publish) == R::published);
+    CHECK(handoff.peek() == nullptr && attempts == 3);
+    CHECK(handoff.try_copy(source, capture) == S::ok);
+    first = handoff.peek();
+    write_result = R::failed;
+    CHECK(avsync::try_publish_oldest_video(handoff, capture, delay, publish) == R::failed);
+    CHECK(handoff.peek() == first && attempts == 4);
+    write_result = R::empty; // Unexpected callback result cannot release a frame.
+    CHECK(avsync::try_publish_oldest_video(handoff, capture, delay, publish) == R::failed);
+    CHECK(handoff.peek() == first && attempts == 5);
+    CHECK(avsync::try_publish_oldest_video(handoff, -1, delay, publish) == R::invalid);
+    CHECK(avsync::try_publish_oldest_video(handoff, capture, -1, publish) == R::invalid);
+    CHECK(handoff.peek() == first && attempts == 5);
+    CHECK(handoff.release());
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    CHECK(handoff.try_copy(source, maximum) == S::ok);
+    CHECK(avsync::try_publish_oldest_video(handoff, maximum, 1, publish) == R::invalid);
+    CHECK(handoff.peek()->capture_ns == maximum && attempts == 5);
+    CHECK(handoff.release());
+}
+
+void test_publication_future_anchor_bound()
+{
+    using R = avsync::VideoPublicationResult;
+    Handoff handoff(2, 2, 2);
+    const std::vector<std::byte> source(6, std::byte{0x49});
+    constexpr std::int64_t capture = 1'000'000'000;
+    CHECK(handoff.try_copy(source, capture) == S::ok);
+    unsigned attempts = 0;
+    const auto publish = [&](std::span<const std::uint8_t>, std::int64_t captured, std::int64_t presentation) {
+        ++attempts;
+        CHECK(captured == capture && presentation == capture);
+        return R::busy;
+    };
+    // Same conservative future tolerance as the physical capture acceptance.
+    CHECK(avsync::try_publish_oldest_video(handoff, capture - 1'000'000, 0, publish) == R::busy);
+    CHECK(avsync::try_publish_oldest_video(handoff, capture - 1'000'001, 0, publish) == R::invalid);
+    CHECK(attempts == 1 && handoff.peek()->capture_ns == capture);
+    CHECK(handoff.release());
+}
+
 void test_two_thread_publication()
 {
     Handoff handoff(8, 4, 12);
@@ -275,6 +380,9 @@ int main()
         test_fifo_full_reuse_and_invalid();
         test_trailing_padding_and_all_bytes();
         test_borrow_blocks_producer_reuse();
+        test_publication_retry_preserves_owned_frame();
+        test_publication_deadline_and_failures();
+        test_publication_future_anchor_bound();
         test_two_thread_publication();
         std::cout << "video-handoff tests: " << checks
                   << " checks and 50000 threaded frames passed; no hardware or media\n";

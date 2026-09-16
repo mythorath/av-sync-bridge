@@ -1,9 +1,10 @@
-# Experimental OBS synthetic adapter
+# Experimental native OBS adapter
 
 This module is a feasibility prototype, not a replacement for a working capture
 or audio bridge. It does not access cameras, microphones, sound devices, network
 ports, OBS collections, existing source names, or startup configuration. Its only
-input is the local synthetic producer's IPC mapping.
+input is an explicit local IPC mapping. Synthetic producers remain the default;
+separate capture tools can provide physical media in isolated maintenance tests.
 
 ## Build and isolate
 
@@ -18,7 +19,8 @@ cmake --build build --target avsync-obs
 The module is `build/plugins/obs/avsync-obs.so`. Installing it in a normal OBS
 profile is deliberately a separate maintenance operation. Prefer an isolated
 libOBS smoke harness or disposable OBS configuration first. Do not open the
-physical capture device in these tests. The shader is embedded; no module data
+physical capture device in synthetic tests. Physical producers require a separate
+explicit maintenance step. The shader is embedded; no module data
 directory is required.
 
 Source type IDs and settings:
@@ -29,7 +31,9 @@ Source type IDs and settings:
 | `avsync_prototype_desktop` | Independent stereo PCM audio input |
 | `avsync_prototype_microphone` | Independent mono PCM audio input |
 
-Each has an `ipc_path` setting pointing to the same producer mapping. The
+Each has an `ipc_path` setting, normally pointing to the same synthetic mapping.
+Separate physical producers may use different mappings, but must preserve a
+common monotonic presentation timeline; IPC does not infer content offsets. The
 default is `$XDG_RUNTIME_DIR/av-sync-bridge.ipc`, matching the producer. If the
 runtime variable is absent or empty, set `ipc_path` explicitly; there is no shared
 `/tmp` fallback. These types do not create sources or rename existing sources by
@@ -125,7 +129,8 @@ Keep these separate when reporting progress:
    timeline across staggered source creation, hide/show, stalls and reconnects.
 4. **Audio controls:** independent mute, volume and routing work, including a
    rapid-toggle test with the intended microphone filters.
-5. **Physical end-to-end:** not implemented or proven by any of the above.
+5. **Physical end-to-end:** requires its own [combined test evidence](physical-combined-validation.md);
+   not proven by any of the above.
 
 Do not infer synchronized encoded output from timestamps at the IPC boundary.
 Compare encoded-frame event times with encoded PCM event times, and report
@@ -157,6 +162,29 @@ about 0.75 GB/s of payload, with additional memory read/write and GPU-upload
 traffic. These are calculations, not measured performance.
 
 ## Relevant upstream contracts
+
+### Isolated boundary traces
+
+The finite native recorder saves `.source0.csv` and `.source1.csv` alongside
+its existing `.mix0.csv` and `.mix1.csv`. Source rows contain original
+post-filter timestamps, approximately 1 ms stereo-downmixed RMS windows, mute
+status and callback time. OBS 32.2.2 supplies the original timestamp to this
+callback even though its mixer queues a separately adjusted copy. Therefore
+source continuity alone does not establish mixer placement; compare matching
+content on both timelines. Muted rows retain their activity measurement and
+are explicitly labeled, not silently converted into measured silence.
+
+The `.video.csv` trace records raw rendered-frame timestamps and cyan-marker
+scores from a sparse 80x45 grid of the recorder's 640x360 NV12 output. Its
+BT.709 limited-range conversion uses the physical helper's cyan predicates;
+sampling is not identical to that helper's area scaling. This observes rendered
+content before encoding, not capture-card latency or a physical display.
+
+These test callbacks write only preallocated, bounded records; they perform no
+file I/O or additional locking. Detachment fences in-flight writers before
+exclusive-create CSV output. Invalid input or diagnostic-capacity exhaustion
+fails the diagnostic. Keep these private activity/timestamp traces out of the
+public repository. They are not an always-on production telemetry service.
 
 - [OBS source implementation, 32.2.2](https://github.com/obsproject/obs-studio/blob/32.2.2/libobs/obs-source.c)
 - [OBS public API, 32.2.2](https://github.com/obsproject/obs-studio/blob/32.2.2/libobs/obs.h)

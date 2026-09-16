@@ -295,6 +295,12 @@ void original_clock_not_nominal()
         if (actual_rate == 192'192) {
             CHECK(measured && !measured->within_correction_limit);
             CHECK(!validator.current_estimate(record.capture_ns)); // Diagnostics are not correction commands.
+            auto repeated_bad_rate=record; repeated_bad_rate.packet_wire_start+=160;
+            auto probe=validator;
+            const auto repeat=accept(probe,repeated_bad_rate,160,record.capture_ns);
+            CHECK(repeat.accepted && !repeat.estimate);
+            CHECK(!validator.timing_only_stale(repeated_bad_rate,99,timestamp(repeated_bad_rate),160,
+                record.capture_ns+250'000'001));
         } else {
             CHECK(measured);
             const double expected_ppm = (static_cast<double>(actual_rate) / 192'000 - 1.0) * 1'000'000;
@@ -349,6 +355,31 @@ void admission()
     try { AudioStreamAdmission invalid(0); } catch (const std::invalid_argument&) { thrown = true; }
     CHECK(thrown);
 }
+void stale_retirement_classification() {
+    auto record=origin(); AudioReceiverValidator validator(record.clock_epoch);
+    CHECK(accept(validator,record).accepted); record.packet_wire_start=180;
+    const auto late=record.capture_ns+250'000'001;
+    CHECK(validator.timing_only_stale(record,99,timestamp(record),180,late));
+    CHECK(!validator.faulted() && validator.next_wire_frame()==180);
+    CHECK(!validator.timing_only_stale(record,99,timestamp(record),180,late-1));
+    for (unsigned bad=0;bad<8;++bad) {
+        auto invalid=record;
+        if (bad==0) ++invalid.epoch.session;
+        if (bad==1) ++invalid.epoch.generation;
+        if (bad==2) ++invalid.clock_epoch;
+        if (bad==3) ++invalid.qpc_100ns; // Conflicting repetition, despite plausible stale age.
+        if (bad==4) --invalid.capture_ns;
+        if (bad==5) ++invalid.anchor_sequence;
+        if (bad==6) ++invalid.packet_wire_start;
+        if (bad==7) ++invalid.device_position;
+        CHECK(!validator.timing_only_stale(invalid,99,timestamp(invalid),180,late));
+    }
+    CHECK(!validator.timing_only_stale(record,100,timestamp(record),180,late));
+    CHECK(!validator.timing_only_stale(record,99,timestamp(record)+1,180,late));
+    CHECK(!validator.timing_only_stale(record,99,timestamp(record),0,late));
+    CHECK(accept(validator,record,180,late).status==Status::stale);
+    CHECK(!validator.timing_only_stale(record,99,timestamp(record),180,late));
+}
 } // namespace
 
 int main()
@@ -360,6 +391,7 @@ int main()
         freshness();
         original_clock_not_nominal();
         admission();
+        stale_retirement_classification();
         std::cout << "audio wire checks passed: " << checks << '\n';
         return 0;
     } catch (const std::exception& error) {

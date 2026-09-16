@@ -1,0 +1,322 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>A/V Bridge — instrumented reference</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #101720; color: #edf3f8; }
+    body { margin: 0; }
+    main { max-width: 850px; margin: 40px auto; padding: 24px; }
+    h1 { font-size: 30px; margin-bottom: 12px; }
+    p { line-height: 1.6; }
+    button { font: inherit; border: 1px solid #648091; border-radius: 6px; padding: 12px 18px; margin: 6px 10px 6px 0; background: #1e3543; color: white; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    #status { min-height: 2em; padding: 16px; border-left: 4px solid #00bbc8; background: #172833; }
+    #stage { display: none; position: relative; background: black; }
+    #stage:fullscreen { display: block; width: 100vw; height: 100vh; }
+    canvas { width: 100%; height: 100%; display: block; }
+    #stopFull { position: absolute; right: 12px; top: 8px; opacity: .8; }
+    code { color: #b5e9ef; }
+    small { color: #bbcbd2; }
+    details { margin-top: 18px; }
+    summary { cursor: pointer; padding: 10px 0; }
+    pre { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: #080f15; padding: 16px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Instrumented A/V reference</h1>
+  <p>One 68-second pass: six widely spaced cyan flashes and quiet, distinct tones.
+     This checks the test source’s scheduling, <strong>not physical synchronization</strong>.</p>
+  <p>Move this browser to the display feeding your capture device. Keep the existing Windows
+     sound output unchanged, pause other audio, and leave this page visible. Start requests
+     fullscreen. Escape or Stop cancels the run; restarting always requires another click.</p>
+  <p><small>Notice: six 200 ms bright flashes and tones. Do not start if flashing light is unsafe for you.
+     The page neither records a microphone nor uploads or stores anything. Reports are downloaded only on request.</small></p>
+  <button id="start" disabled>Start one pass</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="download" disabled>Download timing report</button>
+  <p id="status" role="status">Loading local timing module. If this remains visible, use tools/serve-reference.py as described in docs/browser-reference.md; file URLs or an incorrect module MIME type can prevent loading.</p>
+  <details id="reportDetails" hidden>
+    <summary>View last timing report — local only</summary>
+    <pre id="reportSummary"></pre>
+    <details id="fullReportDetails">
+      <summary>Include bounded per-frame log</summary>
+      <pre id="reportJson"></pre>
+    </details>
+  </details>
+  <p><small>Audio markers: 660, 880, 1100, 1320, 1540 and 1760 Hz. Scheduled onsets:
+     5.00, 11.35, 19.10, 29.70, 43.15 and 59.80 seconds. No repeating cycle.</small></p>
+</main>
+<section id="stage" aria-label="Reference test fullscreen">
+  <canvas id="canvas"></canvas>
+  <button id="stopFull">Stop test</button>
+</section>
+<script type="module">
+import { ReferenceTimeline, FullscreenDimensionsGate, sameDimensions,
+  DURATION_SECONDS, fillReferenceChannel, checkScheduledStart, checkTimestampQuery,
+  checkTimestampPair, POLICY, SCHEDULING_POLICY } from './reference-timeline.mjs';
+
+const ui = Object.fromEntries(['start', 'stop', 'download', 'status', 'stage', 'canvas', 'stopFull',
+  'reportDetails', 'reportSummary', 'fullReportDetails', 'reportJson']
+  .map(id => [id, document.getElementById(id)]));
+const drawing = ui.canvas.getContext('2d', { alpha: false });
+let generation = 0;
+let active = null;
+let savedReport = null;
+let running = false;
+
+function dimensions() {
+  return { width: innerWidth, height: innerHeight, dpr: devicePixelRatio,
+    screenWidth: screen.width, screenHeight: screen.height };
+}
+function paint(eventId) {
+  drawing.fillStyle = eventId === null ? '#000000' : '#00ffff';
+  drawing.fillRect(0, 0, ui.canvas.width, ui.canvas.height);
+  drawing.fillStyle = eventId === null ? '#b9c7ce' : '#001a1c';
+  drawing.font = `${Math.max(20, Math.round(ui.canvas.height / 32))}px monospace`;
+  drawing.textAlign = 'center';
+  drawing.fillText(eventId === null ? 'A/V REFERENCE — SINGLE PASS' : `MARKER ${eventId} / 6`,
+    ui.canvas.width / 2, ui.canvas.height * 0.90);
+}
+function reportFor(run) {
+  const report = run.timeline ? run.timeline.report() : {
+    schema: 'avsync.browser-reference.v1', runId: run.id, status: run.status,
+    reason: run.reason, sourcePolicyVersion: POLICY.version, policy: POLICY,
+    physicalSyncVerified: false, events: [], frames: [],
+  };
+  return { ...report, environment: run.environment, startAttempt: run.number,
+    fullscreenSettling: run.dimensionsGate?.result() ?? null,
+    audioSchedule: run.audioSchedule,
+    lastTimestampQuery: run.lastTimestampQuery,
+    lastTimestampPair: run.lastTimestampPair,
+    latencyObservations: run.latencies, sourceScheduledOnce: run.sourceScheduled,
+    limitations: [
+      'rAF/draw timestamps are not compositor or physical display presentation timestamps.',
+      'Raw rAF and performance.now() values can have different privacy rounding; post-query time drives scheduling.',
+      'Audio output timestamps are browser/device estimates, not observed acoustic output.',
+      'Source policy v2 bounds pair proximity to 50 ms in either direction; this is not an accuracy guarantee.',
+      'WASAPI loopback and physical sink output need not have identical timing.',
+      'No bridge, OBS, encoder, HDMI, monitor or AVR latency is removed by this report.',
+      'Completed means the scheduling checks passed, not an A/V calibration verdict.',
+    ],
+  };
+}
+async function finish(run, reason, invalid = true) {
+  if (active !== run || run.finishing) return;
+  run.finishing = true;
+  clearTimeout(run.deadline);
+  if (run.raf !== null) cancelAnimationFrame(run.raf);
+  if (run.timeline?.status === 'running') {
+    if (invalid) run.timeline.invalidate(reason);
+    else run.timeline.stop();
+  }
+  run.status = invalid ? 'invalid' : 'stopped';
+  run.reason = reason;
+  if (run.source) { try { run.source.stop(); } catch {} run.source.disconnect(); }
+  if (run.context && run.context.state !== 'closed') {
+    try { await run.context.close(); } catch { run.closeFailed = true; }
+  }
+  paint(null);
+  savedReport = reportFor(run);
+  if (run.closeFailed) savedReport.audioCloseFailed = true;
+  if (document.fullscreenElement === ui.stage) {
+    try { await document.exitFullscreen(); } catch {}
+  }
+  if (active !== run) return;
+  active = null;
+  running = false;
+  ui.start.disabled = false;
+  ui.stop.disabled = true;
+  ui.download.disabled = false;
+  const { frames, ...summary } = savedReport;
+  ui.reportSummary.textContent = JSON.stringify({ ...summary,
+    frameLog: `${frames.length} records; expand the per-frame log or download the report.` }, null, 2);
+  ui.reportDetails.hidden = false;
+  ui.status.textContent = savedReport.status === 'completed'
+    ? 'Source scheduling completed under policy v2: all six markers submitted. Physical A/V sync is still unverified. View or download the report.'
+    : savedReport.status === 'stopped'
+      ? 'Test stopped. This is not a completed calibration pass. View or download the report.'
+      : `Stopped by timing check: ${savedReport.reason || 'invalid_run'}. Fullscreen was closed deliberately; this is not a valid calibration pass. View or download the report.`;
+}
+function latencySnapshot(run, now) {
+  // Observational only. Never add these to getOutputTimestamp()'s mapping.
+  if (run.latencies.length >= 80 || (run.lastLatencyMs !== null && now - run.lastLatencyMs < 1000)) return;
+  const context = run.context;
+  run.latencies.push({ performanceMs: now, baseLatency: context.baseLatency,
+    outputLatency: typeof context.outputLatency === 'number' ? context.outputLatency : null });
+  run.lastLatencyMs = now;
+}
+function frame(run, rafMs) {
+  if (active !== run || run.finishing) return;
+  // Use this same API for scheduling and draw readings. The rAF argument may
+  // have a finer privacy-reduced resolution and appear ahead of this reading.
+  const callbackMs = performance.now();
+  try {
+    const queryStartMs = performance.now();
+    const stamp = run.context.getOutputTimestamp();
+    const queryEndMs = performance.now();
+    run.lastTimestampQuery = checkTimestampQuery({ callbackEntryMs: callbackMs, queryStartMs, queryEndMs });
+    run.lastTimestampPair = checkTimestampPair(queryEndMs, stamp);
+    latencySnapshot(run, queryEndMs);
+    if (!run.timeline) {
+      if (!run.lastTimestampQuery.valid) { void finish(run, run.lastTimestampQuery.reason); return; }
+      if (run.context.state !== 'running' || document.visibilityState !== 'visible' ||
+          document.fullscreenElement !== ui.stage) {
+        void finish(run, 'arming_environment_changed');
+        return;
+      }
+      if (queryEndMs - run.armMs > 3000) { void finish(run, 'audio_clock_warmup_timeout'); return; }
+      const settled = run.dimensionsGate.observe(queryEndMs, dimensions());
+      if (settled.status === 'invalid') { void finish(run, settled.reason); return; }
+      if (run.lastTimestampPair.valid) {
+        // Require multiple advancing device-clock pairs before arming. No timestamp is synthesized.
+        if (run.warmStamp && stamp.contextTime > run.warmStamp.contextTime &&
+            stamp.performanceTime > run.warmStamp.performanceTime) ++run.warmAdvances;
+        run.warmStamp = stamp;
+        if (run.warmAdvances >= 5 && settled.status === 'ready') {
+          // Snapshot only after fullscreen's final dimensions have settled.
+          run.environment.dimensions = { ...settled.dimensions };
+          ui.canvas.width = Math.round(settled.dimensions.width * settled.dimensions.dpr);
+          ui.canvas.height = Math.round(settled.dimensions.height * settled.dimensions.dpr);
+          paint(null);
+          run.source = run.context.createBufferSource();
+          run.source.buffer = run.buffer;
+          run.source.connect(run.context.destination);
+          // Build/connect first; then bracket the one scheduling call. A past
+          // start() time plays immediately, so never silently bless that case.
+          const plannedPerformanceMs = performance.now();
+          const plannedContextTime = run.context.currentTime;
+          const startContextTime = plannedContextTime + SCHEDULING_POLICY.initialLeadSeconds;
+          run.audioSchedule = { plannedContextTime, plannedPerformanceMs, startContextTime,
+            beforePerformanceMs: performance.now(), beforeContextTime: run.context.currentTime };
+          run.audioSchedule.validation = checkScheduledStart(run.audioSchedule);
+          if (!run.audioSchedule.validation.valid) {
+            void finish(run, run.audioSchedule.validation.reason); return;
+          }
+          run.source.start(startContextTime);
+          run.sourceScheduled = true;
+          run.audioSchedule.afterContextTime = run.context.currentTime;
+          run.audioSchedule.afterPerformanceMs = performance.now();
+          run.audioSchedule.validation = checkScheduledStart(run.audioSchedule);
+          if (!run.audioSchedule.validation.valid) {
+            void finish(run, run.audioSchedule.validation.reason); return;
+          }
+          run.timeline = new ReferenceTimeline({ runId: run.id, startContextTime, sampleRate: run.context.sampleRate });
+          // The audio buffer itself is finite even if a main-thread timer is delayed.
+          clearTimeout(run.deadline);
+          run.deadline = setTimeout(() => void finish(run, 'finite_run_deadline'), 72000);
+        }
+      }
+    } else {
+      const result = run.timeline.observe({ rafMs, callbackMs, queryStartMs, queryEndMs, stamp,
+        audioState: run.context.state, visible: document.visibilityState === 'visible',
+        fullscreen: document.fullscreenElement === ui.stage,
+        dimensionsStable: sameDimensions(run.environment.dimensions, dimensions()) });
+      if (result.status !== 'running') { void finish(run, result.reason || 'completed'); return; }
+      if (result.needsDraw) {
+        const drawStartMs = performance.now();
+        paint(result.activeEvent);
+        const drawEndMs = performance.now();
+        const drawn = run.timeline.confirmDraw(result.frameSequence, drawStartMs, drawEndMs);
+        if (drawn.status !== 'running') { void finish(run, drawn.reason); return; }
+      }
+    }
+    run.raf = requestAnimationFrame(time => frame(run, time));
+  } catch {
+    void finish(run, 'browser_api_or_drawing_error');
+  }
+}
+ui.start.addEventListener('click', async () => {
+  if (running) return;
+  running = true;
+  ui.start.disabled = true;
+  ui.stop.disabled = false;
+  ui.download.disabled = true;
+  savedReport = null;
+  ui.reportDetails.hidden = true;
+  ui.reportDetails.open = false;
+  ui.fullReportDetails.open = false;
+  ui.reportSummary.textContent = '';
+  ui.reportJson.textContent = '';
+  const number = ++generation;
+  const run = { number, id: `reference-${number}-${Math.floor(performance.now())}`, context: null,
+    timeline: null, source: null, raf: null, deadline: null, finishing: false,
+    latencies: [], lastLatencyMs: null, sourceScheduled: false, status: 'arming', reason: null,
+    warmStamp: null, warmAdvances: 0, dimensionsGate: null, audioSchedule: null,
+    lastTimestampQuery: null, lastTimestampPair: null,
+    environment: { browser: navigator.userAgent, language: navigator.language,
+      crossOriginIsolated, performanceTimeOrigin: performance.timeOrigin } };
+  active = run;
+  ui.status.textContent = 'Opening fullscreen and warming the audio clock. Escape or Stop cancels.';
+  run.deadline = setTimeout(() => void finish(run, 'arming_deadline'), 10000);
+  try {
+    // Call activation-sensitive APIs in the click handler, before awaiting either.
+    run.context = new AudioContext({ latencyHint: 'interactive' });
+    const resumed = run.context.resume();
+    const fullscreen = ui.stage.requestFullscreen();
+    await Promise.all([resumed, fullscreen]);
+    if (active !== run || run.finishing) return;
+    if (run.context.state !== 'running' || typeof run.context.getOutputTimestamp !== 'function')
+      throw new Error('Required audio clock unavailable');
+    run.environment.sampleRate = run.context.sampleRate;
+    run.environment.latencyHint = 'interactive';
+    ui.canvas.width = Math.round(innerWidth * devicePixelRatio);
+    ui.canvas.height = Math.round(innerHeight * devicePixelRatio);
+    paint(null);
+    run.buffer = run.context.createBuffer(2, DURATION_SECONDS * run.context.sampleRate, run.context.sampleRate);
+    fillReferenceChannel(run.buffer.getChannelData(0), run.context.sampleRate);
+    run.buffer.copyToChannel(run.buffer.getChannelData(0), 1);
+    run.context.addEventListener('statechange', () => {
+      if (active === run && !run.finishing && run.context.state !== 'running')
+        void finish(run, 'audio_state_changed');
+    });
+    run.context.addEventListener('sinkchange', () => void finish(run, 'audio_sink_changed'));
+    run.context.addEventListener('error', () => void finish(run, 'audio_device_error'));
+    run.armMs = performance.now();
+    run.dimensionsGate = new FullscreenDimensionsGate(run.armMs);
+    run.raf = requestAnimationFrame(time => frame(run, time));
+  } catch {
+    void finish(run, 'fullscreen_or_audio_start_failed');
+  }
+});
+for (const button of [ui.stop, ui.stopFull]) button.addEventListener('click', () => {
+  if (active) void finish(active, 'user_stopped', false);
+});
+document.addEventListener('visibilitychange', () => {
+  if (active && document.visibilityState !== 'visible') void finish(active, 'document_hidden');
+});
+document.addEventListener('fullscreenchange', () => {
+  if (active && !active.finishing && active.environment.dimensions && document.fullscreenElement !== ui.stage)
+    void finish(active, 'fullscreen_lost');
+});
+window.addEventListener('resize', () => {
+  if (active && !active.finishing && active.timeline &&
+      !sameDimensions(active.environment.dimensions, dimensions())) void finish(active, 'display_dimensions_changed');
+});
+window.addEventListener('pagehide', () => { if (active) void finish(active, 'page_unloaded'); });
+ui.fullReportDetails.addEventListener('toggle', () => {
+  if (ui.fullReportDetails.open && savedReport && !running)
+    ui.reportJson.textContent = JSON.stringify(savedReport, null, 2);
+});
+ui.download.addEventListener('click', () => {
+  if (!savedReport || running) return;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(savedReport, null, 2)], { type: 'application/json' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `av-reference-${savedReport.runId}.json`;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+if (!drawing || !window.AudioContext || !ui.stage.requestFullscreen) {
+  ui.status.textContent = 'This browser lacks the required canvas, audio or fullscreen capability. No test started.';
+} else {
+  ui.start.disabled = false;
+  ui.status.textContent = `Ready. Source timing policy v${POLICY.version}. Start requests fullscreen and plays one finite reference; nothing starts automatically.`;
+}
+</script>
+</body>
+</html>

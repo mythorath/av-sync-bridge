@@ -36,7 +36,7 @@ No process is automatically stopped or killed by this tool.
 The current progressive single-planar NV12 format is required. The IPC/handoff
 limit is 3840x2160, stricter than the metadata probe's 4096-pixel width limit.
 The advertised frame interval only sizes capacity; it does not rewrite actual
-frame times. Delay is 0..2000 ms, capture duration 1..120 seconds. Capacity and
+frame times. Delay is 0..2000 ms, capture duration 1..180 seconds. Capacity and
 dimensions must fit the existing 2 GiB IPC ceiling.
 
 ## Memory, thread ownership and failure behavior
@@ -55,10 +55,21 @@ securely erased, non-pageable, or immune to later memory pressure.
 
 The two-slot SPSC handoff allocates once, packs row padding, and does not block
 or overwrite an unreleased frame. Full handoff slots cause counted frame drops.
-The publication worker uses IPC try-locks; a busy lock causes a counted drop,
-not a stalled capture callback. Frames older than 200 ms at publication are
-discarded rather than used to build a stale worker backlog. Whole-frame copies
-still cost CPU time; nonblocking locking is not a bounded execution-time proof.
+The publication worker uses IPC try-locks. A busy lock retains the same owned
+frame for one new attempt on a later 1 ms worker tick, without changing its
+pixels or timestamps, allocating another frame, or stalling the capture
+callback. `publication_busy` counts unsuccessful lock attempts;
+`publication_retried` counts frames eventually published after one or more such
+attempts. Successful retries alone no longer mark a run degraded.
+
+Retries do not refresh the deadline: frames older than 200 ms **from original
+capture** are discarded and counted in `stale_before_publish`. Capture times
+more than 1 ms in the future, invalid arithmetic and non-busy publication
+failures fail the run. Persistent contention can still fill the two-slot handoff
+or expire a frame; those losses remain visible. A clean result requires
+`captured == published`, in addition to the existing capture, verification and
+cleanup gates. Whole-frame copies still cost CPU time; nonblocking locking is
+not a bounded execution-time proof.
 
 SIGINT/SIGTERM request shutdown, with bounded delayed-frame drain on ordinary
 completion. Kernel calls and the legacy writer destructor are not forcibly
@@ -96,10 +107,34 @@ failures out of a report just to obtain a success status.
 
 Raw V4L2 color metadata is available from the probe, but is not carried by the
 current IPC layout. The existing OBS adapter assumes BT.709 limited-range SDR.
-**Do not connect this real-video ring to that adapter until color interpretation
-is explicitly validated.** This tool only checks byte/timestamp transport, not
+**Do not use this ring/adapter for production until color interpretation is
+explicitly validated.** The isolated combined tests use cyan event recognition;
+that is not a full color/range qualification. This tool checks byte/timestamp transport, not
 matrix, range, transfer function, HDR, or rendered pixels.
 
 See [physical video results](video-validation.md). Fixed HDMI/device content
 calibration, audio-clock matching, a real OBS presentation test, startup priming,
 sustained 4K60 load and restart recovery remain separate gates.
+
+The retry regression tests cover repeated busy results, exact owned bytes and
+timestamps, one attempt per call, two-slot capacity, original-capture expiration,
+future-anchor bounds, overflow and failed publication. A Linux fixture holds
+the actual IPC mutex in a separate process, then verifies both retained frames
+after release. These tests passed on Windows MSVC (portable coverage) and Linux
+optimized/ASan+UBSan builds; they do not establish physical A/V synchronization
+or guarantee that a loaded 4K60 pipeline is loss-free.
+
+## Opt-in marker tracing
+
+`--trace-markers` reserves at most 21,601 metadata records before capture and
+adds a final `marker_trace` JSON array. Each accepted device frame contributes
+its original V4L2 sequence, capture timestamp, intended presentation timestamp,
+sparse cyan score and whether the short handoff accepted it. A record is not
+proof that OBS displayed that frame. Counts use normalized 80x45 cell centers
+and the same BT.709 limited-range cyan predicates as the isolated recorder.
+
+The capture callback does no file I/O, allocation or waiting for diagnostics.
+Invalid layout, overflow or a missing record prevents a clean diagnostic result.
+Tracing is disabled by default. These private content-activity/timestamp records
+help compare capture events to the recorder's raw rendered-video trace; they do
+not measure HDMI input latency, color fidelity or acoustic synchronization.

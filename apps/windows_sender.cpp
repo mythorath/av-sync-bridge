@@ -136,7 +136,7 @@ std::optional<Arguments> parse_arguments(int argc, char **argv)
                 return std::nullopt;
         } else result.host = value;
     }
-    if (!loopback || seen != 63 || !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 120)
+    if (!loopback || seen != 63 || !unicast_ipv4(result.host) || result.seconds < 1 || result.seconds > 180)
         return std::nullopt;
     const auto port = [](unsigned p) { return p >= 1 && p <= 65535; };
     if (!port(result.clock_port) || !port(result.rtp_port) || !port(result.rtcp_port) ||
@@ -767,6 +767,11 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
               << ",\"clock_observations\":" << health.observations << ",\"domain_bracket_ns\":" << s.domain_bracket_ns;
     if (health.observation_age_ns) std::cout << ",\"clock_observation_age_ns\":" << *health.observation_age_ns;
     if (health.rtt_ns) std::cout << ",\"clock_rtt_ns\":" << *health.rtt_ns;
+    if (health.observation_received_ns) std::cout << ",\"clock_last_observation_received_ns\":" << *health.observation_received_ns;
+    if (health.rtt_average_ns) std::cout << ",\"clock_rtt_average_ns\":" << *health.rtt_average_ns;
+    if (health.scheduled_timeout_ns) std::cout << ",\"clock_scheduled_timeout_ns\":" << *health.scheduled_timeout_ns;
+    if (health.last_observation_gap_ns) std::cout << ",\"clock_last_observation_gap_ns\":" << *health.last_observation_gap_ns;
+    std::cout << ",\"clock_maximum_observation_gap_ns\":" << health.maximum_observation_gap_ns;
     if (format) std::cout << ",\"input_channels\":" << format->channels << ",\"input_rate\":" << format->rate
                           << ",\"windows_channel_mask\":" << format->windows_mask;
     std::cout << ",\"captured_packets\":" << s.captured_packets << ",\"captured_frames\":" << s.captured_frames
@@ -821,6 +826,11 @@ void write_summary(const Statistics &s, const CaptureFormat *format, const avsyn
         if (h.observation_age_ns) std::cout<<",\"observation_age_ns\":"<<*h.observation_age_ns;
         if (h.rtt_ns) std::cout<<",\"rtt_ns\":"<<*h.rtt_ns;
         if (h.rate_error_ppm) std::cout<<",\"rate_ppm\":"<<*h.rate_error_ppm;
+        if (h.observation_received_ns) std::cout<<",\"last_observation_received_ns\":"<<*h.observation_received_ns;
+        if (h.rtt_average_ns) std::cout<<",\"rtt_average_ns\":"<<*h.rtt_average_ns;
+        if (h.scheduled_timeout_ns) std::cout<<",\"scheduled_timeout_ns\":"<<*h.scheduled_timeout_ns;
+        if (h.last_observation_gap_ns) std::cout<<",\"last_observation_gap_ns\":"<<*h.last_observation_gap_ns;
+        std::cout<<",\"maximum_observation_gap_ns\":"<<h.maximum_observation_gap_ns;
         std::cout<<'}';
     }
     std::cout<<']';
@@ -1034,7 +1044,7 @@ void help()
 {
     std::cout << "avsync-windows-sender --loopback --host IPV4 --clock-port N --rtp-port N --rtcp-port N --seconds N --clock-epoch N\n"
                  "Experimental desktop-only WASAPI -> explicit stereo mix -> 48 kHz L24 RTP.\n"
-                 "All options required; seconds is an overall deadline from 1 to 120.\n"
+                 "All options required; seconds is an overall deadline from 1 to 180.\n"
                  "A numeric unicast IPv4 destination and three distinct ports are required.\n"
                  "Help/no arguments opens no audio endpoint and sends no network traffic.\n"
                  "The explicit run captures desktop PCM and sends it unencrypted to that host.\n"

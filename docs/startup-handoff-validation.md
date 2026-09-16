@@ -107,15 +107,16 @@ The older harness's synthetic-only labels are not evidence of physical sync.
 
 ## Resume here
 
-1. The audio-only native OBS handoff above is working in isolation. Next add
-   known nonuniform events and independently check absolute mixer/content
-   timestamps before changing a normal scene; ordinary music levels do not
-   establish absolute timing.
-2. Coordinate the actual Elgato video path and desktop path on their shared
-   monotonic capture clock, apply independently measured content offsets, and
-   run the nonuniform-event encoded A/V test. Do not infer alignment from packet
-   counters, matching buffer sizes or the resampler's phase prediction.
-3. Add the explicit provider/sender generation handshake, restart recovery and
+1. The subsequent [combined physical trials](physical-combined-validation.md)
+   connect actual video and desktop audio and measure all six nonuniform
+   events. After the retained early failures and source-policy-v2 fixes, three
+   unchanged-setting fresh-start trials passed. This is short isolated evidence,
+   not production-profile, whole-process/reboot or loaded-soak qualification.
+   See the [latest checkpoint](checkpoint-2026-09-15.md) before continuing.
+2. The opt-in [same-sender recovery](desktop-recovery.md) preserves the current
+   provider/session and replaces retired media generations. It does not cover
+   a whole sender or receiver process restart.
+3. Add the explicit provider/sender process handshake, restart recovery and
    loaded soak. Only then plan a reversible production source/startup migration,
    preserving existing scene/mute controls and microphone privacy.
 

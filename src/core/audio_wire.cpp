@@ -104,6 +104,20 @@ AudioValidationResult AudioReceiverValidator::reject_missing() noexcept
     return reject(faulted_ ? AudioWireStatus::requires_reset : AudioWireStatus::malformed);
 }
 
+bool AudioReceiverValidator::timing_only_stale(const AudioRecord& record,std::uint32_t ssrc,
+        std::uint32_t timestamp,std::uint32_t frames,Nanoseconds now) const noexcept {
+    const auto age=checked_sub(now,record.capture_ns);
+    if (faulted_ || !latest_ || !age || *age<=maximum_anchor_age) return false;
+    if (tracker_ && tracker_->diagnostics().measurements && !tracker_->current_estimate(record.capture_ns))
+        return false; // A repeated anchor cannot hide an already disqualified rate.
+    // Isolated metadata probe: the real stale packet remains rejected. Using
+    // its capture date only bypasses freshness in this COPY, not consistency,
+    // ordering, identity or rate qualification. No PCM/timestamp is published.
+    auto probe=*this;
+    const auto result=probe.observe(record,ssrc,timestamp,frames,record.capture_ns);
+    return result.accepted && (!result.estimate || result.estimate->within_correction_limit);
+}
+
 AudioValidationResult AudioReceiverValidator::observe(const AudioRecord& record, std::uint32_t ssrc,
     std::uint32_t rtp_timestamp, std::uint32_t payload_frames, Nanoseconds now) noexcept
 {

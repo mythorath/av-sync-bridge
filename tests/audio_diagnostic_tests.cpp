@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -148,8 +149,154 @@ void output_hooks() {
     }
     CHECK(d->failed() && sink.revoked && !sink.frames);
 }
+struct RecoverySink {
+    avsync::SessionToken epoch{};
+    std::uint64_t frames{},total_frames{};
+    avsync::Nanoseconds last_capture{-1};
+    unsigned begins{},revocations{};
+    bool revoked{true},reject_begin{};
+    static bool begin(void* p,avsync::SessionToken next) noexcept {
+        auto& s=*static_cast<RecoverySink*>(p);
+        if (s.reject_begin || !s.revoked || !next.valid() ||
+            (s.epoch.valid() && (s.epoch.session!=next.session || s.epoch.generation>=next.generation))) return false;
+        s.epoch=next; s.frames=0; s.revoked=false; ++s.begins; return true;
+    }
+    static bool consume(void* p,const avsync::CorrectedAudio& b,std::span<const float> pcm,
+            avsync::Nanoseconds) noexcept {
+        auto& s=*static_cast<RecoverySink*>(p);
+        if (s.revoked || b.epoch!=s.epoch || b.first_frame!=s.frames || pcm.size()!=b.frames*2 ||
+            b.capture_grid_ns<=s.last_capture) return false;
+        s.last_capture=b.capture_grid_ns; s.frames+=b.frames; s.total_frames+=b.frames; return true;
+    }
+    static void revoke(void* p) noexcept {
+        auto& s=*static_cast<RecoverySink*>(p);
+        if (!s.revoked) ++s.revocations;
+        s.revoked=true;
+    }
+    avsync::DiagnosticAudioOutput hooks() { return {this,consume,revoke,begin}; }
+};
+void recovery() {
+    using avsync::DesktopRecovery;
+    using avsync::CorrectionFault; using avsync::CorrectionStaleReason;
+    CHECK(avsync::desktop_fault_recoverable(CorrectionFault::health,CorrectionStaleReason::none));
+    CHECK(avsync::desktop_fault_recoverable(CorrectionFault::stale,CorrectionStaleReason::no_progress));
+    CHECK(avsync::desktop_fault_recoverable(CorrectionFault::stale,CorrectionStaleReason::anchor_age));
+    for (const auto reason:{CorrectionStaleReason::none,CorrectionStaleReason::input_queue,CorrectionStaleReason::output_queue})
+        CHECK(!avsync::desktop_fault_recoverable(CorrectionFault::stale,reason));
+    for (const auto fault:{CorrectionFault::metadata,CorrectionFault::pcm,CorrectionFault::rate,CorrectionFault::overflow,
+            CorrectionFault::backend,CorrectionFault::timeline,CorrectionFault::phase,CorrectionFault::none})
+        CHECK(!avsync::desktop_fault_recoverable(fault,CorrectionStaleReason::no_progress));
+    RecoverySink sink;
+    auto d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,sink.hooks(),DesktopRecovery::same_sender_session);
+    auto now=feed(*d);
+    CHECK(sink.begins==1 && !sink.revoked && sink.frames>48000);
+    const auto first_frames=sink.total_frames;
+    d->tick(now+1,false);
+    CHECK(!d->failed() && d->awaiting_generation() && sink.revoked && sink.revocations==1);
+    auto old=packet(6*48000); old.arrival_ns=now+10'000'000;
+    CHECK(d->submit(old)); d->tick(old.arrival_ns,true);
+    CHECK(!d->failed() && d->awaiting_generation() && sink.total_frames==first_frames);
+    CHECK(d->retired_packets()==1 && sink.revocations==1);
+    now=feed(*d,2,now+1'000'000'000);
+    CHECK(!d->awaiting_generation() && sink.begins==2 && !sink.revoked);
+    CHECK(d->sessions().size()==2 && d->sessions()[1].first_frame==0 && sink.total_frames>first_frames);
+    // A new admitted generation retires an active predecessor even before its watchdog fires.
+    now=feed(*d,3,now+1'000'000'000);
+    CHECK(sink.begins==3 && sink.revocations==2 && d->sessions().size()==3);
+    old=packet(0,1); old.arrival_ns=now;
+    CHECK(d->submit(old)); d->tick(now,true);
+    CHECK(!d->failed() && sink.begins==3 && d->retired_packets()==2);
+    d->tick(now+201'000'000,true);
+    CHECK(!d->failed() && d->awaiting_generation() && sink.revoked);
+    CHECK(d->sessions()[2].fault==avsync::CorrectionFault::stale);
+    now=feed(*d,4,now+1'000'000'000);
+    CHECK(sink.begins==4 && !sink.revoked);
+    // Fixed storage/admission budget: eight generations, never an unbounded restart loop.
+    for (std::uint64_t generation=5;generation<=8;++generation) now=feed(*d,generation,now+1'000'000'000);
+    const auto ninth=packet(0,9,now+1'000'000'000);
+    CHECK(d->submit(ninth)); d->tick(ninth.arrival_ns,true);
+    CHECK(d->failed() && !d->awaiting_generation() && sink.revoked && sink.begins==8);
+    for (unsigned invalid=0;invalid<5;++invalid) {
+        sink={};
+        d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,sink.hooks(),DesktopRecovery::same_sender_session);
+        now=feed(*d);
+        auto next=packet(0,2,now+1'000'000'000);
+        if (invalid==0) next.record.epoch.session=10;
+        if (invalid==1) next.ssrc=11; // Reused transport identity.
+        if (invalid==2) next=packet(180,2,now+1'000'000'000); // Missing frame zero.
+        if (invalid==3) sink.reject_begin=true;
+        if (invalid==4) next.pcm[0]=std::numeric_limits<float>::quiet_NaN();
+        CHECK(d->submit(next)); d->tick(next.arrival_ns,true);
+        CHECK(d->failed() && sink.revoked && !d->awaiting_generation());
+    }
+    bool rejected{};
+    try { avsync::AudioCorrectionDiagnostic missing(7,{},DesktopRecovery::same_sender_session); }
+    catch (const std::invalid_argument&) { rejected=true; }
+    CHECK(rejected);
+    sink={};
+    d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,sink.hooks(),DesktopRecovery::same_sender_session);
+    const auto first=packet(0); CHECK(d->submit(first)); d->tick(first.arrival_ns,true);
+    d->tick(first.record.capture_ns+250'000'001,true);
+    CHECK(d->awaiting_generation() && !d->failed() && sink.revoked);
+    CHECK(d->sessions()[0].correction.stale_reason==CorrectionStaleReason::anchor_age);
+    feed(*d,2,2'000'000'000);
+    CHECK(!d->failed() && !d->awaiting_generation() && sink.begins==2 && sink.total_frames>48000);
+}
+void ordered_receiver_retirement() {
+    // Exercise the SAME pre-validator fence and expiry-only classification used
+    // by the RTP callback, not just direct submissions into the DSP diagnostic.
+    for (const bool watchdog_first : {false,true}) {
+        RecoverySink sink;
+        avsync::AudioCorrectionDiagnostic d(7,sink.hooks(),avsync::DesktopRecovery::same_sender_session);
+        avsync::wire::AudioReceiverValidator branch(7);
+        avsync::Nanoseconds now{};
+        CHECK(!d.retire_stale_transport({9,1})); // No admitted session yet.
+        for (std::uint64_t wire=0;wire<6*48000;wire+=180) {
+            const auto p=packet(wire); now=p.arrival_ns;
+            CHECK(branch.observe(p.record,p.ssrc,p.timestamp,p.frames,now).accepted);
+            CHECK(d.submit(p)); d.tick(now,true); CHECK(!d.failed());
+        }
+        CHECK(!d.retire_stale_transport({10,1}));
+        CHECK(!d.retire_stale_transport({9,2})); // Not admitted, even if generation increases.
+        const auto late=packet(6*48000);
+        now=late.record.capture_ns+251'000'000;
+        if (watchdog_first) {
+            d.tick(now,true);
+            CHECK(d.retired_generation(late.record.epoch) && d.awaiting_generation());
+            // Callback drops BEFORE the validator, which otherwise latches stale.
+            auto probe=branch;
+            CHECK(probe.observe(late.record,late.ssrc,late.timestamp,late.frames,now).status==
+                avsync::wire::AudioWireStatus::stale);
+            CHECK(branch.next_wire_frame()==6*48000 && !branch.faulted());
+        } else {
+            CHECK(!d.retired_generation(late.record.epoch));
+            CHECK(branch.timing_only_stale(late.record,late.ssrc,late.timestamp,late.frames,now));
+            CHECK(branch.observe(late.record,late.ssrc,late.timestamp,late.frames,now).status==
+                avsync::wire::AudioWireStatus::stale);
+            CHECK(d.retire_stale_transport(late.record.epoch));
+            CHECK(!sink.revoked); // Callback only posts an atomic request; no DSP/IPC I/O.
+            d.tick(now,true);
+        }
+        CHECK(!d.failed() && d.awaiting_generation() && sink.revoked);
+        CHECK(d.retired_generation({9,1}) && !d.retired_generation({9,2}) && !d.retired_generation({10,1}));
+        const auto old_frames=sink.total_frames;
+        auto pending=late; pending.arrival_ns=now-101'000'000;
+        CHECK(d.submit(pending)); d.tick(now,true);
+        CHECK(!d.failed() && sink.total_frames==old_frames); // A queued retired packet cannot poison recovery.
+        avsync::wire::AudioReceiverValidator successor(7);
+        const auto base=now+1'000'000'000;
+        for (std::uint64_t wire=0;wire<6*48000;wire+=180) {
+            const auto p=packet(wire,2,base); now=p.arrival_ns;
+            CHECK(successor.observe(p.record,p.ssrc,p.timestamp,p.frames,now).accepted);
+            CHECK(d.submit(p)); d.tick(now,true); CHECK(!d.failed());
+        }
+        CHECK(!d.awaiting_generation() && !sink.revoked && sink.begins==2 && sink.total_frames>old_frames);
+        CHECK(d.retired_generation({9,1}) && !d.retired_generation({9,2}));
+    }
+}
 }
 int main() {
-    try { decode(); verdicts(); lifecycle(); failures(); output_hooks(); std::cout<<checks<<" diagnostic checks passed\n"; }
+    try { decode(); verdicts(); lifecycle(); failures(); output_hooks(); recovery(); ordered_receiver_retirement();
+        std::cout<<checks<<" diagnostic checks passed\n"; }
     catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

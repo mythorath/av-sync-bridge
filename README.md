@@ -13,10 +13,16 @@ have been tested; see [transport results and limits](docs/network-validation.md)
 An optional [physical video capture and memory buffer](docs/video-buffer.md) now
 preserves NV12 frames and their driver timestamps in a bounded two-second ring;
 see [physical video results and remaining faults](docs/video-validation.md).
-These experiments are not yet connected into one real A/V OBS playout path.
-Packet recovery, adaptive audio-rate correction, physical content calibration
-and production recovery still require explicit validation. A separate [metadata-only WASAPI probe](docs/windows-capture.md)
+These paths are now connected for [isolated combined physical tests](docs/physical-combined-validation.md),
+not normal OBS operation. Following clock-freshness, video-publication and
+reference-scheduling fixes, three unchanged-setting physical timing passes
+succeeded. Production integration, loaded stability and whole-process/reboot
+recovery remain unqualified. See the [current checkpoint](docs/checkpoint-2026-09-15.md).
+A separate [metadata-only WASAPI probe](docs/windows-capture.md)
 remains available without transmitting PCM.
+Opt-in [same-sender recovery](docs/desktop-recovery.md) has now reconnected an
+isolated OBS recording after a planned clock interruption, with a measured
+silence gap. It is not whole-process or reboot recovery.
 
 ## Intended use
 
@@ -59,8 +65,8 @@ change startup tasks, or touch an OBS profile. Tests remain active in Release bu
 Implemented foundation: timestamp arithmetic, rational cadence, bounded queues,
 rate-estimation recommendations, privacy-cutoff logic, local synthetic IPC and an
 optional native OBS adapter. A rate estimate is not implemented ASRC; simulated
-audio is not hardware validation. The optional network experiment remains
-separate from the physical-video and synthetic IPC/OBS paths. The
+audio is not hardware validation. The optional network and physical-video paths
+can feed separate IPC inputs to the isolated OBS harness. The
 [optional resampler and original capture-anchor components](docs/asrc-validation.md)
 now pass offline checks, including a 600-second generated-marker case and wrong-rate
 controls. The [old sender conversion](docs/conversion-timing.md) hid drift and
@@ -77,13 +83,19 @@ against original capture anchors before releasing output. It passes separate
 generated-waveform and fault checks, not live A/V validation. The
 [quality/resource and isolated live correction milestone](docs/audio-live-correction-validation.md)
 now exercises actual desktop PCM through ASRC in an explicit inspect-and-discard
-receiver mode. It does **not replace normal OBS audio**. Loaded clock/recovery reliability,
-physical calibration and combined A/V delivery remain open.
+receiver mode. It does **not replace normal OBS audio**. Loaded clock/recovery
+reliability, production calibration and continuous combined A/V delivery remain open.
 The [startup and desktop handoff checkpoint](docs/startup-handoff-validation.md)
 adds bounded provisional acquisition and an explicit two-second corrected-audio
 IPC buffer in the native adapter's format. Real desktop audio reached an encoded
 recording through that native source in an isolated OBS harness. This begins
 integration; it does not install a normal OBS source or replace production audio.
+The [physical marker measurement helper](docs/physical-measurement.md) requires
+one complete six-event pass and checks audio/video spacing independently. It
+rejects missing or obscured events rather than pairing a convenient subset.
+An [instrumented browser reference](docs/browser-reference.md) generates the same
+six-event pattern and reports its own scheduling uncertainty. Its report is not
+a substitute for measuring the physical capture and encoded output.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,
