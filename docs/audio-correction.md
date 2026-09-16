@@ -9,7 +9,8 @@ background service or production replacement.
 It now includes a [model-based runtime phase guard](audio-phase-guard.md), limited
 to the audited libsamplerate 0.2.2 implementation and independently tested offline.
 A separate [owned-queue diagnostic adapter](network-receiver.md) now connects
-actual network PCM to the worker and inspects/discards its output. See the
+actual network PCM to the worker. It defaults to inspect/discard; explicit Linux
+desktop IPC handoff is also available without changing an OBS source. See the
 [quality/resource and live boundary evidence](audio-live-correction-validation.md).
 
 ## Contract
@@ -26,8 +27,12 @@ epochs cannot take over the active worker.
    1..180-frame PCM payload using the wire policy. Repeated anchors do not create
    new clock measurements.
 2. Discard priming PCM until three nonoverlapping original-clock rate windows
-   agree within 20 ppm; take their median. A larger spread restarts acquisition.
-   Silence is legitimate PCM.
+   pass the existing +/-500 ppm validity limit; take their median. This is a
+   provisional initial ratio, not a steady-lock claim. Report their spread;
+   do not restart acquisition on short-window noise. The previous 20 ppm
+   agreement rule could starve startup (19 seconds observed). Health, freshness,
+   rate, command-slew and per-sample 10 ms phase limits are unchanged. Silence
+   is legitimate PCM. See [startup and handoff evidence](startup-handoff-validation.md).
 3. Set the initial ratio before emitting samples. Establish the post-priming
    capture-grid origin from the fresh original anchor, rational nominal sample
    association and at most 50 ms of rate-based extrapolation. No arrival rebasing

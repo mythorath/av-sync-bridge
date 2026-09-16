@@ -74,6 +74,8 @@ public:
     // stream 0: interleaved stereo float PCM; stream 1: mono float PCM.
     bool publish_audio(unsigned stream, std::span<const float> samples,
                        std::int64_t capture_ns, std::int64_t presentation_ns) noexcept;
+    WriteResult try_publish_audio(unsigned stream, std::span<const float> samples,
+                       std::int64_t capture_ns, std::int64_t presentation_ns) noexcept;
     bool heartbeat() noexcept;
 private:
     struct Impl;

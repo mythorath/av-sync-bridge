@@ -47,7 +47,7 @@ isolated real-capture development, not production deployment.
 - [ ] Automatic provider/sender restart handshake, loaded loss/reordering/recovery
   and sustained original-anchor uncertainty characterization.
 - [ ] Smooth per-input ASRC, with one adaptive rate controller per path.
-- [x] Offline desktop feed-forward worker: stable-rate acquisition, fixed-quantum
+- [x] Offline desktop feed-forward worker: provisional rate acquisition, fixed-quantum
   command slew, owned bounded queues, original-anchor origin and explicit reset.
 - [x] Model-based runtime phase guard, pinned backend audit, independent linear-PCM
   phase check and fault/no-false-alarm fixtures with generated media.
@@ -55,6 +55,11 @@ isolated real-capture development, not production deployment.
   individual-call paced CPU measurements (affinity-conditioned pass on test host).
 - [x] Combined generated 192 kHz conversion/RTP/correction marker checks and
   bounded desktop-only live inspect-and-discard adapter; no OBS output.
+- [x] Bounded three-window startup and explicit corrected desktop IPC handoff,
+  with due-reader verification, bounded contention retry and fault revocation.
+  See [startup/handoff scope and next steps](startup-handoff-validation.md).
+- [x] Actual Windows desktop audio through the native source to a short encoded
+  recording in isolated libOBS; no physical video, real mic or normal-profile migration.
 - [ ] Loaded clock/recovery repeatability, source-timestamp uncertainty and
   complete resource qualification before a production or OBS correction path.
 

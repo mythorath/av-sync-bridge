@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -12,17 +13,19 @@
 int main(int argc, char** argv) {
     std::string path;
     unsigned duration = 5, delay_ms = 2000;
-    bool verify = false;
+    bool verify = false, desktop_only = false;
+    long double audio_power{}; std::uint64_t audio_sample_count{}; double audio_peak{};
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "--help") {
-            std::cout << "avsync-probe --path FILE [--duration SECONDS] [--verify] [--delay-ms MS]\n"
+            std::cout << "avsync-probe --path FILE [--duration SECONDS] [--verify] [--delay-ms MS] [--desktop-only]\n"
                          "Reads due IPC media only; --verify checks synthetic timestamp delay,\n"
                          "monotonic sequence order, and finite receipt of all three streams.\n"
                          "This is metadata/IPC validation, NOT encoded A/V or hardware validation.\n";
             return 0;
         }
         if (arg == "--verify") { verify = true; continue; }
+        if (arg == "--desktop-only") { desktop_only = true; continue; }
         if (i + 1 == argc) return 2;
         std::string value(argv[++i]);
         if (arg == "--path") path = value;
@@ -52,6 +55,7 @@ int main(int argc, char** argv) {
         else if (result == ReadResult::invalid || result == ReadResult::buffer_too_small) failed = true;
         else if (result == ReadResult::ok) {
             if (info.sequence <= sequences[stream] || info.presentation_ns > now) failed = true;
+            if (verify && desktop_only && info.sequence!=sequences[stream]+1) failed=true;
             if (verify && info.presentation_ns - info.capture_ns != std::int64_t(delay_ms) * 1000000) failed = true;
             max_lateness = std::max(max_lateness, now - info.presentation_ns);
             sequences[stream] = info.sequence; ++received[stream];
@@ -60,12 +64,17 @@ int main(int argc, char** argv) {
     while (avsync::ipc::monotonic_ns() - begin < std::int64_t(duration) * 1000000000) {
         const auto now = avsync::ipc::monotonic_ns();
         avsync::ipc::FrameInfo info;
-        auto result = reader.read_latest_due_video(now, video, info); accept(0, result, info, now);
-        for (unsigned stream = 0; stream < 2; ++stream) {
+        auto result = avsync::ipc::ReadResult::empty;
+        if (!desktop_only) { result=reader.read_latest_due_video(now,video,info); accept(0,result,info,now); }
+        for (unsigned stream = 0; stream < (desktop_only ? 1u:2u); ++stream) {
             for (unsigned drain = 0; drain < 16; ++drain) {
                 result = reader.read_next_due_audio(stream, now, audio, info);
                 accept(stream + 1, result, info, now);
                 if (result != avsync::ipc::ReadResult::ok) break;
+                if (desktop_only) for (std::size_t n=0;n<info.frames*2;++n) {
+                    const double x=audio[n]; if (!std::isfinite(x)) failed=true;
+                    audio_power+=x*x; audio_peak=std::max(audio_peak,std::abs(x)); ++audio_sample_count;
+                }
             }
         }
         if (now >= next_status) {
@@ -78,7 +87,10 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    if (verify && (!received[0] || !received[1] || !received[2])) failed = true;
+    if (verify && (desktop_only ? received[1]<100 || stale || disconnected :
+            !received[0] || !received[1] || !received[2])) failed = true;
+    if (desktop_only) std::cout<<"desktop_pcm_peak="<<audio_peak<<" desktop_pcm_rms="
+        <<(audio_sample_count ? std::sqrt(static_cast<double>(audio_power/audio_sample_count)):0)<<'\n';
     std::cout << "IPC " << (failed ? "FAIL" : verify ? "METADATA PASS" : "OBSERVED") << " counts=" << received[0] << ',' << received[1] << ',' << received[2]
               << " busy=" << busy << " stale=" << stale << " disconnected_polls=" << disconnected
               << "; metadata-only, not end-to-end validation\n";

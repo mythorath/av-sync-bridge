@@ -91,14 +91,16 @@ CorrectionPush AudioCorrectionWorker::push(const wire::AudioRecord& record, std:
         target_ = ppm;
         if (state_ == CorrectionState::priming) {
             acquisition_[acquisition_count_++] = ppm;
-            const auto [low, high] = std::minmax_element(acquisition_.begin(), acquisition_.begin() + acquisition_count_);
-            if (*high - *low > 20) { acquisition_[0] = ppm; acquisition_count_ = 1; }
         }
     }
     if (state_ == CorrectionState::priming && acquisition_count_ == acquisition_.size()) {
-        // Median of three consistent ORIGINAL-clock windows rejects a single
-        // extreme priming estimate without retaining old PCM for three seconds.
+        // Three valid ORIGINAL-clock windows give a bounded initial estimate.
+        // Do not restart indefinitely on noisy short-window slopes. This is
+        // provisional acquisition, NOT proof of steady lock: every later sample
+        // must still pass the original-anchor phase guard, and rate/health limits
+        // and command slew remain unchanged. No old priming PCM is retained.
         auto sorted = acquisition_; std::sort(sorted.begin(), sorted.end()); target_ = sorted[1];
+        diagnostics_.acquisition_spread_ppm = sorted.back()-sorted.front();
         if (!start(record)) { fail(CorrectionFault::timeline); return CorrectionPush::rejected; }
     }
     if (state_ == CorrectionState::priming) {

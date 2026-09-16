@@ -15,6 +15,7 @@ struct CorrectionDiagnostics {
     std::uint64_t estimator_windows{}, backend_calls{}, no_progress_dispatches{};
     std::size_t peak_input_frames{}, peak_output_frames{};
     double maximum_command_step_ppm{};
+    double acquisition_spread_ppm{};
     std::uint64_t phase_checks{}, phase_waits{};
     std::size_t peak_phase_anchors{};
     Nanoseconds maximum_predicted_phase_ns{};

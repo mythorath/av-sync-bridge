@@ -77,8 +77,13 @@ against original capture anchors before releasing output. It passes separate
 generated-waveform and fault checks, not live A/V validation. The
 [quality/resource and isolated live correction milestone](docs/audio-live-correction-validation.md)
 now exercises actual desktop PCM through ASRC in an explicit inspect-and-discard
-receiver mode. It is **not connected to OBS**. Loaded clock/recovery reliability,
+receiver mode. It does **not replace normal OBS audio**. Loaded clock/recovery reliability,
 physical calibration and combined A/V delivery remain open.
+The [startup and desktop handoff checkpoint](docs/startup-handoff-validation.md)
+adds bounded provisional acquisition and an explicit two-second corrected-audio
+IPC buffer in the native adapter's format. Real desktop audio reached an encoded
+recording through that native source in an isolated OBS harness. This begins
+integration; it does not install a normal OBS source or replace production audio.
 
 Do not install untested components into your normal OBS profile. Use an isolated
 configuration with synthetic sources first. Never publish real device identifiers,

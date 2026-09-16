@@ -145,6 +145,40 @@ Keep the sender active through the receiver deadline for this finite verdict:
 ordinary sender termination correctly makes the diagnostic's current generation
 stale. Teardown tails are not an exact sender/receiver packet-count test.
 
+## Explicit desktop IPC handoff (not production migration)
+
+With NETWORK, ASRC and IPC enabled, `--desktop-ipc NEW_PRIVATE_FILE` implies
+`--correct-desktop` and writes corrected desktop PCM to the existing native
+adapter's IPC protocol. The file must not exist; its parent must already be
+private and user-owned. No OBS profile, source, service or microphone is changed.
+This is a separate audio-only mapping; video and mic slots remain unused.
+
+Capture-grid timestamps are preserved. Presentation is exactly capture + two
+seconds, never arrival + two seconds. Complete 480-frame quanta are published
+with nonblocking mutex acquisition into a preallocated 224-block stereo ring.
+Brief mutex contention is retried from a fixed 16-block owned queue, with at most
+eight publish attempts per dispatch and a 200 ms capture-age deadline. No sleeps
+or unbounded backlog are used. Bad/late PCM, discontinuities, retry overflow/deadline,
+clock loss or a new media generation
+stop this finite handoff and revoke the mapping, rather than replaying queued
+old audio. Creation/revocation are ordinary control-thread operations, not OBS
+callbacks. **Automatic reconnection/restart is not implemented in this mode.**
+The inspect/discard mode retains its separately tested recovery behavior.
+
+Start a reader before audio begins to verify every due block, without playback:
+
+```sh
+./build-asrc/avsync-probe --path NEW_PRIVATE_FILE --duration 30 \
+  --verify --desktop-only --delay-ms 2000
+```
+
+The reader checks exact delay, contiguous sequence, finite PCM and delivery, not
+physical A/V sync. End it before the receiver's deadline; receiver shutdown
+deliberately revokes undrained future audio. The private mapping contains recent
+desktop PCM; do not publish it, and remove the test file/lock after all readers
+and the producer exit. The [handoff checkpoint](startup-handoff-validation.md)
+records what has actually been verified and the remaining OBS integration work.
+
 ## Explicit clock-loss fixture
 
 The optional pair `--clock-pause-after N --clock-pause-seconds M` disables replies

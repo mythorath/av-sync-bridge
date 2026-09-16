@@ -312,6 +312,12 @@ bool Writer::heartbeat() noexcept {
     if (lock.result != 0 || !lock.h->online) return false;
     lock.h->heartbeat_ns = monotonic_ns(); return true;
 }
+WriteResult Writer::try_publish_audio(unsigned stream, std::span<const float> samples,
+        std::int64_t capture, std::int64_t presentation) noexcept {
+    if (!valid() || stream>1 || samples.size()!=audio_samples(impl_->config,stream)) return WriteResult::invalid;
+    return publish(impl_->map,impl_->layout,stream+1,samples.data(),samples.size_bytes(),
+                   impl_->config.audio_frames,capture,presentation,true);
+}
 
 struct Reader::Impl {
     std::string path, error;
@@ -435,7 +441,7 @@ ReadResult Reader::poll_status(std::int64_t now, Status& status) noexcept {
 // Private fault-injection symbols, deliberately absent from the public API/CLI.
 // Only compile these in test builds. They operate on the test process's own IPC file.
 namespace testing {
-[[noreturn]] void abandon_mutex(const char* path, int notify_fd, int release_fd) {
+[[noreturn]] void hold_test_mutex(const char* path, int notify_fd, int release_fd, bool abandon) {
     const int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     struct stat st{};
     if (fd < 0 || fstat(fd, &st) || !private_regular(st)) _exit(91);
@@ -445,7 +451,14 @@ namespace testing {
     if (write(notify_fd, &ready, 1) != 1) _exit(93);
     char release{};
     if (read(release_fd, &release, 1) != 1) _exit(94);
+    if (!abandon) { pthread_mutex_unlock(&h->mutex); _exit(0); }
     _exit(99); // Kernel marks the robust mutex owner dead; no unlock.
+}
+[[noreturn]] void abandon_mutex(const char* path,int notify_fd,int release_fd) {
+    hold_test_mutex(path,notify_fd,release_fd,true);
+}
+[[noreturn]] void briefly_hold_mutex(const char* path,int notify_fd,int release_fd) {
+    hold_test_mutex(path,notify_fd,release_fd,false);
 }
 bool set_sequence(const char* path, unsigned stream, std::uint64_t value) {
     if (stream > 2) return false;

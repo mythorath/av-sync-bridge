@@ -135,7 +135,8 @@ default; a clamped out-of-range estimate is a fault indication, not permission
 to keep playing indefinitely.
 
 Start with the existing 1-second nonoverlapping estimator windows. Require three
-consistent valid windows before priming output; discard old priming PCM rather
+valid windows and use their median provisionally under the phase guard; do not
+require agreement that can indefinitely starve acquisition. Discard old priming PCM rather
 than retaining three seconds or moving its timestamps. Anchor the accepted new
 output generation from fresh capture metadata. Initial ratio can be set before
 any output; no audible ratio step is needed at startup.

@@ -118,8 +118,38 @@ void failures() {
     CHECK(future->submit(a)); future->tick(a.arrival_ns-1,true);
     CHECK(future->sessions().empty()); future->tick(a.arrival_ns,true); CHECK(future->sessions().size()==1);
 }
+void output_hooks() {
+    struct Sink {
+        std::uint64_t frames{}; unsigned revoked{}; bool reject{};
+        static bool consume(void* p,const avsync::CorrectedAudio& b,std::span<const float> pcm,
+                avsync::Nanoseconds) noexcept {
+            auto& s=*static_cast<Sink*>(p);
+            if (s.reject || s.revoked || b.first_frame!=s.frames || pcm.size()!=b.frames*2) return false;
+            s.frames+=b.frames; return true;
+        }
+        static void revoke(void* p) noexcept { ++static_cast<Sink*>(p)->revoked; }
+    } sink;
+    auto d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,
+        avsync::DiagnosticAudioOutput{&sink,Sink::consume,Sink::revoke});
+    auto now=feed(*d); CHECK(sink.frames>48000 && !sink.revoked);
+    d->tick(now+1,false); CHECK(d->failed() && sink.revoked);
+    sink={};
+    d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,
+        avsync::DiagnosticAudioOutput{&sink,Sink::consume,Sink::revoke});
+    now=feed(*d);
+    auto newer=packet(0,2,now+1'000'000'000);
+    CHECK(d->submit(newer)); d->tick(newer.arrival_ns,true);
+    CHECK(d->failed() && sink.revoked); // No old buffer stays online while a new generation primes.
+    sink={}; sink.reject=true;
+    d=std::make_unique<avsync::AudioCorrectionDiagnostic>(7,
+        avsync::DiagnosticAudioOutput{&sink,Sink::consume,Sink::revoke});
+    for (std::uint64_t wire=0;wire<5*48000 && !d->failed();wire+=180) {
+        const auto p=packet(wire); CHECK(d->submit(p)); d->tick(p.arrival_ns,true);
+    }
+    CHECK(d->failed() && sink.revoked && !sink.frames);
+}
 }
 int main() {
-    try { decode(); verdicts(); lifecycle(); failures(); std::cout<<checks<<" diagnostic checks passed\n"; }
+    try { decode(); verdicts(); lifecycle(); failures(); output_hooks(); std::cout<<checks<<" diagnostic checks passed\n"; }
     catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

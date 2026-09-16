@@ -198,6 +198,30 @@ void phase_faults() {
     CHECK(w->reset({3,3})); f={}; f.token={3,3}; prime(*w,f);
     CHECK(w->diagnostics().maximum_predicted_phase_ns==0 && w->diagnostics().phase_checks==0);
 }
+void bounded_noisy_acquisition() {
+    // Smooth timestamp noise creates alternating 1-second slope estimates
+    // outside the old 20 ppm agreement test, without a source discontinuity.
+    // It must not starve startup; the actual phase guard stays active afterward.
+    for (const auto amplitude : {35'000.L,350'000.L}) {
+        auto w=std::make_unique<avsync::AudioCorrectionWorker>(epoch,clock_epoch);
+        Feed f; f.ppm=0; std::array<float,960> output{};
+        std::uint64_t started{};
+        while (f.frame<8*48000) {
+            const auto anchor=f.frame/960*960;
+            f.timestamp_bias=static_cast<avsync::Nanoseconds>(amplitude*
+                std::sin(2*std::numbers::pi_v<long double>*anchor/(4*48000.L)));
+            CHECK(f.push(*w)!=avsync::CorrectionPush::rejected);
+            if (!started && w->state()==avsync::CorrectionState::running) started=f.frame;
+            (void)w->dispatch(f.now,true);
+            while (w->pull(output,f.now,true)) {}
+        }
+        CHECK(started>=3*48000 && started<static_cast<std::uint64_t>(3.1*48000));
+        CHECK(w->diagnostics().acquisition_spread_ppm>20);
+        CHECK(w->state()==avsync::CorrectionState::running);
+        CHECK(w->diagnostics().maximum_predicted_phase_ns<2'000'000);
+        CHECK(w->diagnostics().delivered_frames>4*48000);
+    }
+}
 }
 int main() {
     try {
@@ -207,6 +231,7 @@ int main() {
         faults();
         backpressure_and_ownership();
         phase_faults();
+        bounded_noisy_acquisition();
         std::cout << checks << " correction worker checks passed; generated PCM only\n"; return 0;
     } catch (const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

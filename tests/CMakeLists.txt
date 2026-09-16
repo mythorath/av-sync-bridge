@@ -79,3 +79,8 @@ if(AVSYNC_BUILD_IPC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ipc_tests.cpp")
 endif()
 
 avsync_configure_test_runtime()
+if(TARGET avsync_audio_handoff)
+    add_executable(avsync-audio-handoff-tests audio_handoff_tests.cpp)
+    target_link_libraries(avsync-audio-handoff-tests PRIVATE avsync_audio_handoff)
+    add_test(NAME avsync-audio-handoff-tests COMMAND avsync-audio-handoff-tests)
+endif()

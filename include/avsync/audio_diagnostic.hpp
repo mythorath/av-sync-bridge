@@ -34,16 +34,24 @@ struct DiagnosticAudioSession {
 // never hides an additional unplanned interruption.
 [[nodiscard]] bool correction_diagnostic_pass(std::span<const DiagnosticAudioSession> sessions,
     bool queue_failed,std::optional<Nanoseconds> provider_pause_ns={}) noexcept;
-// Finite desktop-only diagnostic bridge. NO playback, file, IPC or OBS output.
+struct DiagnosticAudioOutput {
+    void* context{};
+    bool (*consume)(void*,const CorrectedAudio&,std::span<const float>,Nanoseconds) noexcept{};
+    void (*revoke)(void*) noexcept{};
+};
+// Finite desktop-only diagnostic bridge. Defaults to inspect/discard. Explicit
+// output hooks run on the ordinary tick owner, NEVER the network/OBS callback.
+// An output-enabled instance fails closed on ANY generation fault; no recovery.
 // submit(): network callback, short mutex-protected fixed-size copy, no DSP.
 // tick(): ordinary single owner, no mutex held during DSP/analysis. At most
-// 64 input packets and eight DSP quanta per tick; output inspected then discarded.
+// 64 input packets and eight DSP quanta per tick; optional synchronous output
+// consumes a borrowed span before it is cleared. Never retain that span.
 // snapshot accessors require producer callbacks stopped and final tick complete.
 class AudioCorrectionDiagnostic {
 public:
     static constexpr std::size_t capacity=64;
     static constexpr Nanoseconds maximum_queue_age_ns=100'000'000;
-    explicit AudioCorrectionDiagnostic(std::uint64_t clock_epoch);
+    explicit AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output={});
     [[nodiscard]] bool submit(const DiagnosticAudioPacket& packet) noexcept;
     void tick(Nanoseconds now,bool provider_healthy);
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
@@ -54,6 +62,7 @@ public:
 private:
     void snapshot() noexcept;
     void fail(Nanoseconds now) noexcept;
+    DiagnosticAudioOutput destination_;
     std::uint64_t clock_epoch_;
     wire::AudioStreamAdmission admission_;
     std::mutex mutex_;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Bounded network diagnostics. No audio device, PCM file, IPC bridge or OBS output.
+// Bounded network diagnostics; explicit optional desktop IPC, never OBS changes.
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/net/gstnet.h>
@@ -10,6 +10,10 @@
 #include "avsync/rtp_audio_anchor.hpp"
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
 #include "avsync/audio_diagnostic.hpp"
+#endif
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+#include "avsync/audio_handoff.hpp"
+#include <filesystem>
 #endif
 #include <algorithm>
 #include <array>
@@ -46,7 +50,7 @@ unsigned number(const char* value, unsigned low, unsigned high) {
     return result;
 }
 struct Options {
-    std::string bind, peer;
+    std::string bind, peer, desktop_ipc;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
     bool expect_media{}, expect_anchors{}, correct_desktop{};
@@ -55,6 +59,7 @@ void help() {
     std::cout << "avsync-network-receiver --bind LOCAL_IPV4 --peer SENDER_IPV4 --clock-port N --rtp-port N --rtcp-port N\n"
                  " [--seconds 1..180] [--expect-media] [--expect-anchors]\n"
                  " [--correct-desktop] (optional ASRC build; inspect/discard PCM, NEVER playback/OBS)\n"
+                 " [--desktop-ipc NEW_PRIVATE_FILE] (explicit IPC+ASRC build; 2-second desktop buffer, no OBS changes)\n"
                  " [--clock-pause-after SECONDS --clock-pause-seconds 1..10] (test fixture only)\n"
                  "Explicit private-link diagnostic listener and shared monotonic clock provider.\n"
                  "PT96/L24/48kHz/stereo; accepts only the supplied peer's media packets.\n"
@@ -132,7 +137,20 @@ public:
         do { clock_epoch_ = (static_cast<std::uint64_t>(g_random_int()) << 32) | g_random_int(); } while (!clock_epoch_);
         admission_.emplace(clock_epoch_);
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
-        if (options_.correct_desktop) correction_=std::make_unique<avsync::AudioCorrectionDiagnostic>(clock_epoch_);
+        avsync::DiagnosticAudioOutput destination;
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+        if (!options_.desktop_ipc.empty()) {
+            require(!std::filesystem::exists(options_.desktop_ipc),"Desktop IPC requires a new private file");
+            handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,2'000'000'000);
+            destination={handoff_.get(),[](void* p,const avsync::CorrectedAudio& block,
+                    std::span<const float> pcm,avsync::Nanoseconds now) noexcept {
+                return static_cast<avsync::CorrectedAudioHandoff*>(p)->consume(block,pcm,now);
+            },[](void* p) noexcept { static_cast<avsync::CorrectedAudioHandoff*>(p)->revoke(); }};
+        }
+#else
+        require(options_.desktop_ipc.empty(),"Desktop IPC requires an explicit IPC+ASRC build");
+#endif
+        if (options_.correct_desktop) correction_=std::make_unique<avsync::AudioCorrectionDiagnostic>(clock_epoch_,destination);
 #else
         require(!options_.correct_desktop,"Desktop correction requires an explicit optional ASRC build");
 #endif
@@ -188,7 +206,8 @@ public:
         auto* bus = gst_element_get_bus(pipeline_);
         const auto start = Steady::now();
         const auto deadline = start + std::chrono::seconds(options_.seconds);
-        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic pcm_saved=false clock_epoch="
+        std::cout << "AVSYNC_NETWORK_READY clock_domain=linux_monotonic pcm_saved="
+                  <<(options_.desktop_ipc.empty()?"false":"true")<<" clock_epoch="
                   << clock_epoch_ << "\n" << std::flush;
         bool error = false;
         bool clock_paused = false, clock_resumed = false;
@@ -213,6 +232,9 @@ public:
                 if (correction_->failed()) { error=true; break; }
             }
 #endif
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+            if (handoff_ && !handoff_->heartbeat(monotonic_now())) { error=true; break; }
+#endif
             auto* message = gst_bus_timed_pop_filtered(bus, (options_.correct_desktop ? 2:100)*GST_MSECOND,
                 static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
                     GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT));
@@ -228,6 +250,9 @@ public:
             if (error) break;
         }
         gst_object_unref(bus);
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+        if (handoff_) handoff_->revoke(); // Close the buffer before transport teardown.
+#endif
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         gst_element_get_state(pipeline_, nullptr, nullptr, 5*GST_SECOND);
         std::optional<avsync::SessionToken> active_epoch;
@@ -240,7 +265,8 @@ public:
         std::uint64_t timed = 0, invalid = 0, buffers = 0, original_invalid = 0;
         std::uint64_t active_branches = 0, active_windows = 0, active_usable_windows = 0;
         bool active_last_estimate_within_limit = false;
-        std::cout << "{\"schema\":1,\"mode\":\"rtp_diagnostic\",\"pcm_saved\":false,\"obs_used\":false,"
+        std::cout << "{\"schema\":1,\"mode\":\"rtp_diagnostic\",\"pcm_saved\":"
+                  <<(options_.desktop_ipc.empty()?"false":"true")<<",\"obs_used\":false,"
                   << "\"capture_timing_verified\":false,\"reference_semantics\":\"sender_media_time_not_proof_of_capture_time\","
                   << "\"original_anchor_mode\":" << (options_.expect_anchors ? "true" : "false")
                   << ",\"jitter_faststart_min_packets\":" << (options_.expect_anchors ? 2 : 0)
@@ -369,6 +395,7 @@ public:
                     <<",\"priming_discarded_frames\":"<<d.priming_discarded_frames
                     <<",\"produced_frames\":"<<d.produced_frames<<",\"delivered_frames\":"<<s.delivered_frames
                     <<",\"command_ppm\":"<<s.command_ppm<<",\"target_ppm\":"<<s.target_ppm
+                    <<",\"acquisition_spread_ppm\":"<<d.acquisition_spread_ppm
                     <<",\"maximum_predicted_phase_ns\":"<<d.maximum_predicted_phase_ns
                     <<",\"maximum_output_age_ns\":"<<s.maximum_output_age_ns
                     <<",\"peak_input_frames\":"<<d.peak_input_frames<<",\"peak_output_frames\":"<<d.peak_output_frames
@@ -381,8 +408,14 @@ public:
             }
             std::cout<<"],\"correction_state_codes\":{\"priming\":0,\"running\":1,\"faulted\":2}"
                 <<",\"correction_fault_codes\":{\"none\":0,\"metadata\":1,\"pcm\":2,\"rate\":3,\"overflow\":4,\"stale\":5,\"health\":6,\"backend\":7,\"timeline\":8,\"phase\":9}"
-                <<",\"corrected_pcm_destination\":\"in_memory_statistics_then_discard\""
+                <<",\"corrected_pcm_destination\":\""<<(options_.desktop_ipc.empty()?
+                    "in_memory_statistics_then_discard":"private_desktop_ipc_2_seconds")<<"\""
                 <<",\"correction_diagnostic_pass\":"<<(bad_correction?"false":"true");
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+            if (handoff_) std::cout<<",\"ipc_published_frames\":"<<handoff_->published_frames()
+                <<",\"ipc_busy_retries\":"<<handoff_->busy_retries()<<",\"ipc_retry_queue_peak_blocks\":"<<handoff_->queue_peak()
+                <<",\"ipc_failure\":\""<<handoff_->failure_reason()<<"\"";
+#endif
         }
 #endif
         std::cout << ",\"present_lock_verified\":false,\"status\":\"" << (error || fatal_ ? "error" :
@@ -682,6 +715,9 @@ private:
     std::uint64_t jitter_drop_messages_{}, jitter_num_too_late_{}, jitter_num_drop_on_latency_{};
     std::uint64_t invalid_jitter_drop_messages_{};
     std::optional<unsigned> first_jitter_drop_seqnum_, first_jitter_drop_reason_;
+#ifdef AVSYNC_HAS_AUDIO_HANDOFF
+    std::unique_ptr<avsync::CorrectedAudioHandoff> handoff_;
+#endif
 #ifdef AVSYNC_HAS_AUDIO_CORRECTION
     std::unique_ptr<avsync::AudioCorrectionDiagnostic> correction_;
 #endif
@@ -704,6 +740,7 @@ int main(int argc,char** argv) {
             else if(arg=="--rtp-port") options.rtp_port=number(value,1024,65535);
             else if(arg=="--rtcp-port") options.rtcp_port=number(value,1024,65535);
             else if(arg=="--seconds") options.seconds=number(value,1,180);
+            else if(arg=="--desktop-ipc") { options.desktop_ipc=value; options.correct_desktop=true; options.expect_anchors=true; }
             else if(arg=="--clock-pause-after") options.clock_pause_after=number(value,1,179);
             else if(arg=="--clock-pause-seconds") options.clock_pause_seconds=number(value,1,10);
             else throw std::runtime_error("Unknown option");

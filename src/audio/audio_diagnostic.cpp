@@ -2,6 +2,7 @@
 #include "avsync/audio_diagnostic.hpp"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace avsync {
 bool correction_diagnostic_pass(std::span<const DiagnosticAudioSession> sessions,bool queue_failed,
@@ -30,8 +31,11 @@ bool decode_l24(std::span<const std::byte> payload,DiagnosticAudioPacket& packet
     }
     return true;
 }
-AudioCorrectionDiagnostic::AudioCorrectionDiagnostic(std::uint64_t clock_epoch)
-    : clock_epoch_(clock_epoch),admission_(clock_epoch) {}
+AudioCorrectionDiagnostic::AudioCorrectionDiagnostic(std::uint64_t clock_epoch,DiagnosticAudioOutput output)
+    : destination_(output),clock_epoch_(clock_epoch),admission_(clock_epoch) {
+    if ((destination_.consume!=nullptr)!=(destination_.revoke!=nullptr))
+        throw std::invalid_argument("output requires consume and revoke hooks");
+}
 bool AudioCorrectionDiagnostic::submit(const DiagnosticAudioPacket& packet) noexcept {
     if (failed_.load()) return false;
     if (!packet.frames || packet.frames>wire::maximum_audio_payload_frames || packet.arrival_ns<0) {
@@ -46,11 +50,15 @@ void AudioCorrectionDiagnostic::snapshot() noexcept {
     if (!worker_) return;
     auto& s=sessions_[session_count_-1];
     s.correction=worker_->diagnostics(); s.state=worker_->state(); s.fault=worker_->fault();
+    if (s.state==CorrectionState::faulted && destination_.revoke) {
+        destination_.revoke(destination_.context); failed_.store(true);
+    }
     if (s.state==CorrectionState::faulted && !s.first_fault_ns) s.first_fault_ns=last_tick_;
     s.command_ppm=worker_->command_ppm(); s.target_ppm=worker_->target_ppm();
 }
 void AudioCorrectionDiagnostic::fail(Nanoseconds now) noexcept {
     failed_.store(true);
+    if (destination_.revoke) destination_.revoke(destination_.context);
     if (worker_) (void)worker_->dispatch(now,false);
     { std::lock_guard lock(mutex_); queue_={}; size_=head_=0; }
     snapshot();
@@ -72,6 +80,7 @@ void AudioCorrectionDiagnostic::tick(Nanoseconds now,bool provider_healthy) {
         if (!age || *age>maximum_queue_age_ns) { fail(now); return; }
         if (!admission_.admit(packet.record,packet.ssrc)) continue;
         if (!worker_ || sessions_[session_count_-1].epoch!=packet.record.epoch) {
+            if (worker_ && destination_.revoke) { fail(now); return; }
             snapshot();
             if (session_count_==sessions_.size()) { fail(now); return; }
             worker_=std::make_unique<AudioCorrectionWorker>(packet.record.epoch,clock_epoch_);
@@ -109,6 +118,8 @@ void AudioCorrectionDiagnostic::tick(Nanoseconds now,bool provider_healthy) {
             s.peak=std::max(s.peak,std::abs(x)); s.sum_squares+=x*x;
         }
         s.delivered_frames+=block->frames;
+        if (destination_.consume && !destination_.consume(destination_.context,*block,
+                std::span(output_).first(block->frames*2),now)) { fail(now); return; }
         std::fill(output_.begin(),output_.end(),0);
     }
     snapshot();

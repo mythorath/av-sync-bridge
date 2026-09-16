@@ -293,15 +293,18 @@ void owner_death_and_wrap(TempDir& dir) {
     const auto busy_result = reader.poll_status(monotonic_ns(), status);
     std::vector<std::uint8_t> video(video_bytes(c), 12);
     const auto busy_publish = writer.try_publish_video(video, 1, 2);
+    std::vector<float> busy_pcm(audio_samples(c,0),0);
+    const auto busy_audio = writer.try_publish_audio(0,busy_pcm,1,2);
     const auto busy_heartbeat = writer.try_heartbeat();
     require(write(release[1], &marker, 1) == 1, "release fault owner"); close(release[1]);
     int code{}; require(waitpid(child, &code, 0) == child && WIFEXITED(code) && WEXITSTATUS(code) == 99, "owner exits locked");
     require(busy_result == ReadResult::busy, "reader must not wait for mutex");
-    require(busy_publish == WriteResult::busy && busy_heartbeat == WriteResult::busy,
+    require(busy_publish == WriteResult::busy && busy_audio==WriteResult::busy && busy_heartbeat == WriteResult::busy,
             "capture worker must not wait for an IPC reader mutex");
     require(reader.poll_status(monotonic_ns(), status) == ReadResult::disconnected && status.owner_died, "robust recovery rejects incomplete epoch");
     require(!writer.heartbeat(), "dead epoch cannot resume");
     require(writer.try_publish_video(video, 1, 2) == WriteResult::disconnected &&
+            writer.try_publish_audio(0,busy_pcm,1,2)==WriteResult::disconnected &&
             writer.try_heartbeat() == WriteResult::disconnected, "nonblocking rejects abandoned generation");
     const auto wrap_path = dir.file("wrap"); Writer wrap_writer(wrap_path, c); Reader wrap_reader(wrap_path);
     const auto max = std::numeric_limits<std::uint64_t>::max();
