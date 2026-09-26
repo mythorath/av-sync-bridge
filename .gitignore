@@ -30,3 +30,6 @@ __pycache__/
 *.py[cod]
 /core
 /core.*
+
+# Runtime state of the RTP sender
+rtp/windows/state/

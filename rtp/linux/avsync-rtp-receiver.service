@@ -1,0 +1,15 @@
+[Unit]
+Description=Windows desktop audio RTP receiver (PipeWire rtp-source)
+# The stream plays into the avsync_desktop null sink, which pipewire-pulse creates.
+After=pipewire.service pipewire-pulse.service wireplumber.service
+BindsTo=pipewire.service
+PartOf=pipewire.service pipewire-pulse.service
+
+[Service]
+ExecStartPre=/usr/bin/timeout 30 /bin/sh -c 'until /usr/bin/pactl list short sinks | /usr/bin/grep -q "[[:space:]]avsync_desktop[[:space:]]"; do /usr/bin/sleep 0.2; done'
+ExecStart=/usr/bin/pipewire -c %h/.config/avsync-rtp/windows-desktop-rtp.conf
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=pipewire.service pipewire-pulse.service

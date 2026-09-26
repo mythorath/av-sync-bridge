@@ -1,0 +1,29 @@
+# Against https://github.com/dimtpap/obs-pipewire-audio-capture at 6120aa6
+# Apply with: git apply obs-pipewire-audio-capture-graph-clock.patch
+diff --git a/src/pipewire-audio.c b/src/pipewire-audio.c
+index 13cb453..546575c 100644
+--- a/src/pipewire-audio.c
++++ b/src/pipewire-audio.c
+@@ -173,9 +173,10 @@ bool spa_to_obs_pw_audio_info(struct obs_pw_audio_info *info, const struct spa_p
+ 
+ static void on_process_cb(void *data)
+ {
+-	uint64_t now = os_gettime_ns();
+-
+ 	struct obs_pw_audio_stream *s = data;
++	/* avsync patch 2026-09-24: stamp with the graph cycle time measured by the driver
++	 * (CLOCK_MONOTONIC, same base as os_gettime_ns) instead of when this thread woke up. */
++	uint64_t now = (s->pos && s->pos->clock.nsec) ? s->pos->clock.nsec : os_gettime_ns();
+ 
+ 	struct pw_buffer *b = pw_stream_dequeue_buffer(s->stream);
+ 
+@@ -316,7 +317,8 @@ int obs_pw_audio_stream_connect(struct obs_pw_audio_stream *s, uint32_t target_i
+ 
+ 	return pw_stream_connect(
+ 		s->stream, PW_DIRECTION_INPUT, target_id,
+-		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT, params, 1);
++		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT |
++				  PW_STREAM_FLAG_RT_PROCESS /* avsync patch: process in the realtime data thread */, params, 1);
+ }
+ /* ------------------------------------------------- */
+ 
