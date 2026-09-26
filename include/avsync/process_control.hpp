@@ -46,7 +46,9 @@ class ControlLease {
 public:
     using Clock = std::chrono::steady_clock;
     using Time = Clock::time_point;
-    static constexpr auto timeout = std::chrono::seconds(5);
+    // 12 s, not 5 s: a cold start (GStreamer registry, WASAPI device open) can
+    // exceed 5 s before the first poll, which failed every first launch.
+    static constexpr auto timeout = std::chrono::seconds(12);
     static constexpr std::size_t maximum_line = 32;
     explicit ControlLease(Time now) noexcept : heartbeat_(now), last_poll_(now) {}
     ControlState state() const noexcept { return state_; }

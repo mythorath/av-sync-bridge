@@ -143,6 +143,9 @@ def fake_child() -> int:
                     summary["clock_usable" if role == "sender" else "correction_diagnostic_pass"] = False
                 elif mode == "native_error":
                     summary["status"] = "error"
+                    if role == "sender":
+                        summary.update(error_stage="capture_get_buffer", error_code=0x88890004,
+                                       discontinuities=2, reject_stale=3)
                 encoded = json.dumps(summary).encode("ascii")
                 if mode == "native_truncated":
                     sys.stdout.buffer.write(encoded)
@@ -433,6 +436,45 @@ class ProtocolTests(unittest.TestCase):
         for line in lines:
             with self.subTest(line=line[:40]), self.assertRaises(pair.PairError):
                 pair.parse_native_summary(line, "sender")
+
+    def test_sender_error_stage_and_uint32_code_are_safe_diagnostics_only(self):
+        base = native_summary("sender")
+        for stage in sorted(pair.SENDER_ERROR_STAGES):
+            for code in (0, 0x88890004, (1 << 32) - 1):
+                with self.subTest(stage=stage, code=code):
+                    original = {**base, "status": "error", "error_stage": stage, "error_code": code}
+                    summary = pair.parse_native_summary(json.dumps(original).encode(), "sender")
+                    self.assertEqual(summary["error_stage"], stage)
+                    self.assertEqual(summary["error_code"], code)
+                    self.assertFalse(summary["reported_media_qualified"])
+        for value in ("DO_NOT_PUBLISH_PRIVATE_ERROR", "capture_get_buffer\nPRIVATE", [], {}, None, 1, True):
+            original = {**base, "error_stage": value, "error_code": value}
+            summary = pair.parse_native_summary(json.dumps(original).encode(), "sender")
+            self.assertEqual(summary["error_stage"], "unknown")
+            self.assertEqual(summary["error_code"], 1 if type(value) is int else None)
+            self.assertTrue(summary["reported_media_qualified"])  # Diagnostic fields do not add new gates.
+            self.assertNotIn("PRIVATE", json.dumps(summary))
+        for code in (-1, 1 << 32, 1.5, "2290679812", True, None):
+            summary = pair.parse_native_summary(json.dumps({**base, "error_code": code}).encode(), "sender")
+            self.assertIsNone(summary["error_code"])
+            self.assertTrue(summary["reported_media_qualified"])
+        for role in ("sender", "receiver"):
+            summary = pair.parse_native_summary(json.dumps(native_summary(role)).encode(), role)
+            self.assertNotIn("error_stage", summary)
+            self.assertNotIn("error_code", summary)
+
+    def test_sender_discontinuity_rejection_counters_preserved_without_new_gates(self):
+        names = ("silent_packets", "initial_discontinuities", "discontinuities", "reject_mapping",
+                 "reject_clock_now", "reject_future", "reject_stale", "reject_nonmonotonic",
+                 "reject_after_build", "reject_after_conversion")
+        original = {**native_summary("sender"), **{name: (1 << 64) - 1 for name in names}}
+        summary = pair.parse_native_summary(json.dumps(original).encode(), "sender")
+        for name in names:
+            self.assertEqual(summary["metrics"][name], (1 << 64) - 1)
+            for invalid in (-1, 1 << 64, True, "PRIVATE"):
+                with self.subTest(name=name, invalid=invalid), self.assertRaises(pair.PairError):
+                    pair.parse_native_summary(json.dumps({**original, name: invalid}).encode(), "sender")
+        self.assertTrue(summary["reported_media_qualified"])
 
     def test_receiver_requires_exact_native_no_ipc_failure(self):
         base = native_summary("receiver")
@@ -746,6 +788,12 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0)
                 self.assertTrue(result.native_summary_requirement_met)
                 self.assertFalse(result.reported_media_qualified)
+                if mode == "native_error":
+                    sender = next(item for item in result.native_diagnostics if item["role"] == "sender")
+                    self.assertEqual(sender["error_stage"], "capture_get_buffer")
+                    self.assertEqual(sender["error_code"], 0x88890004)
+                    self.assertEqual(sender["metrics"]["discontinuities"], 2)
+                    self.assertEqual(sender["metrics"]["reject_stale"], 3)
 
     def test_bad_final_stdout_is_not_lost_during_cleanup(self):
         for mode in ("native_truncated", "native_oversize", "native_final_control", "native_total_overflow"):

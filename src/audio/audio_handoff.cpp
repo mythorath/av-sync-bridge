@@ -8,8 +8,8 @@
 namespace avsync {
 CorrectedAudioHandoff::CorrectedAudioHandoff(std::string path,Nanoseconds delay_ns,
         ipc::ReplacementPolicy replacement):delay_(delay_ns) {
-    if (delay_<100'000'000 || delay_>2'000'000'000 || delay_%10'000'000)
-        throw std::invalid_argument("desktop handoff delay must be 100..2000 ms in 10 ms steps");
+    if (delay_<30'000'000 || delay_>2'000'000'000 || delay_%10'000'000)
+        throw std::invalid_argument("desktop handoff delay must be 30..2000 ms in 10 ms steps");
     ipc::Config config;
     config.width=config.height=2; config.video_capacity=2; // Unused video slots.
     config.audio_capacity=static_cast<std::uint32_t>(delay_/10'000'000+24);

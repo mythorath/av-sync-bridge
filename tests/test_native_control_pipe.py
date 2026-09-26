@@ -29,7 +29,8 @@ class NativeControlPipeTests(unittest.TestCase):
                 stream.close()
 
     def check_result(self, child, expected, code):
-        child.wait(timeout=8)
+        # Must exceed the control lease timeout (12 s) so expiry can be observed.
+        child.wait(timeout=20)
         self.assertEqual(child.stdout.read().decode().splitlines(),
                          ["CONTROL_PIPE_READY", expected])
         self.assertEqual(child.stderr.read(), b"")

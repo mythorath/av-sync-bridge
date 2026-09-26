@@ -19,17 +19,18 @@ S consume(L& lease, std::string_view bytes, L::Time when) {
     return lease.consume({bytes.data(), bytes.size()}, when);
 }
 void test_lease() {
+    constexpr auto lease_timeout = L::timeout; // relative to the configured lease, not a literal
     L lease(start);
-    CHECK(lease.tick(start + 4999ms) == S::active);
-    CHECK(lease.tick(start + 5s) == S::expired);
-    CHECK(consume(lease, "AVSYNC_KEEPALIVE\n", start + 5s) == S::expired);
-    CHECK(consume(lease, "AVSYNC_STOP\n", start + 5s) == S::expired);
+    CHECK(lease.tick(start + lease_timeout - 1ms) == S::active);
+    CHECK(lease.tick(start + lease_timeout) == S::expired);
+    CHECK(consume(lease, "AVSYNC_KEEPALIVE\n", start + lease_timeout) == S::expired);
+    CHECK(consume(lease, "AVSYNC_STOP\n", start + lease_timeout) == S::expired);
     L renewed(start);
-    CHECK(consume(renewed, "AVSYNC_KEEPALIVE\n", start + 4s) == S::active);
-    CHECK(renewed.tick(start + 8s) == S::active);
-    CHECK(renewed.tick(start + 9s) == S::expired);
+    CHECK(consume(renewed, "AVSYNC_KEEPALIVE\n", start + lease_timeout - 1s) == S::active);
+    CHECK(renewed.tick(start + 2 * lease_timeout - 3s) == S::active);
+    CHECK(renewed.tick(start + 2 * lease_timeout - 1s) == S::expired);
     L boundary(start);
-    CHECK(consume(boundary, "AVSYNC_KEEPALIVE\n", start + 5s) == S::expired);
+    CHECK(consume(boundary, "AVSYNC_KEEPALIVE\n", start + lease_timeout) == S::expired);
     L backwards(start);
     CHECK(backwards.tick(start - 1ns) == S::invalid);
 }
@@ -43,8 +44,8 @@ void test_commands() {
         CHECK(consume(lease, command, start + 4s) == S::stopped);
     }
     L fragmented(start);
-    CHECK(consume(fragmented, "AVSYNC_KEEPALIVE", start + 4s) == S::active);
-    CHECK(consume(fragmented, "\n", start + 5s) == S::expired);
+    CHECK(consume(fragmented, "AVSYNC_KEEPALIVE", start + L::timeout - 1s) == S::active);
+    CHECK(consume(fragmented, "\n", start + L::timeout) == S::expired);
     for (const auto text : {"\n", "AVSYNC_KEEPALIVE\r\n", "STOP\n", " AVSYNC_STOP\n", "AVSYNC_STOP \n"}) {
         L lease(start);
         CHECK(consume(lease, text, start) == S::invalid);

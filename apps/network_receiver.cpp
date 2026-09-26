@@ -62,6 +62,7 @@ struct Options {
     std::string bind, peer, desktop_ipc;
     unsigned clock_port{}, rtp_port{}, rtcp_port{}, seconds{30};
     unsigned clock_pause_after{}, clock_pause_seconds{};
+    unsigned desktop_delay_ms{2000}, jitter_latency_ms{100};
     bool expect_media{}, expect_anchors{}, correct_desktop{}, recover_desktop_ipc{};
     bool control_stdin{}, replace_desktop_ipc{}, session_mode{};
     std::optional<std::uint64_t> expected_sender_session;
@@ -164,7 +165,8 @@ public:
         if (!options_.desktop_ipc.empty() && control_.poll() == avsync::process::ControlState::active) {
             require(options_.replace_desktop_ipc || !std::filesystem::exists(options_.desktop_ipc),
                     "Desktop IPC requires a new private file or explicit supervised replacement");
-            handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,2'000'000'000,
+            handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(options_.desktop_ipc,
+                static_cast<avsync::Nanoseconds>(options_.desktop_delay_ms)*1'000'000,
                 options_.replace_desktop_ipc ? avsync::ipc::ReplacementPolicy::retire_previous :
                                               avsync::ipc::ReplacementPolicy::atomic_replace);
             destination={this,[](void* p,const avsync::CorrectedAudio& block,
@@ -184,7 +186,8 @@ public:
                         self->retired_ipc_peak_=std::max(self->retired_ipc_peak_,self->handoff_->queue_peak());
                         self->handoff_.reset();
                     }
-                    self->handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(self->options_.desktop_ipc,2'000'000'000,
+                    self->handoff_=std::make_unique<avsync::CorrectedAudioHandoff>(self->options_.desktop_ipc,
+                        static_cast<avsync::Nanoseconds>(self->options_.desktop_delay_ms)*1'000'000,
                         self->options_.replace_desktop_ipc ? avsync::ipc::ReplacementPolicy::retire_previous :
                                                           avsync::ipc::ReplacementPolicy::atomic_replace);
                     ++self->ipc_recreations_; return true;
@@ -227,7 +230,7 @@ public:
         pipeline_ = gst_pipeline_new("avsync-network-diagnostic");
         require(pipeline_ != nullptr, "Cannot create receiver pipeline");
         rtpbin_ = add("rtpbin", "rtp");
-        g_object_set(rtpbin_, "latency", 100u, "drop-on-latency", TRUE,
+        g_object_set(rtpbin_, "latency", static_cast<guint>(options_.jitter_latency_ms), "drop-on-latency", TRUE,
                      "add-reference-timestamp-meta", TRUE, "ntp-sync", FALSE, nullptr);
         g_signal_connect(rtpbin_, "pad-added", G_CALLBACK(pad_added), this);
         g_signal_connect(rtpbin_, "new-jitterbuffer", G_CALLBACK(new_jitterbuffer), this);
@@ -940,6 +943,11 @@ int main(int argc,char** argv) {
                 options.expected_sender_session=identity(value);
             }
             else if(arg=="--desktop-ipc") { options.desktop_ipc=value; options.correct_desktop=true; options.expect_anchors=true; }
+            else if(arg=="--desktop-delay-ms") {
+                options.desktop_delay_ms=number(value,30,2000);
+                require(options.desktop_delay_ms%10==0,"Desktop delay must be a multiple of 10 ms");
+            }
+            else if(arg=="--jitter-latency-ms") options.jitter_latency_ms=number(value,5,1000);
             else if(arg=="--clock-pause-after") options.clock_pause_after=number(value,1,179);
             else if(arg=="--clock-pause-seconds") options.clock_pause_seconds=number(value,1,10);
             else throw std::runtime_error("Unknown option");

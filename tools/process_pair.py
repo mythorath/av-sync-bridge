@@ -96,7 +96,34 @@ SENDER_COUNTS = (
     "rtp_packets_at_output", "sender_reports", "timestamp_errors", "queue_overflows",
     "rtp_frame_steps", "rtp_nominal_pts_steps", "rtp_invalid_payload", "anchor_transport_errors",
     "clock_loss_count", "resets", "reject_unhealthy", "dropped_packets",
+    "silent_packets", "initial_discontinuities", "discontinuities", "reject_mapping",
+    "reject_clock_now", "reject_future", "reject_stale", "reject_nonmonotonic",
+    "reject_after_build", "reject_after_conversion",
 )
+# Fixed stage literals emitted by apps/windows_sender.cpp, never library/device
+# error text. Keep these diagnostics independent from qualification/control.
+SENDER_ERROR_STAGES = {
+    "arguments", "unexpected_exception", "com_initialize",
+    "unsupported_capture_dimensions", "invalid_extensible_format",
+    "unsupported_capture_subformat", "unsupported_valid_bit_layout",
+    "unsupported_capture_sample_format", "unsupported_capture_channel_mask",
+    "unsupported_capture_speaker", "empty_downmix", "invalid_gstreamer_audio_info",
+    "create_device_enumerator", "default_render_endpoint", "activate_audio_client",
+    "get_mix_format", "missing_mix_format", "initialize_loopback",
+    "capture_buffer_size", "capture_buffer_too_large", "capture_service",
+    "start_capture", "stop_capture", "capture_get_buffer", "empty_success_packet",
+    "capture_release_buffer", "oversized_capture_packet", "missing_capture_pcm",
+    "create_pipeline", "create_input_caps", "link_conversion_pipeline",
+    "link_rtp_session_input", "link_rtp_output", "link_rtcp_output",
+    "get_internal_rtp_session", "start_sender_pipeline", "anchor_transport_failed",
+    "gstreamer_pipeline_error", "original_capture_anchor_invalid", "anchor_ledger_capacity",
+    "nominal_conversion_failed", "nominal_conversion_size", "nominal_timeline_overflow",
+    "allocate_converted_buffer", "appsrc_push_failed", "missing_gstreamer_element",
+    "add_pipeline_element", "gstreamer_initialize", "create_network_clock",
+    "missing_internal_network_clock", "clock_poll_timeout", "qpc_gstreamer_domain_mismatch",
+    "session_requires_new_process", "restart_limit", "deadline_before_capture",
+    "device_position_overflow",
+}
 RECEIVER_COUNTS = (
     "packets_accepted", "packets_rejected", "invalid_ingress_anchor_packets",
     "foreign_identity_rtp_packets", "unadmitted_rtcp_packets", "invalid_sender_reports",
@@ -153,6 +180,12 @@ def parse_native_summary(line: bytes, role: str) -> dict[str, Any]:
     details: dict[str, Any] = {}
     good_status = raw["status"] in ("control_stopped", "rtp_output_observed_unverified", "original_anchors_observed")
     if role == "sender":
+        if "error_stage" in raw or "error_code" in raw:
+            stage, code = raw.get("error_stage"), raw.get("error_code")
+            details = {
+                "error_stage": stage if isinstance(stage, str) and stage in SENDER_ERROR_STAGES else "unknown",
+                "error_code": code if type(code) is int and 0 <= code <= (1 << 32) - 1 else None,
+            }
         qualified = (good_status and metrics.get("clock_usable") is True
                      and metrics.get("original_anchors_transmitted") is True
                      and all(metrics.get(name, 0) > 0 for name in
@@ -725,6 +758,8 @@ class Supervisor:
                 **({name: summary[name] for name in
                     ("ipc_failure", "correction_sessions", "correction_session_count", "correction_sessions_truncated")}
                    if summary and child.role == "receiver" else {}),
+                **({name: summary[name] for name in ("error_stage", "error_code") if name in summary}
+                   if summary and child.role == "sender" else {}),
                 "reported_media_qualified": valid and bool(summary["reported_media_qualified"]),
                 "discarded_stdout_lines": child.discarded_stdout_lines,
                 "output_bytes": child.output_bytes,
